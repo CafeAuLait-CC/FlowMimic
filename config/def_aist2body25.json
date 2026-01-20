@@ -1,6 +1,14 @@
 {
+  "notes": {
+    "body25_pelvis": "midpoint of SMPL left_hip (1) and right_hip (2)",
+    "body25_neck": "midpoint of SMPL left_shoulder (16) and right_shoulder (17)"
+  },
+  "computed_body25": [
+    {"name": "pelvis", "body25_idx": 8, "smpl_indices": [1, 2], "op": "midpoint"},
+    {"name": "neck", "body25_idx": 1, "smpl_indices": [16, 17], "op": "midpoint"}
+  ],
   "smpl_joints": [
-    {"name": "pelvis", "smpl_idx": 0, "body25_idx": 8},
+    {"name": "pelvis", "smpl_idx": 0, "body25_idx": null},
     {"name": "left_hip", "smpl_idx": 1, "body25_idx": 12},
     {"name": "right_hip", "smpl_idx": 2, "body25_idx": 9},
     {"name": "spine1", "smpl_idx": 3, "body25_idx": null},
@@ -12,7 +20,7 @@
     {"name": "spine3", "smpl_idx": 9, "body25_idx": null},
     {"name": "left_foot", "smpl_idx": 10, "body25_idx": null},
     {"name": "right_foot", "smpl_idx": 11, "body25_idx": null},
-    {"name": "neck", "smpl_idx": 12, "body25_idx": 1},
+    {"name": "neck", "smpl_idx": 12, "body25_idx": null},
     {"name": "left_collar", "smpl_idx": 13, "body25_idx": null},
     {"name": "right_collar", "smpl_idx": 14, "body25_idx": null},
     {"name": "head", "smpl_idx": 15, "body25_idx": null},

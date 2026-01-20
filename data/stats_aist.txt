@@ -1,0 +1,8 @@
+Frames: 1123873
+Avg pelvis: [ -2.07844144 167.15136051 -23.89241169]
+Avg left_heel: [ -1.94852088 166.43791795 -23.95801568]
+Avg right_heel: [ -2.20907386 166.4293519  -23.97012913]
+Avg height (nose-to-heel): 1.461399
+Avg width (X_max - X_min): 0.768838
+Avg height span (Y_max - Y_min): 1.558317
+Avg depth (Z_max - Z_min): 0.607026

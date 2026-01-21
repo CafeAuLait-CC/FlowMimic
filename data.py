@@ -2,13 +2,32 @@ import json
 
 import numpy as np
 
-from tools.aistpp2body25 import pose_from_aist
+from utils.smpl2joints import joints_from_smpl_param
 
 
-def load_smpl_raw_data(pkl_path):
+def load_aistpp_raw_joints(pkl_path):
     data = np.load(pkl_path, allow_pickle=True)
 
-    joints3d = pose_from_aist(data)
+    joints3d = joints_from_smpl_param(data)
+    return joints3d
+
+
+def load_aistpp_smpl22(pkl_path):
+    joints3d = load_aistpp_raw_joints(pkl_path)
+    return joints3d[:, :22]
+
+
+def load_mvhumannet_raw_joints(pkl_path):
+    data = np.load(pkl_path, allow_pickle=True)
+
+    joints = data["joints"]
+    if joints.ndim == 3 and joints.shape[0] == 1:
+        joints = joints[0]
+    return joints
+
+
+def load_mvhumannet_smpl22(pkl_path):
+    joints3d = load_mvhumannet_raw_joints(pkl_path)
     return joints3d[:, :22]
 
 
@@ -61,7 +80,21 @@ def build_body25(joints3d, mapping, computed):
     return body25
 
 
-def load_body25_data(pkl_path, def_path):
-    joints3d = load_smpl_raw_data(pkl_path)
+def build_body25_from_joints(joints3d, def_path):
     mapping, _names, computed = load_body25_mapping(def_path)
     return build_body25(joints3d, mapping, computed)
+
+
+def load_body25_data(pkl_path, def_path):
+    joints3d = load_aistpp_smpl22(pkl_path)
+    return build_body25_from_joints(joints3d, def_path)
+
+
+def load_aistpp_body25(pkl_path, def_path):
+    joints3d = load_aistpp_raw_joints(pkl_path)
+    return build_body25_from_joints(joints3d, def_path)
+
+
+def load_mvhumannet_body25(pkl_path, def_path):
+    joints3d = load_mvhumannet_raw_joints(pkl_path)
+    return build_body25_from_joints(joints3d, def_path)

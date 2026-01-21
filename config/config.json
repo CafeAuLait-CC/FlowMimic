@@ -1,0 +1,4 @@
+{
+  "aist_motions_dir": "data/AIST++/Annotations/motions",
+  "mvhumannet_root": "data/MVHumanNet"
+}

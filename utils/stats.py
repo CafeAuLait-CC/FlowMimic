@@ -5,12 +5,12 @@ from multiprocessing import Pool
 import numpy as np
 from tqdm import tqdm
 
-from common.dataloader import build_body25, load_body25_mapping, load_smpl_raw_data
+from common.dataloader import build_body25, load_body25_mapping, load_aistpp_raw_joints
 
 
 def _stats_for_file(args):
     pkl_path, mapping, computed = args
-    joints3d = load_smpl_raw_data(pkl_path)
+    joints3d = load_aistpp_raw_joints(pkl_path)
     body25 = build_body25(joints3d, mapping, computed)
 
     pelvis_idx = 8

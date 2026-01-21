@@ -153,3 +153,19 @@ def load_aistpp_body25(pkl_path, def_path):
 def load_mvhumannet_body25(pkl_path, def_path):
     joints3d = load_mvhumannet_raw_joints(pkl_path)
     return build_body25_from_joints(joints3d, def_path)
+
+
+def load_mvhumannet_sequence_smpl22(smpl_param_dir):
+    frame_files = sorted(
+        f for f in os.listdir(smpl_param_dir) if f.endswith(".pkl")
+    )
+    if not frame_files:
+        raise FileNotFoundError(f"No frame files found in {smpl_param_dir}")
+
+    frames = []
+    for name in frame_files:
+        pkl_path = os.path.join(smpl_param_dir, name)
+        frame = load_mvhumannet_smpl22(pkl_path)[0]
+        frames.append(frame)
+
+    return np.stack(frames, axis=0)

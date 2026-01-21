@@ -9,14 +9,9 @@ from models.vae.datasets.balanced_batch_sampler import balanced_batch_iter
 from models.vae.datasets.dataset_aist import AISTDataset
 from models.vae.datasets.dataset_mvh import MVHumanNetDataset
 from models.vae.datasets.label_map_builder import build_genre_to_id, save_genre_to_id
-from models.vae.losses import (
-    masked_acceleration_loss,
-    masked_kl,
-    masked_smooth_l1,
-    masked_velocity_loss,
-    style_ce_loss,
-)
+from models.vae.losses import grouped_recon_loss, masked_kl, smoothness_loss, style_ce_loss
 from models.vae.motion_vae import MotionVAE
+from models.vae.stats import compute_mean_std, load_mean_std
 from utils.config import load_config
 
 
@@ -44,45 +39,72 @@ def kl_weight(step, warmup_steps, max_weight):
     return min(max_weight, max_weight * (step / warmup_steps))
 
 
+def apply_style_dropout(style_id, domain_id, p):
+    if p <= 0:
+        return style_id
+    drop_mask = (domain_id == 1) & (torch.rand_like(style_id.float()) < p)
+    style_id = style_id.clone()
+    style_id[drop_mask] = 0
+    return style_id
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seq-len", type=int, default=60)
+    parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--ratio-aist", type=int, default=1)
     parser.add_argument("--ratio-mvh", type=int, default=1)
-    parser.add_argument("--kl-warmup", type=int, default=20000)
-    parser.add_argument("--kl-weight", type=float, default=2e-3)
-    parser.add_argument("--w-vel", type=float, default=0.1)
-    parser.add_argument("--w-acc", type=float, default=0.05)
-    parser.add_argument("--w-style", type=float, default=0.1)
+    parser.add_argument("--kl-warmup", type=int, default=None)
+    parser.add_argument("--kl-weight", type=float, default=None)
+    parser.add_argument("--w-vel", type=float, default=None)
+    parser.add_argument("--w-acc", type=float, default=None)
+    parser.add_argument("--w-style", type=float, default=None)
+    parser.add_argument("--w-contact", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--genre-map", type=str, default="genre_to_id.json")
+    parser.add_argument("--stats-path", type=str, default=None)
     args = parser.parse_args()
 
     config = load_config()
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
+    aist_genres = config["aist_genres"]
+    num_styles = config["num_styles"]
+    d_in = config["d_in"]
+    d_z = config["d_z"]
+    seq_len = args.seq_len or config["seq_len"]
+    kl_warmup = args.kl_warmup or config["kl_warmup_steps"]
+    kl_weight_target = args.kl_weight or config["kl_target_weight"]
+    w_vel = args.w_vel or config["w_vel"]
+    w_acc = args.w_acc or config["w_acc"]
+    w_style = args.w_style or config["w_style"]
+    w_contact = args.w_contact or config["w_contact"]
+    style_dropout_p = config["style_dropout_p"]
+    stats_path = args.stats_path or config["stats_path"]
 
     if os.path.exists(args.genre_map):
         with open(args.genre_map, "r", encoding="utf-8") as f:
             genre_to_id = json.load(f)
     else:
-        genre_to_id = build_genre_to_id(aist_dir)
+        genre_to_id = build_genre_to_id(aist_genres)
         save_genre_to_id(genre_to_id, args.genre_map)
 
-    num_styles = max(genre_to_id.values()) + 1
+    if not os.path.exists(stats_path):
+        stats_a = AISTDataset(aist_dir, genre_to_id, seq_len, normalize=False)
+        compute_mean_std(stats_a, stats_path)
 
-    dataset_a = AISTDataset(aist_dir, genre_to_id, args.seq_len)
-    dataset_b = MVHumanNetDataset(mv_root, args.seq_len)
+    mean, std = load_mean_std(stats_path)
+
+    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean, std=std)
+    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean, std=std)
 
     loader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=True, drop_last=True)
     loader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-    d_in = 22 * 3
-    model = MotionVAE(d_in=d_in, num_styles=num_styles)
+    model = MotionVAE(d_in=d_in, d_z=d_z, num_styles=num_styles, max_len=seq_len)
     model.to(args.device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -102,19 +124,21 @@ def main():
             style_id = style_id.to(args.device)
             mask = mask.to(args.device)
 
-            outputs = model(motion, domain_id, style_id, mask=mask)
+            style_id_in = apply_style_dropout(style_id, domain_id, style_dropout_p)
+            outputs = model(motion, domain_id, style_id_in, mask=mask)
             x_hat = outputs["x_hat"]
 
-            recon = masked_smooth_l1(x_hat, motion, mask)
+            recon, cont_loss, contact_loss = grouped_recon_loss(
+                x_hat, motion, mask, w_contact=w_contact
+            )
             kl = masked_kl(outputs["mu"], outputs["logvar"], mask)
-            vel = masked_velocity_loss(x_hat, motion, mask)
-            acc = masked_acceleration_loss(x_hat, motion, mask)
-            style_loss = style_ce_loss(outputs.get("style_logits"), style_id, domain_id)
+            vel, acc = smoothness_loss(x_hat, motion, mask)
+            style_loss = style_ce_loss(outputs.get("style_logits"), style_id_in, domain_id)
 
-            kld_weight = kl_weight(step, args.kl_warmup, args.kl_weight)
-            loss = recon + kld_weight * kl + args.w_vel * vel + args.w_acc * acc
+            kld_weight = kl_weight(step, kl_warmup, kl_weight_target)
+            loss = recon + kld_weight * kl + w_vel * vel + w_acc * acc
             if style_loss is not None:
-                loss = loss + args.w_style * style_loss
+                loss = loss + w_style * style_loss
 
             optimizer.zero_grad()
             loss.backward()

@@ -8,8 +8,8 @@ from models.vae.transformer_blocks import AdaLNTransformerBlock
 class MotionVAE(nn.Module):
     def __init__(
         self,
-        d_in,
-        d_z=128,
+        d_in=263,
+        d_z=256,
         d_model=512,
         max_len=256,
         n_layers=8,

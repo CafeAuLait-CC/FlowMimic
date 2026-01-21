@@ -1,5 +1,29 @@
 {
   "aist_motions_dir": "data/AIST++/Annotations/motions",
   "mvhumannet_root": "data/MVHumanNet",
-  "smpl45_to_body25_def": "config/def_smpl45_to_body25.json"
+  "smpl45_to_body25_def": "config/def_smpl45_to_body25.json",
+  "aist_genres": [
+    "BR",
+    "PO",
+    "LO",
+    "MH",
+    "LH",
+    "HO",
+    "WA",
+    "KR",
+    "JS",
+    "JB"
+  ],
+  "num_styles": 11,
+  "d_in": 263,
+  "d_z": 256,
+  "seq_len": 60,
+  "kl_target_weight": 0.002,
+  "kl_warmup_steps": 40000,
+  "w_vel": 0.05,
+  "w_acc": 0.02,
+  "w_contact": 5.0,
+  "w_style": 0.1,
+  "style_dropout_p": 0.1,
+  "stats_path": "config/mean_std_263.npz"
 }

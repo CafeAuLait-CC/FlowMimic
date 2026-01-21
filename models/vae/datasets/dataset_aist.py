@@ -8,6 +8,8 @@ from torch.utils.data import Dataset
 
 from models.vae.datasets.aist_filename_parser import get_genre_code
 from common.dataloader import load_aistpp_smpl22
+from process_motion import smpl_to_ik263
+from models.vae.losses import LAYOUT_SLICES
 
 
 def _pad_or_crop(sequence, target_len):
@@ -31,12 +33,15 @@ def _pad_or_crop(sequence, target_len):
 
 
 class AISTDataset(Dataset):
-    def __init__(self, aist_dir, genre_to_id, seq_len):
+    def __init__(self, aist_dir, genre_to_id, seq_len, mean=None, std=None, normalize=True):
         self.files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
         if not self.files:
             raise FileNotFoundError(f"No AIST++ files found in {aist_dir}")
         self.genre_to_id = genre_to_id
         self.seq_len = seq_len
+        self.mean = mean
+        self.std = std
+        self.normalize = normalize
 
     def __len__(self):
         return len(self.files)
@@ -44,8 +49,20 @@ class AISTDataset(Dataset):
     def __getitem__(self, idx):
         path = self.files[idx]
         joints = load_aistpp_smpl22(path)
-        motion, mask = _pad_or_crop(joints, self.seq_len)
-        motion = motion.reshape(motion.shape[0], -1)
+        motion = smpl_to_ik263(joints)
+        motion, mask = _pad_or_crop(motion, self.seq_len)
+        if motion.shape[-1] != 263:
+            raise ValueError(f"Expected 263 features, got {motion.shape[-1]} in {path}")
+
+        cont_end = LAYOUT_SLICES["feet_contact"][0]
+        contact = motion[:, cont_end:]
+        if not np.isin(contact, [0.0, 1.0]).all():
+            raise ValueError(f"Contact channels are not binary in {path}")
+
+        if self.normalize:
+            if self.mean is None or self.std is None:
+                raise ValueError("mean/std required for normalization")
+            motion[:, :cont_end] = (motion[:, :cont_end] - self.mean) / self.std
 
         genre = get_genre_code(path)
         style_id = self.genre_to_id.get(genre, 0)

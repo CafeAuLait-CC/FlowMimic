@@ -1,5 +1,5 @@
 {
   "aist_motions_dir": "data/AIST++/Annotations/motions",
   "mvhumannet_root": "data/MVHumanNet",
-  "smpl45_to_body25_def": "config/def_smpl45_to_body25.json",
+  "smpl45_to_body25_def": "config/def_smpl45_to_body25.json"
 }

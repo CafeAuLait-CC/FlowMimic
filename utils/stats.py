@@ -5,7 +5,7 @@ from multiprocessing import Pool
 import numpy as np
 from tqdm import tqdm
 
-from data import build_body25, load_body25_mapping, load_smpl_raw_data
+from common.dataloader import build_body25, load_body25_mapping, load_smpl_raw_data
 
 
 def _stats_for_file(args):

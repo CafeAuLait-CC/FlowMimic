@@ -1,7 +1,7 @@
 import glob
 import os
 
-from data import load_aistpp_smpl22, load_mvhumannet_sequence_smpl22
+from common.dataloader import load_aistpp_smpl22, load_mvhumannet_sequence_smpl22
 from utils.config import load_config
 
 

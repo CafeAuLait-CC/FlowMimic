@@ -28,7 +28,7 @@ def load_mvhumannet_raw_joints(pkl_path):
 
 def load_mvhumannet_smpl22(pkl_path):
     joints3d = load_mvhumannet_raw_joints(pkl_path)
-    return joints3d[:, :22]
+    return joints3d[:22]
 
 
 def load_body25_mapping(def_path):

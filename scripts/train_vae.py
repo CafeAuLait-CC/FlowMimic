@@ -65,7 +65,7 @@ def main():
     parser.add_argument("--w-contact", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--genre-map", type=str, default="genre_to_id.json")
-    parser.add_argument("--stats-path", type=str, default=None)
+    # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 
     config = load_config()
@@ -83,7 +83,8 @@ def main():
     w_style = args.w_style or config["w_style"]
     w_contact = args.w_contact or config["w_contact"]
     style_dropout_p = config["style_dropout_p"]
-    stats_path = args.stats_path or config["stats_path"]
+    stats_path_aist = config["stats_path_aist"]
+    stats_path_mvh = config["stats_path_mvh"]
 
     if os.path.exists(args.genre_map):
         with open(args.genre_map, "r", encoding="utf-8") as f:
@@ -92,14 +93,19 @@ def main():
         genre_to_id = build_genre_to_id(aist_genres)
         save_genre_to_id(genre_to_id, args.genre_map)
 
-    if not os.path.exists(stats_path):
+    if not os.path.exists(stats_path_aist):
         stats_a = AISTDataset(aist_dir, genre_to_id, seq_len, normalize=False)
-        compute_mean_std(stats_a, stats_path)
+        compute_mean_std(stats_a, stats_path_aist, desc="AIST++ mean/std")
 
-    mean, std = load_mean_std(stats_path)
+    if not os.path.exists(stats_path_mvh):
+        stats_b = MVHumanNetDataset(mv_root, seq_len, normalize=False)
+        compute_mean_std(stats_b, stats_path_mvh, desc="MVHumanNet mean/std")
 
-    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean, std=std)
-    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean, std=std)
+    mean_a, std_a = load_mean_std(stats_path_aist)
+    mean_b, std_b = load_mean_std(stats_path_mvh)
+
+    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean_a, std=std_a)
+    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean_b, std=std_b)
 
     loader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=True, drop_last=True)
     loader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=True, drop_last=True)

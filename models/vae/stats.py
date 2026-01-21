@@ -1,17 +1,18 @@
 import os
 
 import numpy as np
+from tqdm import tqdm
 
 from models.vae.losses import LAYOUT_SLICES
 
 
-def compute_mean_std(dataset, out_path, eps=1e-6):
+def compute_mean_std(dataset, out_path, eps=1e-6, desc="Computing mean/std"):
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     sum_vec = np.zeros(cont_end, dtype=np.float64)
     sum_sq = np.zeros(cont_end, dtype=np.float64)
     count = 0.0
 
-    for sample in dataset:
+    for sample in tqdm(dataset, desc=desc):
         motion = sample["motion"].numpy()
         mask = sample["mask"].numpy()
         valid = motion[mask][:, :cont_end]

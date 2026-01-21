@@ -65,14 +65,15 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--genre-map", type=str, default=None)
-    parser.add_argument("--stats-path", type=str, default=None)
+    # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 
     config = load_config()
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     seq_len = args.seq_len or config["seq_len"]
-    stats_path = args.stats_path or config["stats_path"]
+    stats_path_aist = config["stats_path_aist"]
+    stats_path_mvh = config["stats_path_mvh"]
     w_contact = config["w_contact"]
 
     if args.genre_map and os.path.exists(args.genre_map):
@@ -84,10 +85,11 @@ def main():
     num_styles = config["num_styles"]
     d_in = config["d_in"]
     d_z = config["d_z"]
-    mean, std = load_mean_std(stats_path)
+    mean_a, std_a = load_mean_std(stats_path_aist)
+    mean_b, std_b = load_mean_std(stats_path_mvh)
 
-    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean, std=std)
-    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean, std=std)
+    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean_a, std=std_a)
+    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean_b, std=std_b)
 
     loader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=False)
     loader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=False)
@@ -97,8 +99,8 @@ def main():
     model.load_state_dict(state["model"])
     model.to(args.device)
 
-    aist_metrics = run_eval(loader_a, model, args.device, mean, std, w_contact)
-    mvh_metrics = run_eval(loader_b, model, args.device, mean, std, w_contact)
+    aist_metrics = run_eval(loader_a, model, args.device, mean_a, std_a, w_contact)
+    mvh_metrics = run_eval(loader_b, model, args.device, mean_b, std_b, w_contact)
 
     print("AIST++ metrics", aist_metrics)
     print("MVHumanNet metrics", mvh_metrics)

@@ -56,6 +56,14 @@ def load_aistpp_raw_joints(pkl_path):
 
     joints3d = joints_from_smpl_param(data)
     joints3d = _transform_aistpp(joints3d)
+
+    scale = float(np.array(data["smpl_scaling"]).reshape(-1)[0])
+    if scale > 0:
+        pelvis = joints3d[:, 0]
+        delta = pelvis - pelvis[0]
+        scaled_pelvis = pelvis[0] + (delta / scale)
+        joints3d = joints3d - pelvis[:, None, :] + scaled_pelvis[:, None, :]
+
     base_pelvis = joints3d[0, 0].copy()
     return joints3d - base_pelvis
 

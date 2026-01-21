@@ -1,29 +1,43 @@
 import glob
 import os
 
-from data import load_mvhumannet_raw_joints, load_mvhumannet_smpl22
+from data import load_aistpp_smpl22
 from utils.config import load_config
 
 
 def main():
     paths = load_config()
 
-    mv_root = paths["mvhumannet_root"]
-    mv_files = sorted(
-        glob.glob(
-            os.path.join(mv_root, "MVHumanNet_24_Part_0*", "*", "smpl_param", "*.pkl")
-        )
-    )
-    if not mv_files:
-        raise FileNotFoundError(f"No MVHumanNet smpl_param files found in {mv_root}")
+    aist_dir = paths["aist_motions_dir"]
 
-    first_file = mv_files[0]
-    joints3d = load_mvhumannet_raw_joints(first_file)
-    smpl22 = load_mvhumannet_smpl22(first_file)
+    aist_files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
+    if not aist_files:
+        raise FileNotFoundError(f"No AIST++ motion files found in {aist_dir}")
 
-    print(f"Raw joints shape: {joints3d.shape}")
-    print(f"SMPL-22 shape: {smpl22.shape}")
-    print(smpl22)
+    joints3d = load_aistpp_smpl22(aist_files[0])
+    first_frame = joints3d[0]
+    last_frame = joints3d[-1]
+    pelvis = joints3d[:, 0]
+
+    write_frame_list(first_frame, "aist_first_frame.txt")
+    write_frame_list(last_frame, "aist_last_frame.txt")
+    write_trajectory_list(pelvis, "pelvis_trajectory.txt")
+
+
+def write_frame_list(points, out_path):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("[\n")
+        for x, y, z in points:
+            f.write(f"  [{x}, {y}, {z}],\n")
+        f.write("]\n")
+
+
+def write_trajectory_list(points, out_path):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("[\n")
+        for x, y, z in points:
+            f.write(f"  [{x}, {y}, {z}],\n")
+        f.write("]\n")
 
 
 if __name__ == "__main__":

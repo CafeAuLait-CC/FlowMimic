@@ -1,10 +1,10 @@
 import os
 
 import torch
-from smplx import SMPL  # 或 aist api 提供的 SMPL 包装
+from smplx import SMPL
 
 
-def pose_from_aist(aist_data):
+def joints_from_smpl_param(aist_data):
     smpl_dir = os.path.join("data", "smpl_models")
 
     smpl_poses = aist_data["smpl_poses"]

@@ -1,15 +1,63 @@
 import json
+import os
 
 import numpy as np
 
 from utils.smpl2joints import joints_from_smpl_param
+
+_MVH_BASE_PELVIS = {}
+
+
+def _transform_aistpp(joints3d):
+    x = joints3d[..., 0]
+    y = joints3d[..., 1]
+    z = joints3d[..., 2]
+    return np.stack([x, -z, y], axis=-1)
+
+
+def _transform_mvhumannet(joints3d):
+    x = joints3d[..., 0]
+    y = joints3d[..., 1]
+    z = joints3d[..., 2]
+    return np.stack([-y, -x, -z], axis=-1)
+
+
+def _load_mvhumannet_joints_noalign(pkl_path):
+    data = np.load(pkl_path, allow_pickle=True)
+    if hasattr(data, "item"):
+        data = data.item()
+
+    joints = data["joints"]
+    if joints.ndim == 2:
+        joints = joints[None, ...]
+    return joints
+
+
+def _get_mvhumannet_base_pelvis(smpl_param_dir):
+    if smpl_param_dir in _MVH_BASE_PELVIS:
+        return _MVH_BASE_PELVIS[smpl_param_dir]
+
+    frame_files = sorted(
+        f for f in os.listdir(smpl_param_dir) if f.endswith(".pkl")
+    )
+    if not frame_files:
+        raise FileNotFoundError(f"No frame files found in {smpl_param_dir}")
+
+    first_path = os.path.join(smpl_param_dir, frame_files[0])
+    joints = _load_mvhumannet_joints_noalign(first_path)
+    joints = _transform_mvhumannet(joints)
+    base_pelvis = joints[0, 0].copy()
+    _MVH_BASE_PELVIS[smpl_param_dir] = base_pelvis
+    return base_pelvis
 
 
 def load_aistpp_raw_joints(pkl_path):
     data = np.load(pkl_path, allow_pickle=True)
 
     joints3d = joints_from_smpl_param(data)
-    return joints3d
+    joints3d = _transform_aistpp(joints3d)
+    base_pelvis = joints3d[0, 0].copy()
+    return joints3d - base_pelvis
 
 
 def load_aistpp_smpl22(pkl_path):
@@ -18,17 +66,16 @@ def load_aistpp_smpl22(pkl_path):
 
 
 def load_mvhumannet_raw_joints(pkl_path):
-    data = np.load(pkl_path, allow_pickle=True)
-
-    joints = data["joints"]
-    if joints.ndim == 3 and joints.shape[0] == 1:
-        joints = joints[0]
-    return joints
+    joints = _load_mvhumannet_joints_noalign(pkl_path)
+    joints = _transform_mvhumannet(joints)
+    smpl_param_dir = os.path.dirname(pkl_path)
+    base_pelvis = _get_mvhumannet_base_pelvis(smpl_param_dir)
+    return joints - base_pelvis
 
 
 def load_mvhumannet_smpl22(pkl_path):
     joints3d = load_mvhumannet_raw_joints(pkl_path)
-    return joints3d[:22]
+    return joints3d[:, :22]
 
 
 def load_body25_mapping(def_path):

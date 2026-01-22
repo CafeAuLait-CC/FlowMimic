@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--genre-map", type=str, default=None)
+    parser.add_argument("--genre-map", type=str, default="config/genre_to_id.json")
     # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 

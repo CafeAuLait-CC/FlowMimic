@@ -78,7 +78,7 @@ def main():
     parser.add_argument("--w-style", type=float, default=None)
     parser.add_argument("--w-contact", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--genre-map", type=str, default="genre_to_id.json")
+    parser.add_argument("--genre-map", type=str, default="config/genre_to_id.json")
     # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 

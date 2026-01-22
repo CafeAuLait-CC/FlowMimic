@@ -25,7 +25,7 @@
   "w_contact": 5.0,
   "w_style": 0.1,
   "style_dropout_p": 0.1,
-  "stats_path": "config/mean_std_263_train.npz",
+  "stats_path": "data/mean_std_263_train.npz",
   "aist_split_train": "data/AIST++/Annotations/splits/pose_train.txt",
   "aist_split_val": "data/AIST++/Annotations/splits/pose_val.txt",
   "mvh_split_train": "data/MVHumanNet/mvh_train.txt",

@@ -1,9 +1,12 @@
 import argparse
 import json
 import os
+import sys
 
 import torch
 from torch.utils.data import DataLoader
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from models.vae.datasets.dataset_aist import AISTDataset
 from models.vae.datasets.dataset_mvh import MVHumanNetDataset
@@ -72,8 +75,14 @@ def main():
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     seq_len = args.seq_len or config["seq_len"]
-    stats_path_aist = config["stats_path_aist"]
-    stats_path_mvh = config["stats_path_mvh"]
+    stats_path = config["stats_path"]
+    aist_split_val = config["aist_split_val"]
+    mvh_split_val = config["mvh_split_val"]
+
+    if not os.path.exists(aist_split_val):
+        raise FileNotFoundError(f"AIST split file not found: {aist_split_val}")
+    if not os.path.exists(mvh_split_val):
+        raise FileNotFoundError(f"MVHumanNet split file not found: {mvh_split_val}")
     w_contact = config["w_contact"]
 
     if args.genre_map and os.path.exists(args.genre_map):
@@ -85,11 +94,25 @@ def main():
     num_styles = config["num_styles"]
     d_in = config["d_in"]
     d_z = config["d_z"]
-    mean_a, std_a = load_mean_std(stats_path_aist)
-    mean_b, std_b = load_mean_std(stats_path_mvh)
+    mean, std = load_mean_std(stats_path)
 
-    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean_a, std=std_a)
-    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean_b, std=std_b)
+    def read_lines(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def aist_split_paths(split_path):
+        names = read_lines(split_path)
+        return [os.path.join(aist_dir, f\"{name}.pkl\") for name in names]
+
+    aist_val_paths = aist_split_paths(aist_split_val)
+    mvh_val_dirs = read_lines(mvh_split_val)
+
+    dataset_a = AISTDataset(
+        aist_dir, genre_to_id, seq_len, mean=mean, std=std, files=aist_val_paths
+    )
+    dataset_b = MVHumanNetDataset(
+        mv_root, seq_len, mean=mean, std=std, sequence_dirs=mvh_val_dirs
+    )
 
     loader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=False)
     loader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=False)
@@ -99,8 +122,8 @@ def main():
     model.load_state_dict(state["model"])
     model.to(args.device)
 
-    aist_metrics = run_eval(loader_a, model, args.device, mean_a, std_a, w_contact)
-    mvh_metrics = run_eval(loader_b, model, args.device, mean_b, std_b, w_contact)
+    aist_metrics = run_eval(loader_a, model, args.device, mean, std, w_contact)
+    mvh_metrics = run_eval(loader_b, model, args.device, mean, std, w_contact)
 
     print("AIST++ metrics", aist_metrics)
     print("MVHumanNet metrics", mvh_metrics)

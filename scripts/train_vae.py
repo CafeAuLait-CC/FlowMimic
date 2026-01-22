@@ -1,9 +1,13 @@
 import argparse
 import json
 import os
+import random
+import sys
 
 import torch
 from torch.utils.data import DataLoader
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from models.vae.datasets.balanced_batch_sampler import balanced_batch_iter
 from models.vae.datasets.dataset_aist import AISTDataset
@@ -11,7 +15,7 @@ from models.vae.datasets.dataset_mvh import MVHumanNetDataset
 from models.vae.datasets.label_map_builder import build_genre_to_id, save_genre_to_id
 from models.vae.losses import grouped_recon_loss, masked_kl, smoothness_loss, style_ce_loss
 from models.vae.motion_vae import MotionVAE
-from models.vae.stats import compute_mean_std, load_mean_std
+from models.vae.stats import compute_mean_std_from_splits, load_mean_std
 from utils.config import load_config
 
 
@@ -46,6 +50,16 @@ def apply_style_dropout(style_id, domain_id, p):
     style_id = style_id.clone()
     style_id[drop_mask] = 0
     return style_id
+
+
+def read_lines(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def aist_split_paths(aist_dir, split_path):
+    names = read_lines(split_path)
+    return [os.path.join(aist_dir, f\"{name}.pkl\") for name in names]
 
 
 def main():
@@ -83,8 +97,14 @@ def main():
     w_style = args.w_style or config["w_style"]
     w_contact = args.w_contact or config["w_contact"]
     style_dropout_p = config["style_dropout_p"]
-    stats_path_aist = config["stats_path_aist"]
-    stats_path_mvh = config["stats_path_mvh"]
+    stats_path = config["stats_path"]
+    aist_split_train = config["aist_split_train"]
+    mvh_split_train = config["mvh_split_train"]
+
+    if not os.path.exists(aist_split_train):
+        raise FileNotFoundError(f"AIST split file not found: {aist_split_train}")
+    if not os.path.exists(mvh_split_train):
+        raise FileNotFoundError(f"MVHumanNet split file not found: {mvh_split_train}")
 
     if os.path.exists(args.genre_map):
         with open(args.genre_map, "r", encoding="utf-8") as f:
@@ -93,22 +113,29 @@ def main():
         genre_to_id = build_genre_to_id(aist_genres)
         save_genre_to_id(genre_to_id, args.genre_map)
 
-    if not os.path.exists(stats_path_aist):
-        stats_a = AISTDataset(aist_dir, genre_to_id, seq_len, normalize=False)
-        compute_mean_std(stats_a, stats_path_aist, desc="AIST++ mean/std")
+    aist_train_paths = aist_split_paths(aist_dir, aist_split_train)
+    mvh_train_dirs = read_lines(mvh_split_train)
 
-    if not os.path.exists(stats_path_mvh):
-        stats_b = MVHumanNetDataset(mv_root, seq_len, normalize=False)
-        compute_mean_std(stats_b, stats_path_mvh, desc="MVHumanNet mean/std")
+    if not os.path.exists(stats_path):
+        compute_mean_std_from_splits(
+            aist_train_paths,
+            mvh_train_dirs,
+            stats_path,
+            workers=10,
+        )
 
-    mean_a, std_a = load_mean_std(stats_path_aist)
-    mean_b, std_b = load_mean_std(stats_path_mvh)
+    mean, std = load_mean_std(stats_path)
 
-    dataset_a = AISTDataset(aist_dir, genre_to_id, seq_len, mean=mean_a, std=std_a)
-    dataset_b = MVHumanNetDataset(mv_root, seq_len, mean=mean_b, std=std_b)
+    dataset_a = AISTDataset(
+        aist_dir,
+        genre_to_id,
+        seq_len,
+        mean=mean,
+        std=std,
+        files=aist_train_paths,
+    )
 
     loader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    loader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     model = MotionVAE(d_in=d_in, d_z=d_z, num_styles=num_styles, max_len=seq_len)
     model.to(args.device)
@@ -120,6 +147,21 @@ def main():
     step = 0
     for epoch in range(args.epochs):
         model.train()
+        rng = random.Random(epoch)
+        rng.shuffle(mvh_train_dirs)
+        mvh_subset = mvh_train_dirs[: min(len(mvh_train_dirs), len(aist_train_paths))]
+
+        dataset_b = MVHumanNetDataset(
+            mv_root,
+            seq_len,
+            mean=mean,
+            std=std,
+            sequence_dirs=mvh_subset,
+        )
+        loader_b = DataLoader(
+            dataset_b, batch_size=args.batch_size, shuffle=True, drop_last=True
+        )
+
         batch_iter = balanced_batch_iter(loader_a, loader_b, args.ratio_aist, args.ratio_mvh)
 
         for _ in range(min(len(loader_a), len(loader_b))):

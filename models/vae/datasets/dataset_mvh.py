@@ -32,12 +32,23 @@ def _pad_or_crop(sequence, target_len):
 
 
 class MVHumanNetDataset(Dataset):
-    def __init__(self, mv_root, seq_len, mean=None, std=None, normalize=True):
-        self.sequence_dirs = sorted(
-            glob.glob(
-                os.path.join(mv_root, "MVHumanNet_24_Part_0*", "*", "smpl_param")
+    def __init__(
+        self,
+        mv_root,
+        seq_len,
+        mean=None,
+        std=None,
+        normalize=True,
+        sequence_dirs=None,
+    ):
+        if sequence_dirs is None:
+            self.sequence_dirs = sorted(
+                glob.glob(
+                    os.path.join(mv_root, "MVHumanNet_24_Part_0*", "*", "smpl_param")
+                )
             )
-        )
+        else:
+            self.sequence_dirs = list(sequence_dirs)
         if not self.sequence_dirs:
             raise FileNotFoundError(f"No MVHumanNet smpl_param dirs found in {mv_root}")
         self.seq_len = seq_len

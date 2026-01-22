@@ -33,8 +33,20 @@ def _pad_or_crop(sequence, target_len):
 
 
 class AISTDataset(Dataset):
-    def __init__(self, aist_dir, genre_to_id, seq_len, mean=None, std=None, normalize=True):
-        self.files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
+    def __init__(
+        self,
+        aist_dir,
+        genre_to_id,
+        seq_len,
+        mean=None,
+        std=None,
+        normalize=True,
+        files=None,
+    ):
+        if files is None:
+            self.files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
+        else:
+            self.files = list(files)
         if not self.files:
             raise FileNotFoundError(f"No AIST++ files found in {aist_dir}")
         self.genre_to_id = genre_to_id

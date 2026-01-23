@@ -50,6 +50,8 @@ def _stats_for_sequence(args):
     motion = smpl_to_ik263(joints)
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     cont = motion[:, :cont_end]
+    if not np.isfinite(cont).all():
+        return None
     sum_vec = cont.sum(axis=0)
     sum_sq = (cont ** 2).sum(axis=0)
     count = cont.shape[0]
@@ -81,15 +83,23 @@ def compute_mean_std_from_splits(
     if not tasks:
         raise ValueError("No samples provided for stats computation")
 
+    skipped = 0
     with Pool(processes=workers, initializer=_init_worker) as pool:
-        for s_vec, s_sq, n in tqdm(
+        for result in tqdm(
             pool.imap_unordered(_stats_for_sequence, tasks),
             total=len(tasks),
             desc="Computing mean/std",
         ):
+            if result is None:
+                skipped += 1
+                continue
+            s_vec, s_sq, n = result
             sum_vec += s_vec
             sum_sq += s_sq
             count += n
+
+    if skipped:
+        print(f"Skipped {skipped} sequences with non-finite values")
 
     if count == 0:
         raise ValueError("No valid frames found for statistics")

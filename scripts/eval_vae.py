@@ -7,10 +7,16 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 from models.vae.datasets.dataset_aist import AISTDataset
 from models.vae.datasets.dataset_mvh import MVHumanNetDataset
-from models.vae.losses import grouped_recon_loss, masked_kl, style_ce_loss, LAYOUT_SLICES
+from models.vae.losses import (
+    grouped_recon_loss,
+    masked_kl,
+    style_ce_loss,
+    LAYOUT_SLICES,
+)
 from models.vae.motion_vae import MotionVAE
 from models.vae.stats import load_mean_std
 from utils.config import load_config
@@ -65,8 +71,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--seq-len", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument("--genre-map", type=str, default="config/genre_to_id.json")
     # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
@@ -75,7 +83,13 @@ def main():
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     seq_len = args.seq_len or config["seq_len"]
+    batch_size = args.batch_size or config["eval_batch_size"]
+    num_workers = config["num_workers"]
+    pin_memory = config["pin_memory"]
+    persistent_workers = config["persistent_workers"]
+    prefetch_factor = config["prefetch_factor"]
     stats_path = config["stats_path"]
+    cache_root = config["cache_root"]
     aist_split_val = config["aist_split_val"]
     mvh_split_val = config["mvh_split_val"]
 
@@ -102,20 +116,47 @@ def main():
 
     def aist_split_paths(split_path):
         names = read_lines(split_path)
-        return [os.path.join(aist_dir, f\"{name}.pkl\") for name in names]
+        return [os.path.join(aist_dir, f"{name}.pkl") for name in names]
 
     aist_val_paths = aist_split_paths(aist_split_val)
     mvh_val_dirs = read_lines(mvh_split_val)
 
     dataset_a = AISTDataset(
-        aist_dir, genre_to_id, seq_len, mean=mean, std=std, files=aist_val_paths
+        aist_dir,
+        genre_to_id,
+        seq_len,
+        mean=mean,
+        std=std,
+        files=aist_val_paths,
+        cache_root=cache_root,
     )
     dataset_b = MVHumanNetDataset(
-        mv_root, seq_len, mean=mean, std=std, sequence_dirs=mvh_val_dirs
+        mv_root,
+        seq_len,
+        mean=mean,
+        std=std,
+        sequence_dirs=mvh_val_dirs,
+        cache_root=cache_root,
     )
 
-    loader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=False)
-    loader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=False)
+    loader_a = DataLoader(
+        dataset_a,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+    loader_b = DataLoader(
+        dataset_b,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
 
     model = MotionVAE(d_in=d_in, d_z=d_z, num_styles=num_styles, max_len=seq_len)
     state = torch.load(args.checkpoint, map_location=args.device)

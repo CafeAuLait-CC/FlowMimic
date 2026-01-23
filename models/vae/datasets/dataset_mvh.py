@@ -40,6 +40,7 @@ class MVHumanNetDataset(Dataset):
         std=None,
         normalize=True,
         sequence_dirs=None,
+        cache_root=None,
     ):
         if sequence_dirs is None:
             self.sequence_dirs = sorted(
@@ -51,19 +52,34 @@ class MVHumanNetDataset(Dataset):
             self.sequence_dirs = list(sequence_dirs)
         if not self.sequence_dirs:
             raise FileNotFoundError(f"No MVHumanNet smpl_param dirs found in {mv_root}")
+        self.mv_root = mv_root
         self.seq_len = seq_len
         self.mean = mean
         self.std = std
         self.normalize = normalize
+        self.cache_root = cache_root
 
     def __len__(self):
         return len(self.sequence_dirs)
 
     def __getitem__(self, idx):
         seq_dir = self.sequence_dirs[idx]
-        joints = load_mvhumannet_sequence_smpl22(seq_dir)
-        motion = smpl_to_ik263(joints)
+        motion = None
+        if self.cache_root:
+            rel = os.path.relpath(seq_dir, self.mv_root)
+            cache_path = os.path.join(self.cache_root, "mvh", f"{rel}.npy")
+            if os.path.exists(cache_path):
+                motion = np.load(cache_path)
+
+        if motion is None:
+            joints = load_mvhumannet_sequence_smpl22(seq_dir)
+            motion = smpl_to_ik263(joints)
+            if self.cache_root:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                np.save(cache_path, motion)
         motion, mask = _pad_or_crop(motion, self.seq_len)
+        if not np.isfinite(motion).all():
+            return self.__getitem__((idx + 1) % len(self.sequence_dirs))
         if motion.shape[-1] != 263:
             raise ValueError(f"Expected 263 features, got {motion.shape[-1]} in {seq_dir}")
 
@@ -76,6 +92,8 @@ class MVHumanNetDataset(Dataset):
             if self.mean is None or self.std is None:
                 raise ValueError("mean/std required for normalization")
             motion[:, :cont_end] = (motion[:, :cont_end] - self.mean) / self.std
+            if not np.isfinite(motion).all():
+                return self.__getitem__((idx + 1) % len(self.sequence_dirs))
 
         sample = {
             "motion": torch.from_numpy(motion).float(),

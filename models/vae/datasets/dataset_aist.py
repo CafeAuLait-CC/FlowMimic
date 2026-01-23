@@ -42,6 +42,7 @@ class AISTDataset(Dataset):
         std=None,
         normalize=True,
         files=None,
+        cache_root=None,
     ):
         if files is None:
             self.files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
@@ -54,15 +55,29 @@ class AISTDataset(Dataset):
         self.mean = mean
         self.std = std
         self.normalize = normalize
+        self.cache_root = cache_root
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         path = self.files[idx]
-        joints = load_aistpp_smpl22(path)
-        motion = smpl_to_ik263(joints)
+        motion = None
+        if self.cache_root:
+            name = os.path.splitext(os.path.basename(path))[0]
+            cache_path = os.path.join(self.cache_root, "aist", f"{name}.npy")
+            if os.path.exists(cache_path):
+                motion = np.load(cache_path)
+
+        if motion is None:
+            joints = load_aistpp_smpl22(path)
+            motion = smpl_to_ik263(joints)
+            if self.cache_root:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                np.save(cache_path, motion)
         motion, mask = _pad_or_crop(motion, self.seq_len)
+        if not np.isfinite(motion).all():
+            return self.__getitem__((idx + 1) % len(self.files))
         if motion.shape[-1] != 263:
             raise ValueError(f"Expected 263 features, got {motion.shape[-1]} in {path}")
 
@@ -75,6 +90,8 @@ class AISTDataset(Dataset):
             if self.mean is None or self.std is None:
                 raise ValueError("mean/std required for normalization")
             motion[:, :cont_end] = (motion[:, :cont_end] - self.mean) / self.std
+            if not np.isfinite(motion).all():
+                return self.__getitem__((idx + 1) % len(self.files))
 
         genre = get_genre_code(path)
         style_id = self.genre_to_id.get(genre, 0)

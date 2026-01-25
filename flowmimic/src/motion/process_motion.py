@@ -1,15 +1,15 @@
 import numpy as np
 import torch
 
-from motion_ik.common.quaternion import (
+from flowmimic.src.motion.ik.common.quaternion import (
     qbetween_np,
     qinv_np,
     qmul_np,
     qrot_np,
     quaternion_to_cont6d_np,
 )
-from motion_ik.common.skeleton import Skeleton
-from motion_ik.utils.paramUtil import t2m_kinematic_chain, t2m_raw_offsets
+from flowmimic.src.motion.ik.common.skeleton import Skeleton
+from flowmimic.src.motion.ik.utils.paramUtil import t2m_kinematic_chain, t2m_raw_offsets
 
 
 # Indices follow the Text2Motion 22-joint skeleton definition.
@@ -122,3 +122,50 @@ def smpl_to_ik263(positions, feet_thre=0.002):
     last_row = data[-1:]
     data = np.concatenate([data, last_row], axis=0)
     return data
+
+
+def _recover_root_rot_pos(data):
+    rot_vel = data[..., 0]
+    r_rot_ang = np.zeros_like(rot_vel)
+    r_rot_ang[..., 1:] = rot_vel[..., :-1]
+    r_rot_ang = np.cumsum(r_rot_ang, axis=-1)
+
+    r_rot_quat = np.zeros(rot_vel.shape + (4,), dtype=data.dtype)
+    r_rot_quat[..., 0] = np.cos(r_rot_ang)
+    r_rot_quat[..., 2] = np.sin(r_rot_ang)
+
+    r_pos = np.zeros(rot_vel.shape + (3,), dtype=data.dtype)
+    r_pos[..., 1:, [0, 2]] = data[..., :-1, 1:3]
+    r_pos = qrot_np(qinv_np(r_rot_quat), r_pos)
+    r_pos = np.cumsum(r_pos, axis=-2)
+    r_pos[..., 1] = data[..., 3]
+    return r_rot_quat, r_pos
+
+
+def ik263_to_smpl22(features):
+    if features.ndim not in (2, 3):
+        raise ValueError("Expected features with shape (N, 263) or (B, N, 263)")
+    if features.shape[-1] != 263:
+        raise ValueError(f"Expected 263 features, got {features.shape[-1]}")
+
+    single = features.ndim == 2
+    data = features[None, ...] if single else features
+
+    r_rot_quat, r_pos = _recover_root_rot_pos(data)
+
+    joints_num = 22
+    start = 4
+    end = (joints_num - 1) * 3 + start
+    positions = data[..., start:end]
+    positions = positions.reshape(positions.shape[:-1] + (joints_num - 1, 3))
+
+    r_rot_rep = np.repeat(r_rot_quat[..., None, :], positions.shape[-2], axis=-2)
+    positions = qrot_np(qinv_np(r_rot_rep), positions)
+
+    positions[..., 0] += r_pos[..., 0:1]
+    positions[..., 2] += r_pos[..., 2:3]
+    positions = np.concatenate([r_pos[..., None, :], positions], axis=-2)
+
+    if single:
+        return positions[0]
+    return positions

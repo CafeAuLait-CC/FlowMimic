@@ -5,7 +5,11 @@ from multiprocessing import Pool
 import numpy as np
 from tqdm import tqdm
 
-from common.dataloader import build_body25, load_body25_mapping, load_aistpp_raw_joints
+from flowmimic.src.data.dataloader import (
+    build_body25,
+    load_aistpp_raw_joints,
+    load_body25_mapping,
+)
 
 
 def _stats_for_file(args):

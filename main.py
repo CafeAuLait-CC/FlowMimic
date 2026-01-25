@@ -1,8 +1,11 @@
 import glob
 import os
 
-from common.dataloader import load_aistpp_smpl22, load_mvhumannet_sequence_smpl22
-from utils.config import load_config
+from flowmimic.src.config.config import load_config
+from flowmimic.src.data.dataloader import (
+    load_aistpp_smpl22,
+    load_mvhumannet_sequence_smpl22,
+)
 
 
 def main():

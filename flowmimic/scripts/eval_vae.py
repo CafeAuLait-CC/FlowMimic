@@ -6,20 +6,22 @@ import sys
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-from models.vae.datasets.dataset_aist import AISTDataset
-from models.vae.datasets.dataset_mvh import MVHumanNetDataset
-from models.vae.losses import (
+from flowmimic.src.config.config import load_config
+from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
+from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
+from flowmimic.src.model.vae.losses import (
     grouped_recon_loss,
     masked_kl,
     style_ce_loss,
     LAYOUT_SLICES,
 )
-from models.vae.motion_vae import MotionVAE
-from models.vae.stats import load_mean_std
-from utils.config import load_config
+from flowmimic.src.model.vae.motion_vae import MotionVAE
+from flowmimic.src.model.vae.stats import load_mean_std
 
 
 def run_eval(loader, model, device, mean, std, w_contact):
@@ -75,7 +77,9 @@ def main():
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
-    parser.add_argument("--genre-map", type=str, default="config/genre_to_id.json")
+    parser.add_argument(
+        "--genre-map", type=str, default="flowmimic/src/config/genre_to_id.json"
+    )
     # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 

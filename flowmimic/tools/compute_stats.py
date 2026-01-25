@@ -2,10 +2,12 @@ import argparse
 import os
 import sys
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
-from models.vae.stats import compute_mean_std_from_splits
-from utils.config import load_config
+from flowmimic.src.config.config import load_config
+from flowmimic.src.model.vae.stats import compute_mean_std_from_splits
 
 
 def read_lines(path):

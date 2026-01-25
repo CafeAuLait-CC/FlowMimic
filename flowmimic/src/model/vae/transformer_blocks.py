@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from models.vae.adaln import AdaLayerNorm
+from flowmimic.src.model.vae.adaln import AdaLayerNorm
 
 
 class AdaLNTransformerBlock(nn.Module):

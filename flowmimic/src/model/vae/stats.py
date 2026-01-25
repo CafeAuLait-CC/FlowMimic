@@ -4,9 +4,12 @@ from multiprocessing import Pool
 import numpy as np
 from tqdm import tqdm
 
-from common.dataloader import load_aistpp_smpl22, load_mvhumannet_sequence_smpl22
-from models.vae.losses import LAYOUT_SLICES
-from process_motion import smpl_to_ik263
+from flowmimic.src.data.dataloader import (
+    load_aistpp_smpl22,
+    load_mvhumannet_sequence_smpl22,
+)
+from flowmimic.src.model.vae.losses import LAYOUT_SLICES
+from flowmimic.src.motion.process_motion import smpl_to_ik263
 import torch
 
 

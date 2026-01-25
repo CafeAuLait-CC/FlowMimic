@@ -9,22 +9,27 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-from models.vae.datasets.balanced_batch_sampler import balanced_batch_iter
-from models.vae.datasets.dataset_aist import AISTDataset
-from models.vae.datasets.dataset_mvh import MVHumanNetDataset
-from models.vae.datasets.label_map_builder import build_genre_to_id, save_genre_to_id
-from models.vae.losses import (
+from flowmimic.src.config.config import load_config
+from flowmimic.src.model.vae.datasets.balanced_batch_sampler import balanced_batch_iter
+from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
+from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
+from flowmimic.src.model.vae.datasets.label_map_builder import (
+    build_genre_to_id,
+    save_genre_to_id,
+)
+from flowmimic.src.model.vae.losses import (
     grouped_recon_loss,
     masked_kl,
     smoothness_loss,
     style_ce_loss,
 )
-from models.vae.motion_vae import MotionVAE
-from models.vae.stats import compute_mean_std_from_splits, load_mean_std
-from utils.config import load_config
+from flowmimic.src.model.vae.motion_vae import MotionVAE
+from flowmimic.src.model.vae.stats import compute_mean_std_from_splits, load_mean_std
 
 
 def merge_batches(batches):
@@ -88,7 +93,9 @@ def main():
     parser.add_argument("--w-style", type=float, default=None)
     parser.add_argument("--w-contact", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--genre-map", type=str, default="config/genre_to_id.json")
+    parser.add_argument(
+        "--genre-map", type=str, default="flowmimic/src/config/genre_to_id.json"
+    )
     parser.add_argument("--debug-timing", action="store_true")
     parser.add_argument("--debug-every", type=int, default=50)
     # stats paths are taken from config (separate per dataset)

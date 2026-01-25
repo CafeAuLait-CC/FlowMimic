@@ -6,11 +6,16 @@ from multiprocessing import Pool
 import numpy as np
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
-from common.dataloader import load_aistpp_smpl22, load_mvhumannet_sequence_smpl22
-from process_motion import smpl_to_ik263
-from utils.config import load_config
+from flowmimic.src.config.config import load_config
+from flowmimic.src.data.dataloader import (
+    load_aistpp_smpl22,
+    load_mvhumannet_sequence_smpl22,
+)
+from flowmimic.src.motion.process_motion import smpl_to_ik263
 
 
 def _init_worker():

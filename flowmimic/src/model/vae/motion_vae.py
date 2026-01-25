@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 
-from models.vae.cond_embedding import CondEmbedding
-from models.vae.transformer_blocks import AdaLNTransformerBlock
+from flowmimic.src.model.vae.cond_embedding import CondEmbedding
+from flowmimic.src.model.vae.transformer_blocks import AdaLNTransformerBlock
 
 
 class MotionVAE(nn.Module):

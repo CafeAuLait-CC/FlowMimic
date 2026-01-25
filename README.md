@@ -5,50 +5,49 @@ This repo contains data loading, preprocessing, and a multi-domain conditional M
 ## Project structure
 
 ```
-common/
-  dataloader.py            # AIST/MVHumanNet loading, alignment, SMPL22 selection
-config/
-  config.json              # Main config (paths + hyperparams)
-  def_aist2body25.json      # SMPL to BODY-25 mapping w/ computed pelvis/neck
-  genre_to_id.json          # Genre id mapping (0=unknown)
-  mean_std_263_train.npz    # Blended mean/std for 263D features (train splits)
-models/
-  vae/
-    motion_vae.py           # Conditional VAE (AdaLN Transformer)
-    cond_embedding.py       # Domain/style embeddings + cond MLP
-    adaln.py                # AdaLayerNorm
-    transformer_blocks.py   # Transformer block with AdaLN
-    losses.py               # 263D grouped losses + smoothness
-    stats.py                # Mean/std computation helpers
-    datasets/
-      dataset_aist.py        # AIST dataset (SMPL22 -> 263D)
-      dataset_mvh.py         # MVH dataset (sequence -> 263D)
-      aist_filename_parser.py
-      label_map_builder.py
-      balanced_batch_sampler.py
-motion_ik/
-  ...                       # Minimal IK deps (skeleton + quaternion + params)
-process_motion.py           # SMPL22 -> 263D feature extractor
-scripts/
-  train_vae.py              # Training loop (balanced batches)
-  eval_vae.py               # Eval on val splits
-utils/
-  config.py                 # load_config()
-  smpl2joints.py            # SMPL -> joints for AIST
-  stats.py                  # (old stats helpers for BODY-25)
+flowmimic/
+  src/
+    config/
+      config.json            # Main config (paths + hyperparams)
+      def_smpl45_to_body25.json # SMPL to BODY-25 mapping w/ computed pelvis/neck
+      genre_to_id.json        # Genre id mapping (0=unknown)
+    data/
+      dataloader.py           # AIST/MVHumanNet loading, alignment, SMPL22 selection
+      stats.py                # (legacy BODY-25 stats helpers)
+      smpl2joints.py          # SMPL -> joints for AIST
+    model/
+      vae/
+        motion_vae.py         # Conditional VAE (AdaLN Transformer)
+        cond_embedding.py     # Domain/style embeddings + cond MLP
+        adaln.py              # AdaLayerNorm
+        transformer_blocks.py # Transformer block with AdaLN
+        losses.py             # 263D grouped losses + smoothness
+        stats.py              # Mean/std computation helpers
+        datasets/
+          dataset_aist.py      # AIST dataset (SMPL22 -> 263D)
+          dataset_mvh.py       # MVH dataset (sequence -> 263D)
+          aist_filename_parser.py
+          label_map_builder.py
+          balanced_batch_sampler.py
+    motion/
+      process_motion.py       # SMPL22 -> 263D feature extractor
+      ik/                     # Minimal IK deps (skeleton + quaternion + params)
+  scripts/
+    train_vae.py              # Training loop (balanced batches)
+    eval_vae.py               # Eval on val splits
+  tools/
+    split_datasets.py         # Create MVH train/val splits
+    precompute_ik263.py       # Cache 263D features (AIST + MVH)
+    compute_stats.py          # Compute blended mean/std from splits
+    validate_cache.py         # Check cached .npy for NaN/Inf
+    decompress_mvhumannet.sh  # Tar.gz decompressor for MVHumanNet
+    test_ik_roundtrip.py      # 263D -> SMPL22 roundtrip sanity check
 
-tools/
-  split_datasets.py         # Create MVH train/val splits
-  precompute_ik263.py        # Cache 263D features (AIST + MVH)
-  compute_stats.py           # Compute blended mean/std from splits
-  validate_cache.py          # Check cached .npy for NaN/Inf
-  decompress_mvhumannet.sh   # Tar.gz decompressor for MVHumanNet
-
-main.py                      # Small demo scripts (frames, pelvis trajectory)
+main.py                        # Small demo scripts (frames, pelvis trajectory)
 implementation explanation.txt
 Task Summary.txt
 Multi-Domain Conditional Motion VAE.txt
-ver1.1.txt                   # V1.1 requirements for 263D features
+ver1.1.txt                     # V1.1 requirements for 263D features
 ```
 
 ## Data and preprocessing
@@ -56,8 +55,8 @@ ver1.1.txt                   # V1.1 requirements for 263D features
 ### AIST++
 
 - Files: `data/AIST++/Annotations/motions/*.pkl`
-- Joints are produced from SMPL params (SMPLX) in `utils/smpl2joints.py`.
-- Alignment in `common/dataloader.py`:
+- Joints are produced from SMPL params (SMPLX) in `flowmimic/src/data/smpl2joints.py`.
+- Alignment in `flowmimic/src/data/dataloader.py`:
   - Axis remap: `(x, y, z) -> (x, -z, y)`
   - Translation scaling fix using `smpl_scaling` on pelvis trajectory delta only
   - Root centering: subtract pelvis of first frame
@@ -66,13 +65,13 @@ ver1.1.txt                   # V1.1 requirements for 263D features
 
 - Per-frame files: `data/MVHumanNet/<part>/<sequence>/smpl_param/*.pkl`
 - `joints` key is read directly (shape (1,45,3)).
-- Alignment in `common/dataloader.py`:
+- Alignment in `flowmimic/src/data/dataloader.py`:
   - Axis remap: `(x, y, z) -> (-y, -x, -z)`
   - Root centering: subtract pelvis of first frame in the sequence
 
 ### Feature representation (263D)
 
-- `process_motion.smpl_to_ik263()` converts SMPL22 to the 263D vector.
+- `flowmimic.src.motion.process_motion.smpl_to_ik263()` converts SMPL22 to the 263D vector.
 - Layout (0-based, end-exclusive):
   - root_yaw_vel:   [0:1]
   - root_xz_vel:    [1:3]
@@ -101,7 +100,7 @@ ver1.1.txt                   # V1.1 requirements for 263D features
 To avoid slow on-the-fly IK, cache all 263D features:
 
 ```
-python tools/precompute_ik263.py --workers 10
+python flowmimic/tools/precompute_ik263.py --workers 10
 ```
 
 Cache layout:
@@ -112,7 +111,7 @@ Cache layout:
 Validate cache:
 
 ```
-python tools/validate_cache.py
+python flowmimic/tools/validate_cache.py
 ```
 
 Bad files are logged in:
@@ -125,7 +124,7 @@ Bad files are logged in:
 Compute blended mean/std from train splits:
 
 ```
-python tools/compute_stats.py --workers 10
+python flowmimic/tools/compute_stats.py --workers 10
 ```
 
 This skips sequences with NaN/Inf and logs a skip count.
@@ -138,7 +137,7 @@ This skips sequences with NaN/Inf and logs a skip count.
 - Conditioning: domain + style embeddings -> MLP -> AdaLN
 - Style head: optional classifier on pooled encoder states
 
-Losses (models/vae/losses.py):
+Losses (`flowmimic/src/model/vae/losses.py`):
 
 - Recon (continuous [0:259]): SmoothL1 (normalized space)
 - Contact (259:263): BCEWithLogits
@@ -149,10 +148,10 @@ Losses (models/vae/losses.py):
 ## Training
 
 ```
-python scripts/train_vae.py
+python flowmimic/scripts/train_vae.py
 ```
 
-Defaults from `config/config.json`:
+Defaults from `flowmimic/src/config/config.json`:
 
 - seq_len=120
 - train_batch_size=64
@@ -169,14 +168,14 @@ Notes:
 ## Evaluation
 
 ```
-python scripts/eval_vae.py --checkpoint checkpoints/motion_vae_best.pt
+python flowmimic/scripts/eval_vae.py --checkpoint checkpoints/motion_vae_best.pt
 ```
 
 Outputs recon/KL/style metrics for AIST and MVH val splits.
 
 ## Config
 
-Main config: `config/config.json`
+Main config: `flowmimic/src/config/config.json`
 
 - Dataset paths: `aist_motions_dir`, `mvhumannet_root`
 - Splits: `aist_split_train`, `aist_split_val`, `mvh_split_train`, `mvh_split_val`

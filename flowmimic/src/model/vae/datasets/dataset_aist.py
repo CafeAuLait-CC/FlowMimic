@@ -6,10 +6,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from models.vae.datasets.aist_filename_parser import get_genre_code
-from common.dataloader import load_aistpp_smpl22
-from process_motion import smpl_to_ik263
-from models.vae.losses import LAYOUT_SLICES
+from flowmimic.src.data.dataloader import load_aistpp_smpl22
+from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
+from flowmimic.src.model.vae.losses import LAYOUT_SLICES
+from flowmimic.src.motion.process_motion import smpl_to_ik263
 
 
 def _pad_or_crop(sequence, target_len):

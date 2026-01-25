@@ -3,7 +3,7 @@ import os
 
 import numpy as np
 
-from utils.smpl2joints import joints_from_smpl_param
+from flowmimic.src.data.smpl2joints import joints_from_smpl_param
 
 _MVH_BASE_PELVIS = {}
 

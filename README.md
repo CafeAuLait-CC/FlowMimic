@@ -151,7 +151,7 @@ Losses (`flowmimic/src/model/vae/losses.py`):
 python flowmimic/scripts/train_vae.py
 ```
 
-Defaults from `flowmimic/src/config/config.json`:
+Defaults from `flowmimic/src/config/config.json` (including fps settings):
 
 - seq_len=120
 - train_batch_size=64
@@ -159,6 +159,7 @@ Defaults from `flowmimic/src/config/config.json`:
 - KL warmup 40000 steps
 - Save checkpoints every `val_every_epochs` (default 10)
 - Save latest + best-val checkpoints
+- FPS unify: `target_fps=30` (`aist_fps=60`, `mvh_fps=5`)
 
 Notes:
 

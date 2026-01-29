@@ -12,8 +12,8 @@ if ROOT_DIR not in sys.path:
 
 from flowmimic.src.config.config import load_config
 from flowmimic.src.data.dataloader import (
-    load_aistpp_smpl22,
-    load_mvhumannet_sequence_smpl22,
+    load_aistpp_smpl22_30fps,
+    load_mvhumannet_sequence_smpl22_30fps,
 )
 from flowmimic.src.motion.process_motion import smpl_to_ik263
 
@@ -36,12 +36,14 @@ def aist_split_paths(aist_dir, split_path):
 
 
 def _cache_aist(args):
-    pkl_path, cache_root, overwrite = args
+    pkl_path, cache_root, overwrite, target_fps, aist_fps = args
     name = os.path.splitext(os.path.basename(pkl_path))[0]
     out_path = os.path.join(cache_root, "aist", f"{name}.npy")
     if os.path.exists(out_path) and not overwrite:
         return
-    joints = load_aistpp_smpl22(pkl_path)
+    joints = load_aistpp_smpl22_30fps(
+        pkl_path, target_fps=target_fps, src_fps=aist_fps
+    )
     motion = smpl_to_ik263(joints)
     if not np.isfinite(motion).all():
         return ("aist", pkl_path)
@@ -50,12 +52,14 @@ def _cache_aist(args):
 
 
 def _cache_mvh(args):
-    seq_dir, mv_root, cache_root, overwrite = args
+    seq_dir, mv_root, cache_root, overwrite, target_fps, mvh_fps = args
     rel = os.path.relpath(seq_dir, mv_root)
     out_path = os.path.join(cache_root, "mvh", f"{rel}.npy")
     if os.path.exists(out_path) and not overwrite:
         return
-    joints = load_mvhumannet_sequence_smpl22(seq_dir)
+    joints = load_mvhumannet_sequence_smpl22_30fps(
+        seq_dir, target_fps=target_fps, src_fps=mvh_fps
+    )
     motion = smpl_to_ik263(joints)
     if not np.isfinite(motion).all():
         return ("mvh", seq_dir)
@@ -77,14 +81,22 @@ def main():
     aist_split_val = config["aist_split_val"]
     mvh_split_train = config["mvh_split_train"]
     mvh_split_val = config["mvh_split_val"]
+    target_fps = config.get("target_fps", 30)
+    aist_fps = config.get("aist_fps", 60)
+    mvh_fps = config.get("mvh_fps", 5)
 
     aist_paths = aist_split_paths(aist_dir, aist_split_train) + aist_split_paths(
         aist_dir, aist_split_val
     )
     mvh_dirs = read_lines(mvh_split_train) + read_lines(mvh_split_val)
 
-    tasks_aist = [(p, cache_root, args.overwrite) for p in aist_paths]
-    tasks_mvh = [(p, mv_root, cache_root, args.overwrite) for p in mvh_dirs]
+    tasks_aist = [
+        (p, cache_root, args.overwrite, target_fps, aist_fps) for p in aist_paths
+    ]
+    tasks_mvh = [
+        (p, mv_root, cache_root, args.overwrite, target_fps, mvh_fps)
+        for p in mvh_dirs
+    ]
 
     bad_aist = []
     with Pool(processes=args.workers, initializer=_init_worker) as pool:

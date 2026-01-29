@@ -125,6 +125,9 @@ def main():
     w_contact = args.w_contact or config["w_contact"]
     style_dropout_p = config["style_dropout_p"]
     stats_path = config["stats_path"]
+    target_fps = config.get("target_fps", 30)
+    aist_fps = config.get("aist_fps", 60)
+    mvh_fps = config.get("mvh_fps", 5)
     cache_root = config["cache_root"]
     aist_split_train = config["aist_split_train"]
     mvh_split_train = config["mvh_split_train"]
@@ -153,6 +156,9 @@ def main():
             mvh_train_dirs,
             stats_path,
             workers=10,
+            target_fps=target_fps,
+            aist_fps=aist_fps,
+            mvh_fps=mvh_fps,
         )
 
     print("Loading mean/std")
@@ -167,6 +173,8 @@ def main():
         std=std,
         files=aist_train_paths,
         cache_root=cache_root,
+        target_fps=target_fps,
+        src_fps=aist_fps,
     )
 
     loader_a = DataLoader(
@@ -205,6 +213,8 @@ def main():
             std=std,
             sequence_dirs=mvh_subset,
             cache_root=cache_root,
+            target_fps=target_fps,
+            src_fps=mvh_fps,
         )
         loader_b = DataLoader(
             dataset_b,
@@ -323,6 +333,8 @@ def main():
                 std=std,
                 files=aist_val_paths,
                 cache_root=cache_root,
+                target_fps=target_fps,
+                src_fps=aist_fps,
             )
             val_b = MVHumanNetDataset(
                 mv_root,
@@ -331,6 +343,8 @@ def main():
                 std=std,
                 sequence_dirs=mvh_val_dirs,
                 cache_root=cache_root,
+                target_fps=target_fps,
+                src_fps=mvh_fps,
             )
             val_loader_a = DataLoader(
                 val_a,

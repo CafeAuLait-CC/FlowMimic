@@ -12,8 +12,8 @@ if ROOT_DIR not in sys.path:
 
 from flowmimic.src.config.config import load_config
 from flowmimic.src.data.dataloader import (
-    load_aistpp_smpl22,
-    load_mvhumannet_sequence_smpl22,
+    load_aistpp_smpl22_30fps,
+    load_mvhumannet_sequence_smpl22_30fps,
 )
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.model.vae.motion_vae import MotionVAE
@@ -50,7 +50,7 @@ def _pad_or_crop_features(sequence, target_len):
     return clip, mask
 
 
-def _load_sample_joints(dataset, index, config):
+def _load_sample_joints(dataset, index, config, target_fps, aist_fps, mvh_fps):
     if dataset == "aist":
         aist_dir = config["aist_motions_dir"]
         split_path = config["aist_split_val"]
@@ -61,7 +61,9 @@ def _load_sample_joints(dataset, index, config):
             index = random.randrange(len(names))
         name = names[index % len(names)]
         path = os.path.join(aist_dir, f"{name}.pkl")
-        joints = load_aistpp_smpl22(path)
+        joints = load_aistpp_smpl22_30fps(
+            path, target_fps=target_fps, src_fps=aist_fps
+        )
         return joints, {"path": path, "domain_id": 1, "style_id": 0}
 
     if dataset == "mvh":
@@ -72,7 +74,9 @@ def _load_sample_joints(dataset, index, config):
         if index is None:
             index = random.randrange(len(seq_dirs))
         seq_dir = seq_dirs[index % len(seq_dirs)]
-        joints = load_mvhumannet_sequence_smpl22(seq_dir)
+        joints = load_mvhumannet_sequence_smpl22_30fps(
+            seq_dir, target_fps=target_fps, src_fps=mvh_fps
+        )
         return joints, {"path": seq_dir, "domain_id": 0, "style_id": 0}
 
     raise ValueError("dataset must be 'aist' or 'mvh'")
@@ -139,8 +143,13 @@ def main():
     d_in = config["d_in"]
     d_z = config["d_z"]
     num_styles = config["num_styles"]
+    target_fps = config.get("target_fps", 30)
+    aist_fps = config.get("aist_fps", 60)
+    mvh_fps = config.get("mvh_fps", 5)
 
-    joints, meta = _load_sample_joints(args.dataset, args.index, config)
+    joints, meta = _load_sample_joints(
+        args.dataset, args.index, config, target_fps, aist_fps, mvh_fps
+    )
     if joints.shape[0] > seq_len:
         joints_clip = joints[:seq_len]
         ik_data = smpl_to_ik263(joints_clip)

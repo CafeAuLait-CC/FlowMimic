@@ -5,8 +5,8 @@ import numpy as np
 from tqdm import tqdm
 
 from flowmimic.src.data.dataloader import (
-    load_aistpp_smpl22,
-    load_mvhumannet_sequence_smpl22,
+    load_aistpp_smpl22_30fps,
+    load_mvhumannet_sequence_smpl22_30fps,
 )
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
@@ -42,11 +42,15 @@ def compute_mean_std(dataset, out_path, eps=1e-6, desc="Computing mean/std"):
 
 
 def _stats_for_sequence(args):
-    kind, path = args
+    kind, path, target_fps, aist_fps, mvh_fps = args
     if kind == "aist":
-        joints = load_aistpp_smpl22(path)
+        joints = load_aistpp_smpl22_30fps(
+            path, target_fps=target_fps, src_fps=aist_fps
+        )
     elif kind == "mvh":
-        joints = load_mvhumannet_sequence_smpl22(path)
+        joints = load_mvhumannet_sequence_smpl22_30fps(
+            path, target_fps=target_fps, src_fps=mvh_fps
+        )
     else:
         raise ValueError(f"Unknown kind: {kind}")
 
@@ -76,13 +80,18 @@ def compute_mean_std_from_splits(
     out_path,
     workers=10,
     eps=1e-6,
+    target_fps=30,
+    aist_fps=60,
+    mvh_fps=5,
 ):
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     sum_vec = np.zeros(cont_end, dtype=np.float64)
     sum_sq = np.zeros(cont_end, dtype=np.float64)
     count = 0.0
 
-    tasks = [("aist", p) for p in aist_paths] + [("mvh", p) for p in mvh_dirs]
+    tasks = [("aist", p, target_fps, aist_fps, mvh_fps) for p in aist_paths] + [
+        ("mvh", p, target_fps, aist_fps, mvh_fps) for p in mvh_dirs
+    ]
     if not tasks:
         raise ValueError("No samples provided for stats computation")
 

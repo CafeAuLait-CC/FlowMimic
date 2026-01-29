@@ -86,6 +86,34 @@ def load_mvhumannet_smpl22(pkl_path):
     return joints3d[:, :22]
 
 
+def _resample_to_fps(joints3d, src_fps, dst_fps):
+    if src_fps == dst_fps:
+        return joints3d
+
+    if src_fps == 60 and dst_fps == 30:
+        return joints3d[::2]
+
+    if src_fps < dst_fps:
+        try:
+            from scipy.interpolate import PchipInterpolator
+        except ImportError:
+            raise ImportError(
+                "scipy is required for PCHIP upsampling; please install scipy"
+            )
+
+        t_src = np.arange(joints3d.shape[0], dtype=np.float64) / float(src_fps)
+        t_dst = np.arange(
+            int(np.round(t_src[-1] * dst_fps)) + 1, dtype=np.float64
+        ) / float(dst_fps)
+        flat = joints3d.reshape(joints3d.shape[0], -1)
+        interp = PchipInterpolator(t_src, flat, axis=0)
+        out = interp(t_dst)
+        return out.reshape(len(t_dst), joints3d.shape[1], joints3d.shape[2])
+
+    step = int(round(src_fps / float(dst_fps)))
+    return joints3d[::step]
+
+
 def load_body25_mapping(def_path):
     mapping = {}
     names = {}
@@ -169,3 +197,13 @@ def load_mvhumannet_sequence_smpl22(smpl_param_dir):
         frames.append(frame)
 
     return np.stack(frames, axis=0)
+
+
+def load_aistpp_smpl22_30fps(pkl_path, target_fps=30, src_fps=60):
+    joints3d = load_aistpp_smpl22(pkl_path)
+    return _resample_to_fps(joints3d, src_fps=src_fps, dst_fps=target_fps)
+
+
+def load_mvhumannet_sequence_smpl22_30fps(smpl_param_dir, target_fps=30, src_fps=5):
+    joints3d = load_mvhumannet_sequence_smpl22(smpl_param_dir)
+    return _resample_to_fps(joints3d, src_fps=src_fps, dst_fps=target_fps)

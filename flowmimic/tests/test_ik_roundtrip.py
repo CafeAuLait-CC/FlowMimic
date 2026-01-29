@@ -8,7 +8,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from flowmimic.src.data.dataloader import load_aistpp_smpl22
+from flowmimic.src.data.dataloader import load_aistpp_smpl22_30fps
 from flowmimic.src.motion.ik.common.quaternion import qbetween_np, qrot_np
 from flowmimic.src.motion.process_motion import (
     _FACE_JOINT_INDX,
@@ -56,7 +56,9 @@ def _load_first_aist_smpl22():
         raise FileNotFoundError(f"No motion files found in {motions_dir}")
 
     pkl_path = os.path.join(motions_dir, files[0])
-    joints = load_aistpp_smpl22(pkl_path)
+    joints = load_aistpp_smpl22_30fps(
+        pkl_path, target_fps=cfg.get("target_fps", 30), src_fps=cfg.get("aist_fps", 60)
+    )
     return pkl_path, joints
 
 

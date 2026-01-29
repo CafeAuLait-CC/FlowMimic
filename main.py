@@ -3,8 +3,8 @@ import os
 
 from flowmimic.src.config.config import load_config
 from flowmimic.src.data.dataloader import (
-    load_aistpp_smpl22,
-    load_mvhumannet_sequence_smpl22,
+    load_aistpp_smpl22_30fps,
+    load_mvhumannet_sequence_smpl22_30fps,
 )
 
 
@@ -18,7 +18,11 @@ def main():
     if not aist_files:
         raise FileNotFoundError(f"No AIST++ motion files found in {aist_dir}")
 
-    joints3d = load_aistpp_smpl22(aist_files[0])
+    joints3d = load_aistpp_smpl22_30fps(
+        aist_files[0],
+        target_fps=paths.get("target_fps", 30),
+        src_fps=paths.get("aist_fps", 60),
+    )
     first_frame = joints3d[0]
     last_frame = joints3d[-1]
     pelvis = joints3d[:, 0]
@@ -35,7 +39,11 @@ def main():
     if not mv_dirs:
         raise FileNotFoundError(f"No MVHumanNet smpl_param dirs found in {mv_root}")
 
-    mv_joints3d = load_mvhumannet_sequence_smpl22(mv_dirs[0])
+    mv_joints3d = load_mvhumannet_sequence_smpl22_30fps(
+        mv_dirs[0],
+        target_fps=paths.get("target_fps", 30),
+        src_fps=paths.get("mvh_fps", 5),
+    )
     mv_first_frame = mv_joints3d[0]
     mv_last_frame = mv_joints3d[-1]
     mv_pelvis = mv_joints3d[:, 0]

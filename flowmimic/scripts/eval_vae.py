@@ -93,6 +93,9 @@ def main():
     persistent_workers = config["persistent_workers"]
     prefetch_factor = config["prefetch_factor"]
     stats_path = config["stats_path"]
+    target_fps = config.get("target_fps", 30)
+    aist_fps = config.get("aist_fps", 60)
+    mvh_fps = config.get("mvh_fps", 5)
     cache_root = config["cache_root"]
     aist_split_val = config["aist_split_val"]
     mvh_split_val = config["mvh_split_val"]
@@ -133,6 +136,8 @@ def main():
         std=std,
         files=aist_val_paths,
         cache_root=cache_root,
+        target_fps=target_fps,
+        src_fps=aist_fps,
     )
     dataset_b = MVHumanNetDataset(
         mv_root,
@@ -141,6 +146,8 @@ def main():
         std=std,
         sequence_dirs=mvh_val_dirs,
         cache_root=cache_root,
+        target_fps=target_fps,
+        src_fps=mvh_fps,
     )
 
     loader_a = DataLoader(

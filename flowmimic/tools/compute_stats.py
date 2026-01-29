@@ -31,6 +31,9 @@ def main():
     aist_split_train = config["aist_split_train"]
     mvh_split_train = config["mvh_split_train"]
     out_path = args.out or config["stats_path"]
+    target_fps = config.get("target_fps", 30)
+    aist_fps = config.get("aist_fps", 60)
+    mvh_fps = config.get("mvh_fps", 5)
 
     if not os.path.exists(aist_split_train):
         raise FileNotFoundError(f"AIST split file not found: {aist_split_train}")
@@ -45,6 +48,9 @@ def main():
         mvh_train_dirs,
         out_path,
         workers=args.workers,
+        target_fps=target_fps,
+        aist_fps=aist_fps,
+        mvh_fps=mvh_fps,
     )
 
 

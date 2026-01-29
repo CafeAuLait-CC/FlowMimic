@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from flowmimic.src.data.dataloader import load_mvhumannet_sequence_smpl22
+from flowmimic.src.data.dataloader import load_mvhumannet_sequence_smpl22_30fps
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
 
@@ -41,6 +41,8 @@ class MVHumanNetDataset(Dataset):
         normalize=True,
         sequence_dirs=None,
         cache_root=None,
+        target_fps=30,
+        src_fps=5,
     ):
         if sequence_dirs is None:
             self.sequence_dirs = sorted(
@@ -58,6 +60,8 @@ class MVHumanNetDataset(Dataset):
         self.std = std
         self.normalize = normalize
         self.cache_root = cache_root
+        self.target_fps = target_fps
+        self.src_fps = src_fps
 
     def __len__(self):
         return len(self.sequence_dirs)
@@ -72,7 +76,9 @@ class MVHumanNetDataset(Dataset):
                 motion = np.load(cache_path)
 
         if motion is None:
-            joints = load_mvhumannet_sequence_smpl22(seq_dir)
+            joints = load_mvhumannet_sequence_smpl22_30fps(
+                seq_dir, target_fps=self.target_fps, src_fps=self.src_fps
+            )
             motion = smpl_to_ik263(joints)
             if self.cache_root:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)

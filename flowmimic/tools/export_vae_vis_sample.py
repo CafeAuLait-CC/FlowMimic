@@ -1,3 +1,12 @@
+"""Export before/after SMPL22 sequences for VAE visualization.
+
+Example:
+  python flowmimic/tools/export_vae_vis_sample.py \
+    --checkpoint checkpoints/motion_vae_best.pt \
+    --dataset aist \
+    --space raw
+"""
+
 import argparse
 import os
 import random

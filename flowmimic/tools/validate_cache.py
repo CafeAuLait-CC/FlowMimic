@@ -1,3 +1,9 @@
+"""Validate cached IK263 files for NaN/Inf.
+
+Example:
+  python flowmimic/tools/validate_cache.py
+"""
+
 import argparse
 import os
 import sys

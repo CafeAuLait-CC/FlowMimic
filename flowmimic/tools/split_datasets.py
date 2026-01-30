@@ -1,3 +1,12 @@
+"""Create MVHumanNet train/val splits.
+
+Example:
+  python flowmimic/tools/split_datasets.py \
+    --mv-root data/MVHumanNet \
+    --out-train data/MVHumanNet/mvh_train.txt \
+    --out-val data/MVHumanNet/mvh_val.txt
+"""
+
 import argparse
 import glob
 import os

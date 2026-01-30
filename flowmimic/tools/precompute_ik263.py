@@ -1,3 +1,9 @@
+"""Precompute and cache IK263 features for AIST++ and MVHumanNet splits.
+
+Example:
+  python flowmimic/tools/precompute_ik263.py --workers 10 --overwrite
+"""
+
 import argparse
 import os
 import sys

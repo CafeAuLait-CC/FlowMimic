@@ -90,6 +90,12 @@ def _resample_to_fps(joints3d, src_fps, dst_fps):
     if src_fps == dst_fps:
         return joints3d
 
+    if joints3d.shape[0] < 2:
+        return joints3d
+
+    if not np.isfinite(joints3d).all():
+        return joints3d
+
     if src_fps == 60 and dst_fps == 30:
         return joints3d[::2]
 

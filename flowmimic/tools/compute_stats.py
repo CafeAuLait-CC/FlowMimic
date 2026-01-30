@@ -1,3 +1,9 @@
+"""Compute blended mean/std from training splits.
+
+Example:
+  python flowmimic/tools/compute_stats.py --workers 10
+"""
+
 import argparse
 import os
 import sys

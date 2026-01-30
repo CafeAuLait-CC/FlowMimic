@@ -97,6 +97,35 @@ ver1.1.txt                     # V1.1 requirements for 263D features
 
 ## Caching pipeline
 
+Recommended tool order (after updating data preprocessing or fps):
+
+1) Create MVH splits (one-time if not created):
+
+```
+python flowmimic/tools/split_datasets.py \
+  --mv-root data/MVHumanNet \
+  --out-train data/MVHumanNet/mvh_train.txt \
+  --out-val data/MVHumanNet/mvh_val.txt
+```
+
+2) Compute blended mean/std (train splits):
+
+```
+python flowmimic/tools/compute_stats.py --workers 10
+```
+
+3) Precompute IK263 cache (train + val splits):
+
+```
+python flowmimic/tools/precompute_ik263.py --workers 10 --overwrite
+```
+
+4) Validate cached .npy files:
+
+```
+python flowmimic/tools/validate_cache.py
+```
+
 To avoid slow on-the-fly IK, cache all 263D features:
 
 ```

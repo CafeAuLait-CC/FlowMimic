@@ -249,7 +249,8 @@ def main():
             style_id = style_id.to(args.device)
             mask = mask.to(args.device)
             if not torch.isfinite(motion).all():
-                print("Warning: non-finite motion batch; skipping")
+                if args.debug_timing:
+                    print("Warning: non-finite motion batch; skipping")
                 continue
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize()
@@ -259,11 +260,13 @@ def main():
             outputs = model(motion, domain_id, style_id_in, mask=mask)
             x_hat = outputs["x_hat"]
             if not torch.isfinite(x_hat).all():
-                print("Warning: non-finite model output; skipping")
+                if args.debug_timing:
+                    print("Warning: non-finite model output; skipping")
                 if any(not torch.isfinite(p).all() for p in model.parameters()):
                     latest_path = os.path.join(args.checkpoint_dir, "motion_vae_latest.pt")
                     if os.path.exists(latest_path):
-                        print("Reloading latest checkpoint after NaNs")
+                        if args.debug_timing:
+                            print("Reloading latest checkpoint after NaNs")
                         state = torch.load(latest_path, map_location=args.device)
                         model.load_state_dict(state["model"])
                         optimizer.zero_grad(set_to_none=True)
@@ -291,7 +294,8 @@ def main():
                 torch.cuda.synchronize()
             t4 = time.perf_counter()
             if not torch.isfinite(loss):
-                print("Warning: non-finite loss; skipping batch")
+                if args.debug_timing:
+                    print("Warning: non-finite loss; skipping batch")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 

@@ -40,16 +40,23 @@ def masked_kl(mu, logvar, mask=None):
     return _masked_mean(kl, mask)
 
 
-def grouped_recon_loss(x_hat, x, mask=None, w_contact=5.0):
+def grouped_recon_loss(x_hat, x, mask=None, w_contact=5.0, w_root=1.0):
     cont_start, cont_end = LAYOUT_SLICES["root_yaw_vel"][0], LAYOUT_SLICES["feet_contact"][0]
     cont_loss = masked_smooth_l1(x_hat[..., cont_start:cont_end], x[..., cont_start:cont_end], mask)
+    root_slice = LAYOUT_SLICES["root_yaw_vel"][0], LAYOUT_SLICES["root_y"][1]
+    root_loss = masked_smooth_l1(
+        x_hat[..., root_slice[0] : root_slice[1]],
+        x[..., root_slice[0] : root_slice[1]],
+        mask,
+    )
     contact_slice = LAYOUT_SLICES["feet_contact"]
     contact_loss = masked_bce_with_logits(
         x_hat[..., contact_slice[0] : contact_slice[1]],
         x[..., contact_slice[0] : contact_slice[1]],
         mask,
     )
-    return cont_loss + w_contact * contact_loss, cont_loss, contact_loss
+    total = cont_loss + w_contact * contact_loss + w_root * root_loss
+    return total, cont_loss, contact_loss, root_loss
 
 
 def smoothness_loss(x_hat, x, mask=None, slices=None):

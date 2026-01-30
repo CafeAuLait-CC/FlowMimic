@@ -123,6 +123,7 @@ def main():
     w_acc = args.w_acc or config["w_acc"]
     w_style = args.w_style or config["w_style"]
     w_contact = args.w_contact or config["w_contact"]
+    w_root = config.get("w_root", 1.0)
     style_dropout_p = config["style_dropout_p"]
     stats_path = config["stats_path"]
     target_fps = config.get("target_fps", 30)
@@ -277,8 +278,8 @@ def main():
                 torch.cuda.synchronize()
             t3 = time.perf_counter()
 
-            recon, cont_loss, contact_loss = grouped_recon_loss(
-                x_hat, motion, mask, w_contact=w_contact
+            recon, cont_loss, contact_loss, _root_loss = grouped_recon_loss(
+                x_hat, motion, mask, w_contact=w_contact, w_root=w_root
             )
             kl = masked_kl(outputs["mu"], outputs["logvar"], mask)
             vel, acc = smoothness_loss(x_hat, motion, mask)

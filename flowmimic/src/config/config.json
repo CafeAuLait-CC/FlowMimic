@@ -26,6 +26,7 @@
   "w_vel": 0.05,
   "w_acc": 0.02,
   "w_contact": 5.0,
+  "w_root": 2.0,
   "w_style": 0.1,
   "style_dropout_p": 0.1,
   "stats_path": "data/mean_std_263_train.npz",

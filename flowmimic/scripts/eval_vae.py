@@ -41,8 +41,8 @@ def run_eval(loader, model, device, mean, std, w_contact):
             mask = batch["mask"].to(device)
 
             outputs = model(motion, domain_id, style_id, mask=mask)
-            recon, _cont, _contact = grouped_recon_loss(
-                outputs["x_hat"], motion, mask, w_contact=w_contact
+            recon, _cont, _contact, _root = grouped_recon_loss(
+                outputs["x_hat"], motion, mask, w_contact=w_contact, w_root=w_root
             )
             kl = masked_kl(outputs["mu"], outputs["logvar"], mask)
             style_loss = style_ce_loss(outputs.get("style_logits"), style_id, domain_id)
@@ -105,6 +105,7 @@ def main():
     if not os.path.exists(mvh_split_val):
         raise FileNotFoundError(f"MVHumanNet split file not found: {mvh_split_val}")
     w_contact = config["w_contact"]
+    w_root = config.get("w_root", 1.0)
 
     if args.genre_map and os.path.exists(args.genre_map):
         with open(args.genre_map, "r", encoding="utf-8") as f:

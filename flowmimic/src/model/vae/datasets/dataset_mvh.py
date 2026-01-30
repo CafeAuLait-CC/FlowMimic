@@ -62,12 +62,15 @@ class MVHumanNetDataset(Dataset):
         self.cache_root = cache_root
         self.target_fps = target_fps
         self.src_fps = src_fps
+        self._clip_counts = None
+        self._index_map = None
+        self._build_index_map()
 
     def __len__(self):
-        return len(self.sequence_dirs)
+        return len(self._index_map)
 
     def __getitem__(self, idx):
-        seq_dir = self.sequence_dirs[idx]
+        seq_dir = self.sequence_dirs[self._index_map[idx]]
         motion = None
         if self.cache_root:
             rel = os.path.relpath(seq_dir, self.mv_root)
@@ -109,3 +112,26 @@ class MVHumanNetDataset(Dataset):
             "meta": {"path": seq_dir},
         }
         return sample
+
+    def _build_index_map(self):
+        clip_counts = []
+        index_map = []
+        for i, seq_dir in enumerate(self.sequence_dirs):
+            length = self._sequence_length(seq_dir)
+            clips = max(1, length // self.seq_len)
+            clip_counts.append(clips)
+            index_map.extend([i] * clips)
+        self._clip_counts = clip_counts
+        self._index_map = index_map
+
+    def _sequence_length(self, seq_dir):
+        if self.cache_root:
+            rel = os.path.relpath(seq_dir, self.mv_root)
+            cache_path = os.path.join(self.cache_root, "mvh", f"{rel}.npy")
+            if os.path.exists(cache_path):
+                motion = np.load(cache_path, mmap_mode="r")
+                return motion.shape[0]
+        joints = load_mvhumannet_sequence_smpl22_30fps(
+            seq_dir, target_fps=self.target_fps, src_fps=self.src_fps
+        )
+        return joints.shape[0]

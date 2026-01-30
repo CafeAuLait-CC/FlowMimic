@@ -60,12 +60,15 @@ class AISTDataset(Dataset):
         self.cache_root = cache_root
         self.target_fps = target_fps
         self.src_fps = src_fps
+        self._clip_counts = None
+        self._index_map = None
+        self._build_index_map()
 
     def __len__(self):
-        return len(self.files)
+        return len(self._index_map)
 
     def __getitem__(self, idx):
-        path = self.files[idx]
+        path = self.files[self._index_map[idx]]
         motion = None
         if self.cache_root:
             name = os.path.splitext(os.path.basename(path))[0]
@@ -109,3 +112,26 @@ class AISTDataset(Dataset):
             "meta": {"path": path, "genre": genre},
         }
         return sample
+
+    def _build_index_map(self):
+        clip_counts = []
+        index_map = []
+        for i, path in enumerate(self.files):
+            length = self._sequence_length(path)
+            clips = max(1, length // self.seq_len)
+            clip_counts.append(clips)
+            index_map.extend([i] * clips)
+        self._clip_counts = clip_counts
+        self._index_map = index_map
+
+    def _sequence_length(self, path):
+        if self.cache_root:
+            name = os.path.splitext(os.path.basename(path))[0]
+            cache_path = os.path.join(self.cache_root, "aist", f"{name}.npy")
+            if os.path.exists(cache_path):
+                motion = np.load(cache_path, mmap_mode="r")
+                return motion.shape[0]
+        joints = load_aistpp_smpl22_30fps(
+            path, target_fps=self.target_fps, src_fps=self.src_fps
+        )
+        return joints.shape[0]

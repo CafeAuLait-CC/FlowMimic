@@ -71,7 +71,9 @@ ver1.1.txt                     # V1.1 requirements for 263D features
 
 ### Feature representation (263D)
 
-- `flowmimic.src.motion.process_motion.smpl_to_ik263()` converts SMPL22 to the 263D vector.
+- Before IK feature extraction, joints are converted from Blender Z-up to SMPL Y-up:
+  - Blender (X, Y, Z) -> SMPL (X, Z, -Y)
+- `flowmimic.src.motion.process_motion.smpl_to_ik263()` converts SMPL22 (Y-up) to the 263D vector.
 - Layout (0-based, end-exclusive):
   - root_yaw_vel:   [0:1]
   - root_xz_vel:    [1:3]

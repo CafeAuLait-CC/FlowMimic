@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 from flowmimic.src.data.dataloader import (
+    blender_to_yup,
     load_aistpp_smpl22_30fps,
     load_mvhumannet_sequence_smpl22_30fps,
 )
@@ -47,10 +48,12 @@ def _stats_for_sequence(args):
         joints = load_aistpp_smpl22_30fps(
             path, target_fps=target_fps, src_fps=aist_fps
         )
+        joints = blender_to_yup(joints)
     elif kind == "mvh":
         joints = load_mvhumannet_sequence_smpl22_30fps(
             path, target_fps=target_fps, src_fps=mvh_fps
         )
+        joints = blender_to_yup(joints)
     else:
         raise ValueError(f"Unknown kind: {kind}")
 

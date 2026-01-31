@@ -18,6 +18,7 @@ if ROOT_DIR not in sys.path:
 
 from flowmimic.src.config.config import load_config
 from flowmimic.src.data.dataloader import (
+    blender_to_yup,
     load_aistpp_smpl22_30fps,
     load_mvhumannet_sequence_smpl22_30fps,
 )
@@ -50,6 +51,7 @@ def _cache_aist(args):
     joints = load_aistpp_smpl22_30fps(
         pkl_path, target_fps=target_fps, src_fps=aist_fps
     )
+    joints = blender_to_yup(joints)
     motion = smpl_to_ik263(joints)
     if not np.isfinite(motion).all():
         return ("aist", pkl_path)
@@ -66,6 +68,7 @@ def _cache_mvh(args):
     joints = load_mvhumannet_sequence_smpl22_30fps(
         seq_dir, target_fps=target_fps, src_fps=mvh_fps
     )
+    joints = blender_to_yup(joints)
     motion = smpl_to_ik263(joints)
     if not np.isfinite(motion).all():
         return ("mvh", seq_dir)

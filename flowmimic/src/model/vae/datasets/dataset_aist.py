@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from flowmimic.src.data.dataloader import load_aistpp_smpl22_30fps
+from flowmimic.src.data.dataloader import blender_to_yup, load_aistpp_smpl22_30fps
 from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
@@ -80,6 +80,7 @@ class AISTDataset(Dataset):
             joints = load_aistpp_smpl22_30fps(
                 path, target_fps=self.target_fps, src_fps=self.src_fps
             )
+            joints = blender_to_yup(joints)
             motion = smpl_to_ik263(joints)
             if self.cache_root:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)

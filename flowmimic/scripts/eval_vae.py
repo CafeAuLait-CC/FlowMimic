@@ -24,7 +24,7 @@ from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.model.vae.stats import load_mean_std
 
 
-def run_eval(loader, model, device, mean, std, w_contact):
+def run_eval(loader, model, device, mean, std, w_contact, w_root):
     model.eval()
     total_recon = 0.0
     total_kl = 0.0
@@ -175,8 +175,8 @@ def main():
     model.load_state_dict(state["model"])
     model.to(args.device)
 
-    aist_metrics = run_eval(loader_a, model, args.device, mean, std, w_contact)
-    mvh_metrics = run_eval(loader_b, model, args.device, mean, std, w_contact)
+    aist_metrics = run_eval(loader_a, model, args.device, mean, std, w_contact, w_root)
+    mvh_metrics = run_eval(loader_b, model, args.device, mean, std, w_contact, w_root)
 
     print("AIST++ metrics", aist_metrics)
     print("MVHumanNet metrics", mvh_metrics)

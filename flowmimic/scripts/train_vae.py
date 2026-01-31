@@ -124,6 +124,8 @@ def main():
     w_style = args.w_style or config["w_style"]
     w_contact = args.w_contact or config["w_contact"]
     w_root = config.get("w_root", 1.0)
+    w_root_late_start = config.get("w_root_late_start", 1.0)
+    w_root_late_factor = config.get("w_root_late_factor", 1.0)
     style_dropout_p = config["style_dropout_p"]
     stats_path = config["stats_path"]
     target_fps = config.get("target_fps", 30)
@@ -203,6 +205,8 @@ def main():
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         model.train()
+        epoch_frac = (epoch + 1) / max(args.epochs, 1)
+        w_root_epoch = w_root * (w_root_late_factor if epoch_frac >= w_root_late_start else 1.0)
         rng = random.Random(epoch)
         rng.shuffle(mvh_train_dirs)
         mvh_subset = mvh_train_dirs[: min(len(mvh_train_dirs), len(aist_train_paths))]
@@ -239,6 +243,14 @@ def main():
             )
 
         recon_sum = 0.0
+        cont_sum = 0.0
+        contact_sum = 0.0
+        root_sum = 0.0
+        kl_sum = 0.0
+        vel_sum = 0.0
+        acc_sum = 0.0
+        style_sum = 0.0
+        total_sum = 0.0
         recon_count = 0
         for step_idx in tqdm(range(num_steps), desc="Training", leave=False):
             t0 = time.perf_counter()
@@ -278,8 +290,8 @@ def main():
                 torch.cuda.synchronize()
             t3 = time.perf_counter()
 
-            recon, cont_loss, contact_loss, _root_loss = grouped_recon_loss(
-                x_hat, motion, mask, w_contact=w_contact, w_root=w_root
+            recon, cont_loss, contact_loss, root_loss = grouped_recon_loss(
+                x_hat, motion, mask, w_contact=w_contact, w_root=w_root_epoch
             )
             kl = masked_kl(outputs["mu"], outputs["logvar"], mask)
             vel, acc = smoothness_loss(x_hat, motion, mask)
@@ -310,6 +322,14 @@ def main():
 
             step += 1
             recon_sum += recon.item()
+            cont_sum += cont_loss.item()
+            contact_sum += contact_loss.item()
+            root_sum += root_loss.item()
+            kl_sum += kl.item()
+            vel_sum += vel.item()
+            acc_sum += acc.item()
+            style_sum += style_loss.item() if style_loss is not None else 0.0
+            total_sum += loss.item()
             recon_count += 1
 
             if args.debug_timing and (step_idx % args.debug_every == 0):
@@ -319,8 +339,31 @@ def main():
                     )
                 )
 
-        avg_recon = recon_sum / max(recon_count, 1)
-        print(f"Epoch {epoch + 1} avg_recon={avg_recon:.6f}")
+        denom = max(recon_count, 1)
+        avg_recon = recon_sum / denom
+        avg_cont = cont_sum / denom
+        avg_contact = contact_sum / denom
+        avg_root = root_sum / denom
+        avg_kl = kl_sum / denom
+        avg_vel = vel_sum / denom
+        avg_acc = acc_sum / denom
+        avg_style = style_sum / denom
+        avg_total = total_sum / denom
+        print(
+            "Epoch {} loss_total={:.6f} recon={:.6f} cont={:.6f} contact={:.6f} "
+            "root={:.6f} kl={:.6f} vel={:.6f} acc={:.6f} style={:.6f}".format(
+                epoch + 1,
+                avg_total,
+                avg_recon,
+                avg_cont,
+                avg_contact,
+                avg_root,
+                avg_kl,
+                avg_vel,
+                avg_acc,
+                avg_style,
+            )
+        )
 
         save_ckpt = (epoch + 1) % val_every_epochs == 0
         if save_ckpt:
@@ -379,8 +422,8 @@ def main():
                         style_id = batch["style_id"].to(args.device)
                         mask = batch["mask"].to(args.device)
                         outputs = model(motion, domain_id, style_id, mask=mask)
-                        v_recon, _, _ = grouped_recon_loss(
-                            outputs["x_hat"], motion, mask, w_contact=w_contact
+                        v_recon, _, _, _ = grouped_recon_loss(
+                            outputs["x_hat"], motion, mask, w_contact=w_contact, w_root=w_root
                         )
                         val_recon_sum += v_recon.item()
                         val_count += 1

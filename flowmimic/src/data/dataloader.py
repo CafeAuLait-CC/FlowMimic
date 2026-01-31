@@ -22,6 +22,20 @@ def _transform_mvhumannet(joints3d):
     return np.stack([-y, -x, -z], axis=-1)
 
 
+def blender_to_yup(joints3d):
+    x = joints3d[..., 0]
+    y = joints3d[..., 1]
+    z = joints3d[..., 2]
+    return np.stack([x, z, -y], axis=-1)
+
+
+def yup_to_blender(joints3d):
+    x = joints3d[..., 0]
+    y = joints3d[..., 1]
+    z = joints3d[..., 2]
+    return np.stack([x, -z, y], axis=-1)
+
+
 def _load_mvhumannet_joints_noalign(pkl_path):
     data = np.load(pkl_path, allow_pickle=True)
     if hasattr(data, "item"):

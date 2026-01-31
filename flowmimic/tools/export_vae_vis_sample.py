@@ -21,8 +21,10 @@ if ROOT_DIR not in sys.path:
 
 from flowmimic.src.config.config import load_config
 from flowmimic.src.data.dataloader import (
+    blender_to_yup,
     load_aistpp_smpl22_30fps,
     load_mvhumannet_sequence_smpl22_30fps,
+    yup_to_blender,
 )
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.model.vae.motion_vae import MotionVAE
@@ -73,6 +75,7 @@ def _load_sample_joints(dataset, index, config, target_fps, aist_fps, mvh_fps):
         joints = load_aistpp_smpl22_30fps(
             path, target_fps=target_fps, src_fps=aist_fps
         )
+        joints = blender_to_yup(joints)
         return joints, {"path": path, "domain_id": 1, "style_id": 0}
 
     if dataset == "mvh":
@@ -86,6 +89,7 @@ def _load_sample_joints(dataset, index, config, target_fps, aist_fps, mvh_fps):
         joints = load_mvhumannet_sequence_smpl22_30fps(
             seq_dir, target_fps=target_fps, src_fps=mvh_fps
         )
+        joints = blender_to_yup(joints)
         return joints, {"path": seq_dir, "domain_id": 0, "style_id": 0}
 
     raise ValueError("dataset must be 'aist' or 'mvh'")
@@ -141,6 +145,7 @@ def main():
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--out-dir", type=str, default="./output/")
     parser.add_argument("--space", choices=["canonical", "raw"], default="canonical")
+    parser.add_argument("--output-axis", choices=["blender", "yup"], default="blender")
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -209,6 +214,9 @@ def main():
         after_joints = _invert_canonical(
             after_joints, floor_height, root_pose_init_xz, root_quat_init
         )
+    if args.output_axis == "blender":
+        before_joints = yup_to_blender(before_joints)
+        after_joints = yup_to_blender(after_joints)
     np.save(before_path, before_joints)
     np.save(after_path, after_joints)
 

@@ -128,6 +128,22 @@ python flowmimic/tools/precompute_ik263.py --workers 10 --overwrite
 python flowmimic/tools/validate_cache.py
 ```
 
+OpenPose (BODY-25) utilities:
+
+1) Run OpenPose on AIST++ videos (outputs per-frame JSON + per-video .npy):
+
+```
+bash flowmimic/tools/run_openpose_on_aist.sh
+```
+
+2) Convert a single OpenPose JSON directory to one .npy:
+
+```
+python flowmimic/tools/json2npy_openpose.py \
+  --video_dir <json_dir> \
+  --out <output.npy>
+```
+
 To avoid slow on-the-fly IK, cache all 263D features:
 
 ```

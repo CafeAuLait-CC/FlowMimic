@@ -5,17 +5,26 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
+
+OK = "\033[1;38;2;115;218;202m[OK]\033[0m"
+WARN = "\033[1;38;2;215;215;95m[WARN]\033[0m"
+ERR = "\033[1;38;2;247;118;142m[ERROR]\033[0m"
 
 
 def _frame_index_from_name(p: Path) -> Optional[int]:
     """
-    OpenPose json files are commonly like: <prefix>_000000000000_keypoints.json
+    OpenPose json files may be like:
+      - <prefix>_000000000000_keypoints.json (AIST++)
+      - 0005_img_keypoints.json (MVHumanNet)
     Extract the numeric frame index. If none, return None (will fallback to lexicographic sort).
     """
     m = re.search(r"_(\d+)_keypoints\.json$", p.name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"^(\d+)_img_keypoints\.json$", p.name)
     if m:
         return int(m.group(1))
     return None
@@ -103,7 +112,12 @@ def main():
             with jf.open("r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            raise SystemExit(f"[ERROR] Failed to read JSON: {jf}\n{e}")
+            missing += 1
+            if args.strict:
+                raise SystemExit(f"{ERR} Failed to read JSON: {jf}\n{e}")
+            print(f"{WARN} Failed to read JSON (filled zeros): {jf}\n{e}")
+            frames.append(np.zeros((25, 3), dtype=np.float32))
+            continue
 
         people = data.get("people", [])
         if args.strict and (
@@ -111,7 +125,7 @@ def main():
             or "pose_keypoints_2d"
             not in people[min(args.person_index, len(people) - 1)]
         ):
-            raise SystemExit(f"[ERROR] Missing detection in frame: {jf}")
+            raise SystemExit(f"{ERR} Missing detection in frame: {jf}")
 
         arr = _extract_pose_25x3(data, person_index=args.person_index, fill=args.fill)
         if people == []:
@@ -128,10 +142,13 @@ def main():
     stacked = np.stack(frames, axis=0)  # [T,25,3]
     np.save(out_path, stacked)
 
-    print(f"[OK] video_dir: {video_dir}")
-    print(f"[OK] frames: {stacked.shape[0]}, joints: {stacked.shape[1]}")
-    print(f"[OK] missing_frames: {missing}")
-    print(f"[OK] saved: {out_path}")
+    print(f"{OK} video_dir: {video_dir}")
+    print(f"{OK} frames: {stacked.shape[0]}, joints: {stacked.shape[1]}")
+    if missing:
+        print(f"{WARN} missing_frames: {missing}")
+    else:
+        print(f"{OK} missing_frames: {missing}")
+    print(f"{OK} saved: {out_path}")
 
 
 if __name__ == "__main__":

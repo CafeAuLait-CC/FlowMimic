@@ -15,6 +15,7 @@ from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.motion.process_motion import ik263_to_smpl22
+from flowmimic.src.data.openpose import load_openpose_npy
 
 
 def main():
@@ -34,6 +35,7 @@ def main():
     config = load_config()
     seq_len = config["seq_len"]
     d_z = config["d_z"]
+    openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
 
     flow_cfg = config.get("flow", {})
     flow = ConditionalRectFlow(
@@ -61,17 +63,30 @@ def main():
     vae.to(args.device)
     vae.eval()
 
+    k2d_mean = None
+    k2d_std = None
+    if os.path.exists(openpose_stats_path):
+        stats = np.load(openpose_stats_path)
+        k2d_mean = stats["mean"]
+        k2d_std = stats["std"]
+
     if args.k2d_npy and args.tau_cond_npy:
-        k2d = np.load(args.k2d_npy)
+        k2d, vis = load_openpose_npy(args.k2d_npy)
         tau_cond = np.load(args.tau_cond_npy)
-        cond = build_cond_inputs(k2d, tau_cond, args.device)
+        cond = build_cond_inputs(k2d, tau_cond, args.device, vis_mask=vis)
     else:
         cond = build_dummy_cond(1, device=args.device)
 
     tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=args.device)
     x0 = torch.randn(1, seq_len, d_z, device=args.device)
 
-    g, mem, _vis = flow.cond_encoder(cond["k2d"], cond["tau_cond"])
+    g, mem, _vis = flow.cond_encoder(
+        cond["k2d"],
+        cond["tau_cond"],
+        vis_mask=cond.get("vis_mask"),
+        mean=k2d_mean,
+        std=k2d_std,
+    )
     style_id = torch.tensor([args.style_id], device=args.device)
     domain_id = torch.tensor([args.domain_id], device=args.device)
     style = flow.style_emb(style_id, domain_id, apply_dropout=False)

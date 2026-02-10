@@ -18,20 +18,20 @@ def _pad_or_crop(sequence, target_len):
     length = sequence.shape[0]
     if length == target_len:
         mask = np.ones(target_len, dtype=bool)
-        return sequence, mask
+        return sequence, mask, 0, length
 
     if length > target_len:
         start = random.randint(0, length - target_len)
         clip = sequence[start : start + target_len]
         mask = np.ones(target_len, dtype=bool)
-        return clip, mask
+        return clip, mask, start, length
 
     pad_len = target_len - length
     pad = np.zeros((pad_len,) + sequence.shape[1:], dtype=sequence.dtype)
     clip = np.concatenate([sequence, pad], axis=0)
     mask = np.zeros(target_len, dtype=bool)
     mask[:length] = True
-    return clip, mask
+    return clip, mask, 0, length
 
 
 class MVHumanNetDataset(Dataset):
@@ -90,7 +90,7 @@ class MVHumanNetDataset(Dataset):
             if self.cache_root:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                 np.save(cache_path, motion)
-        motion, mask = _pad_or_crop(motion, self.seq_len)
+        motion, mask, start, orig_len = _pad_or_crop(motion, self.seq_len)
         if not np.isfinite(motion).all():
             return self.__getitem__((idx + 1) % len(self.sequence_dirs))
         if motion.shape[-1] != 263:
@@ -113,7 +113,7 @@ class MVHumanNetDataset(Dataset):
             "domain_id": torch.tensor(0, dtype=torch.long),
             "style_id": torch.tensor(0, dtype=torch.long),
             "mask": torch.from_numpy(mask),
-            "meta": {"path": seq_dir},
+            "meta": {"path": seq_dir, "start": start, "orig_len": orig_len},
         }
         return sample
 

@@ -44,6 +44,9 @@
     "p_style_drop": 0.5,
     "lr": 2e-4,
     "weight_decay": 0.01,
+    "cond_frames_min": 2,
+    "cond_frames_max": 10,
+    "cond_drop_prob": 0.2,
     "teacher_mode": "strict",
     "p_teacher": 1.0,
     "ema_decay": 0.999,
@@ -63,5 +66,9 @@
   "aist_split_train": "data/AIST++/Annotations/splits/pose_train.txt",
   "aist_split_val": "data/AIST++/Annotations/splits/pose_val.txt",
   "mvh_split_train": "data/MVHumanNet/mvh_train.txt",
-  "mvh_split_val": "data/MVHumanNet/mvh_val.txt"
+  "mvh_split_val": "data/MVHumanNet/mvh_val.txt",
+  "aist_openpose_dir": "data/AIST++/Annotations/openpose",
+  "mvh_openpose_root": "data/MVHumanNet",
+  "mvh_cameras": ["22327091", "22327113", "22327084"],
+  "openpose_stats_path": "data/openpose_stats.npz"
 }

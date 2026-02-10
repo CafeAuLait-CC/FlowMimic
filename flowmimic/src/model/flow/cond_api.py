@@ -1,7 +1,7 @@
 import torch
 
 
-def build_cond_inputs(k2d, tau_cond, device):
+def build_cond_inputs(k2d, tau_cond, device, vis_mask=None):
     if k2d is None or tau_cond is None:
         raise ValueError("k2d and tau_cond must be provided")
     if not torch.is_tensor(k2d):
@@ -12,7 +12,14 @@ def build_cond_inputs(k2d, tau_cond, device):
         k2d = k2d.unsqueeze(0)
     if tau_cond.dim() == 1:
         tau_cond = tau_cond.unsqueeze(0)
-    return {"k2d": k2d, "tau_cond": tau_cond}
+    out = {"k2d": k2d, "tau_cond": tau_cond}
+    if vis_mask is not None:
+        if not torch.is_tensor(vis_mask):
+            vis_mask = torch.tensor(vis_mask, dtype=torch.float32, device=device)
+        if vis_mask.dim() == 2:
+            vis_mask = vis_mask.unsqueeze(0)
+        out["vis_mask"] = vis_mask
+    return out
 
 
 def build_dummy_cond(batch_size, t_cond=6, num_joints=25, device="cpu"):

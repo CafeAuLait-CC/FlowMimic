@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -21,6 +22,11 @@ from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.model.vae.datasets.balanced_batch_sampler import balanced_batch_iter
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
+from flowmimic.src.data.openpose import (
+    compute_openpose_stats,
+    load_aist_openpose,
+    load_mvh_openpose,
+)
 
 
 def main():
@@ -48,6 +54,10 @@ def main():
     target_fps = config.get("target_fps", 30)
     aist_fps = config.get("aist_fps", 60)
     mvh_fps = config.get("mvh_fps", 5)
+    openpose_aist_dir = config.get("aist_openpose_dir", "data/AIST++/Annotations/openpose")
+    openpose_mvh_root = config.get("mvh_openpose_root", "data/MVHumanNet")
+    mvh_cameras = config.get("mvh_cameras", ["22327091", "22327113", "22327084"])
+    openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
 
     mean, std = load_mean_std(stats_path)
 
@@ -61,6 +71,9 @@ def main():
     teacher_mode = args.teacher_mode or flow_cfg.get("teacher_mode", "strict")
     p_teacher = args.p_teacher if args.p_teacher is not None else flow_cfg.get("p_teacher", 1.0)
     ema_decay = flow_cfg.get("ema_decay", 0.999)
+    cond_frames_min = flow_cfg.get("cond_frames_min", 2)
+    cond_frames_max = flow_cfg.get("cond_frames_max", 10)
+    cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
 
     dataset_a = AISTDataset(
         aist_dir,
@@ -111,6 +124,23 @@ def main():
     flow.to(args.device)
     optimizer = torch.optim.AdamW(flow.parameters(), lr=lr, weight_decay=weight_decay)
 
+    if not os.path.exists(openpose_stats_path):
+        compute_openpose_stats(
+            aist_paths=_aist_split_paths(aist_dir, config["aist_split_train"]),
+            mvh_dirs=_read_lines(config["mvh_split_train"]),
+            aist_openpose_dir=openpose_aist_dir,
+            mvh_openpose_root=openpose_mvh_root,
+            mv_root=mv_root,
+            cameras=mvh_cameras,
+            target_fps=target_fps,
+            aist_fps=aist_fps,
+            mvh_fps=mvh_fps,
+            out_path=openpose_stats_path,
+        )
+    stats = np.load(openpose_stats_path)
+    k2d_mean = stats["mean"]
+    k2d_std = stats["std"]
+
     teacher = None
     if args.reflow_round >= 1:
         if not args.teacher_ckpt:
@@ -138,7 +168,7 @@ def main():
         total_count = 0
         for _ in tqdm(range(min(len(loader_a), len(loader_b))), desc=f"Flow Epoch {epoch+1}", leave=False):
             batch = next(batch_iter)
-            motion, domain_id, style_id, mask = _merge_batches(batch)
+            motion, domain_id, style_id, mask, metas = _merge_batches(batch)
             motion = motion.to(args.device)
             domain_id = domain_id.to(args.device)
             style_id = style_id.to(args.device)
@@ -151,8 +181,32 @@ def main():
             t = torch.rand(z_data.shape[0], device=args.device)
             x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
 
-            cond = build_dummy_cond(z_data.shape[0], device=args.device)
-            g2d, mem, _vis = flow.cond_encoder(cond["k2d"], cond["tau_cond"])
+            k2d_batch, vis_batch, tau_cond, mask_cond = _load_cond_batch(
+                metas,
+                openpose_aist_dir,
+                openpose_mvh_root,
+                mv_root,
+                mvh_cameras,
+                seq_len,
+                cond_frames_min,
+                cond_frames_max,
+                cond_drop_prob,
+                aist_fps,
+                mvh_fps,
+                target_fps,
+            )
+            k2d_batch = k2d_batch.to(args.device)
+            vis_batch = vis_batch.to(args.device)
+            tau_cond = tau_cond.to(args.device)
+            mask_cond = mask_cond.to(args.device)
+            g2d, mem, _vis = flow.cond_encoder(
+                k2d_batch,
+                tau_cond,
+                vis_mask=vis_batch,
+                mask_cond=mask_cond,
+                mean=k2d_mean,
+                std=k2d_std,
+            )
             style = flow.style_emb(style_id, domain_id, apply_dropout=True)
             g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
             v_pred = flow.flow(x_t, t, tau_out, mem, g)
@@ -194,16 +248,117 @@ def _merge_batches(batches):
     domain_ids = []
     style_ids = []
     masks = []
+    metas = []
     for batch in batches:
         motions.append(batch["motion"])
         domain_ids.append(batch["domain_id"])
         style_ids.append(batch["style_id"])
         masks.append(batch["mask"])
+        metas.extend(batch["meta"])
     motion = torch.cat(motions, dim=0)
     domain_id = torch.cat(domain_ids, dim=0)
     style_id = torch.cat(style_ids, dim=0)
     mask = torch.cat(masks, dim=0)
-    return motion, domain_id, style_id, mask
+    return motion, domain_id, style_id, mask, metas
+
+
+def _read_lines(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def _aist_split_paths(aist_dir, split_path):
+    names = _read_lines(split_path)
+    return [os.path.join(aist_dir, f"{name}.pkl") for name in names]
+
+
+def _load_cond_batch(
+    metas,
+    aist_openpose_dir,
+    mvh_openpose_root,
+    mv_root,
+    cameras,
+    seq_len,
+    cond_frames_min,
+    cond_frames_max,
+    cond_drop_prob,
+    aist_fps,
+    mvh_fps,
+    target_fps,
+):
+    k2d_list = []
+    vis_list = []
+    mask_list = []
+    tau_list = []
+    for meta in metas:
+        path = meta["path"]
+        if path.endswith(".pkl"):
+            k2d, vis = load_aist_openpose(
+                path, aist_openpose_dir, src_fps=aist_fps, target_fps=target_fps
+            )
+        else:
+            k2d, vis = load_mvh_openpose(
+                path,
+                mv_root,
+                mvh_openpose_root,
+                cameras,
+                src_fps=mvh_fps,
+                target_fps=target_fps,
+            )
+        if k2d is None:
+            k2d = np.zeros((seq_len, 25, 2), dtype=np.float32)
+            vis = np.zeros((seq_len, 25), dtype=np.float32)
+        start = meta.get("start", 0)
+        orig_len = meta.get("orig_len", k2d.shape[0])
+        if orig_len >= seq_len:
+            k2d = k2d[start : start + seq_len]
+            vis = vis[start : start + seq_len]
+        else:
+            pad_len = seq_len - orig_len
+            k2d = np.concatenate([k2d, np.zeros((pad_len, 25, 2), dtype=np.float32)], axis=0)
+            vis = np.concatenate([vis, np.zeros((pad_len, 25), dtype=np.float32)], axis=0)
+        t_len = k2d.shape[0]
+        k_frames = int(np.random.randint(cond_frames_min, cond_frames_max + 1))
+        if t_len <= k_frames:
+            idx = np.arange(t_len)
+        else:
+            idx = np.sort(np.random.choice(t_len, size=k_frames, replace=False))
+        k2d_sparse = k2d[idx]
+        vis_sparse = vis[idx]
+        if cond_drop_prob > 0:
+            drop = np.random.rand(*vis_sparse.shape) < cond_drop_prob
+            vis_sparse = vis_sparse * (~drop)
+            k2d_sparse = k2d_sparse * vis_sparse[..., None]
+        mask_cond = np.ones((k2d_sparse.shape[0],), dtype=bool)
+        tau_cond = idx.astype(np.float32) / max(t_len - 1, 1)
+
+        k2d_list.append(k2d_sparse)
+        vis_list.append(vis_sparse)
+        mask_list.append(mask_cond)
+        tau_list.append(tau_cond)
+
+    max_len = max(k.shape[0] for k in k2d_list)
+    k2d_pad = []
+    vis_pad = []
+    mask_pad = []
+    tau_pad = []
+    for k2d, vis, mask, tau in zip(k2d_list, vis_list, mask_list, tau_list):
+        pad = max_len - k2d.shape[0]
+        if pad > 0:
+            k2d = np.concatenate([k2d, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0)
+            vis = np.concatenate([vis, np.zeros((pad, 25), dtype=np.float32)], axis=0)
+            mask = np.concatenate([mask, np.zeros((pad,), dtype=bool)], axis=0)
+            tau = np.concatenate([tau, np.zeros((pad,), dtype=np.float32)], axis=0)
+        k2d_pad.append(k2d)
+        vis_pad.append(vis)
+        mask_pad.append(mask)
+        tau_pad.append(tau)
+
+    k2d_batch = torch.from_numpy(np.stack(k2d_pad, axis=0))
+    vis_batch = torch.from_numpy(np.stack(vis_pad, axis=0))
+    mask_batch = torch.from_numpy(np.stack(mask_pad, axis=0))
+    tau_batch = torch.from_numpy(np.stack(tau_pad, axis=0))
+    return k2d_batch, vis_batch, tau_batch, mask_batch
 
 
 if __name__ == "__main__":

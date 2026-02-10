@@ -47,14 +47,14 @@ class ConditionalRectFlow(nn.Module):
             dropout=dropout,
         )
 
-    def encode_cond(self, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True):
-        g_2d, mem, vis_mask = self.cond_encoder(k2d, tau_cond)
+    def encode_cond(self, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True, vis_mask=None):
+        g_2d, mem, vis_mask = self.cond_encoder(k2d, tau_cond, vis_mask=vis_mask)
         style = self.style_emb(style_id, domain_id, apply_dropout=apply_style_dropout)
         g = self.cond_mlp(torch.cat([g_2d, style], dim=-1))
         return g, mem, vis_mask
 
-    def forward(self, x_t, t_flow, tau_out, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True):
+    def forward(self, x_t, t_flow, tau_out, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True, vis_mask=None):
         g, mem, _vis = self.encode_cond(
-            k2d, tau_cond, style_id, domain_id, apply_style_dropout=apply_style_dropout
+            k2d, tau_cond, style_id, domain_id, apply_style_dropout=apply_style_dropout, vis_mask=vis_mask
         )
         return self.flow(x_t, t_flow, tau_out, mem, g)

@@ -49,6 +49,7 @@ def main():
     )
     parser.add_argument("--p-teacher", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_flow")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -167,6 +168,19 @@ def main():
     )
     flow.to(args.device)
     optimizer = torch.optim.AdamW(flow.parameters(), lr=lr, weight_decay=weight_decay)
+    start_epoch = 0
+
+    if args.resume:
+        print(f"Resuming from {args.resume}")
+        state = torch.load(args.resume, map_location=args.device)
+        flow.load_state_dict(state["model"])
+        if "optimizer" in state:
+            optimizer.load_state_dict(state["optimizer"])
+        if args.use_ema_teacher and "ema" in state:
+            ema_state = state["ema"]
+        else:
+            ema_state = None
+        start_epoch = int(state.get("epoch", 0))
 
     print("Loading OpenPose stats")
     if not os.path.exists(openpose_stats_path):
@@ -208,6 +222,8 @@ def main():
         )
 
     ema = EMA(flow, decay=ema_decay) if args.use_ema_teacher else None
+    if ema is not None and args.resume and ema_state is not None:
+        ema.load_state_dict(ema_state)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     last_path = os.path.join(
@@ -216,7 +232,7 @@ def main():
     tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=args.device)
 
     print("Starting training loop")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         flow.train()
         total_loss = 0.0
         total_count = 0
@@ -363,10 +379,9 @@ def main():
                 f"backward={t_backward / total_count:.4f}"
             )
 
-        state = {"model": flow.state_dict()}
+        state = {"model": flow.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch + 1}
         if ema is not None:
             state["ema"] = ema.state_dict()
-        state["optimizer"] = optimizer.state_dict()
         torch.save(state, last_path)
         if (epoch + 1) % 10 == 0:
             ckpt_path = os.path.join(

@@ -19,9 +19,13 @@ def _resample_to_fps(values, src_fps, dst_fps, mode="pchip"):
         try:
             from scipy.interpolate import PchipInterpolator
         except ImportError:
-            raise ImportError("scipy is required for PCHIP upsampling; please install scipy")
+            raise ImportError(
+                "scipy is required for PCHIP upsampling; please install scipy"
+            )
         t_src = np.arange(values.shape[0], dtype=np.float64) / float(src_fps)
-        t_dst = np.arange(int(np.round(t_src[-1] * dst_fps)) + 1, dtype=np.float64) / float(dst_fps)
+        t_dst = np.arange(
+            int(np.round(t_src[-1] * dst_fps)) + 1, dtype=np.float64
+        ) / float(dst_fps)
         if mode == "nearest":
             idx = np.clip(np.round(t_dst * src_fps).astype(int), 0, values.shape[0] - 1)
             return values[idx]
@@ -59,7 +63,9 @@ def load_openpose_npy(npy_path, src_fps=None, target_fps=None):
     conf[~np.isfinite(conf)] = 0.0
     coords[..., 1] = -coords[..., 1]
     if src_fps is not None and target_fps is not None:
-        coords = _resample_to_fps(coords, src_fps=src_fps, dst_fps=target_fps, mode="pchip")
+        coords = _resample_to_fps(
+            coords, src_fps=src_fps, dst_fps=target_fps, mode="pchip"
+        )
         conf = _resample_to_fps(conf, src_fps=src_fps, dst_fps=target_fps, mode="geom")
         conf = np.clip(conf, 0.0, 1.0)
     vis_mask = conf > 0.0
@@ -83,7 +89,9 @@ def load_aist_openpose(pkl_path, openpose_dir, src_fps=None, target_fps=None):
     return load_openpose_npy(path, src_fps=src_fps, target_fps=target_fps)
 
 
-def load_mvh_openpose(seq_dir, mv_root, openpose_root, cameras, src_fps=None, target_fps=None):
+def load_mvh_openpose(
+    seq_dir, mv_root, openpose_root, cameras, src_fps=None, target_fps=None
+):
     rel = os.path.relpath(seq_dir, mv_root)
     parts = rel.split(os.sep)
     if len(parts) < 2:
@@ -108,6 +116,7 @@ def compute_openpose_stats(
     mvh_fps,
     out_path,
     eps=1e-6,
+    progress=None,
 ):
     sum_xy = np.zeros((25, 2), dtype=np.float64)
     sum_sq = np.zeros((25, 2), dtype=np.float64)
@@ -127,16 +136,22 @@ def compute_openpose_stats(
                 continue
             vals = k_norm[mask[:, j], j]
             sum_xy[j] += vals.sum(axis=0)
-            sum_sq[j] += (vals ** 2).sum(axis=0)
+            sum_sq[j] += (vals**2).sum(axis=0)
             count[j] += vals.shape[0]
 
-    for path in aist_paths:
+    aist_iter = aist_paths
+    mvh_iter = mvh_dirs
+    if progress is not None:
+        aist_iter = progress(aist_paths, desc="OpenPose stats (AIST)", leave=False)
+        mvh_iter = progress(mvh_dirs, desc="OpenPose stats (MVH)", leave=True)
+
+    for path in aist_iter:
         k2d, vis = load_aist_openpose(
             path, aist_openpose_dir, src_fps=aist_fps, target_fps=target_fps
         )
         _accumulate(k2d, vis)
 
-    for seq_dir in mvh_dirs:
+    for seq_dir in mvh_iter:
         k2d, vis = load_mvh_openpose(
             seq_dir,
             mv_root,

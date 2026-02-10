@@ -8,6 +8,7 @@ import argparse
 import os
 import sys
 
+from tqdm import tqdm
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
@@ -58,7 +59,9 @@ def main():
         aist_fps,
         mvh_fps,
         out_path,
+        progress=tqdm,
     )
+    tqdm.write(f"Saved OpenPose stats to {out_path}")
 
 
 if __name__ == "__main__":

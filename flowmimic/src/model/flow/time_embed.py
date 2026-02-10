@@ -30,11 +30,13 @@ class TimeEmbed(nn.Module):
 def sinusoidal_embedding(t, dim):
     if t.dim() == 1:
         t = t[:, None]
+    elif t.dim() == 2:
+        t = t.unsqueeze(-1)
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000.0) * torch.arange(half, device=t.device).float() / max(half, 1)
     )
-    args = t * freqs[None, :]
+    args = t * freqs
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     if dim % 2 == 1:
         emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)

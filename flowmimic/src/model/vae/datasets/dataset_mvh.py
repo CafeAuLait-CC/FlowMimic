@@ -46,6 +46,8 @@ class MVHumanNetDataset(Dataset):
         cache_root=None,
         target_fps=30,
         src_fps=5,
+        camera_ids=None,
+        expand_cameras=False,
     ):
         if sequence_dirs is None:
             self.sequence_dirs = sorted(
@@ -65,6 +67,8 @@ class MVHumanNetDataset(Dataset):
         self.cache_root = cache_root
         self.target_fps = target_fps
         self.src_fps = src_fps
+        self.camera_ids = list(camera_ids) if camera_ids else []
+        self.expand_cameras = expand_cameras
         self._clip_counts = None
         self._index_map = None
         self._build_index_map()
@@ -73,7 +77,12 @@ class MVHumanNetDataset(Dataset):
         return len(self._index_map)
 
     def __getitem__(self, idx):
-        seq_dir = self.sequence_dirs[self._index_map[idx]]
+        entry = self._index_map[idx]
+        if isinstance(entry, tuple):
+            seq_idx, camera = entry
+        else:
+            seq_idx, camera = entry, None
+        seq_dir = self.sequence_dirs[seq_idx]
         motion = None
         if self.cache_root:
             rel = os.path.relpath(seq_dir, self.mv_root)
@@ -92,7 +101,7 @@ class MVHumanNetDataset(Dataset):
                 np.save(cache_path, motion)
         motion, mask, start, orig_len = _pad_or_crop(motion, self.seq_len)
         if not np.isfinite(motion).all():
-            return self.__getitem__((idx + 1) % len(self.sequence_dirs))
+            return self.__getitem__((idx + 1) % len(self))
         if motion.shape[-1] != 263:
             raise ValueError(f"Expected 263 features, got {motion.shape[-1]} in {seq_dir}")
 
@@ -106,25 +115,34 @@ class MVHumanNetDataset(Dataset):
                 raise ValueError("mean/std required for normalization")
             motion[:, :cont_end] = (motion[:, :cont_end] - self.mean) / self.std
             if not np.isfinite(motion).all():
-                return self.__getitem__((idx + 1) % len(self.sequence_dirs))
+                return self.__getitem__((idx + 1) % len(self))
 
+        meta = {"path": seq_dir, "start": start, "orig_len": orig_len}
+        if camera is not None:
+            meta["camera"] = camera
         sample = {
             "motion": torch.from_numpy(motion).float(),
             "domain_id": torch.tensor(0, dtype=torch.long),
             "style_id": torch.tensor(0, dtype=torch.long),
             "mask": torch.from_numpy(mask),
-            "meta": {"path": seq_dir, "start": start, "orig_len": orig_len},
+            "meta": meta,
         }
         return sample
 
     def _build_index_map(self):
         clip_counts = []
         index_map = []
+        cams = self.camera_ids if self.expand_cameras and self.camera_ids else None
         for i, seq_dir in enumerate(self.sequence_dirs):
             length = self._sequence_length(seq_dir)
             clips = max(1, length // self.seq_len)
             clip_counts.append(clips)
-            index_map.extend([i] * clips)
+            if cams is None:
+                index_map.extend([i] * clips)
+            else:
+                for _ in range(clips):
+                    for cam in cams:
+                        index_map.append((i, cam))
         self._clip_counts = clip_counts
         self._index_map = index_map
 

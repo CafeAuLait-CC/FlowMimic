@@ -26,14 +26,14 @@ class ConditionalRectFlow(nn.Module):
         super().__init__()
         self.cond_encoder = CondEncoder2D(
             num_joints=num_joints_2d,
-            d_model=cond_dim,
+            d_model=d_model,
             n_layers=cond_layers,
             n_heads=cond_heads,
             dropout=dropout,
         )
         self.style_emb = StyleEmbedding(num_styles, dim=style_dim, p_drop=p_style_drop)
         self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim + style_dim, cond_dim),
+            nn.Linear(d_model + style_dim, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
@@ -43,7 +43,7 @@ class ConditionalRectFlow(nn.Module):
             n_layers=n_layers,
             n_heads=n_heads,
             ffn_dim=ffn_dim,
-            cond_dim=cond_dim,
+            cond_dim=d_model,
             dropout=dropout,
         )
 

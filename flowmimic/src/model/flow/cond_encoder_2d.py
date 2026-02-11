@@ -63,6 +63,9 @@ class CondEncoder2D(nn.Module):
             std_t = torch.as_tensor(std, device=k2d_norm.device, dtype=k2d_norm.dtype)
             k2d_norm = (k2d_norm - mean_t) / (std_t + 1e-6)
             k2d_norm = k2d_norm * vis_mask.unsqueeze(-1)
+        # Clamp to keep attention logits stable for rare extreme inputs.
+        k2d_norm = torch.nan_to_num(k2d_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        k2d_norm = k2d_norm.clamp(-10.0, 10.0)
         b, t, j, _ = k2d_norm.shape
         flat = k2d_norm.reshape(b, t, j * 2)
         token = torch.cat([flat, vis_mask.reshape(b, t, j)], dim=-1)

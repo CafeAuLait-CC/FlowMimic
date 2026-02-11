@@ -59,6 +59,9 @@ def main():
         "--lr-scale-mode", type=str, choices=["none", "linear"], default="none"
     )
     parser.add_argument("--max-bad-steps", type=int, default=50)
+    parser.add_argument("--cond-lr-scale", type=float, default=0.2)
+    parser.add_argument("--reset-optimizer", action="store_true")
+    parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -105,6 +108,7 @@ def main():
     flow_cfg = config.get("flow", {})
     lr = args.lr or flow_cfg.get("lr", 2e-4)
     weight_decay = flow_cfg.get("weight_decay", 1e-2)
+    cond_lr_scale = args.cond_lr_scale
     teacher_steps = args.teacher_steps or flow_cfg.get("teacher_steps", 16)
     teacher_solver = args.teacher_solver or flow_cfg.get("teacher_solver", "heun")
     teacher_mode = args.teacher_mode or flow_cfg.get("teacher_mode", "strict")
@@ -117,6 +121,7 @@ def main():
     cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
     save_every_steps = args.save_every_steps or flow_cfg.get("save_every_steps", 0)
+    save_every_epochs = args.save_every_epochs
     max_bad_steps = args.max_bad_steps
     seed = config.get("seed", 42)
     seed_rank = seed + rank
@@ -253,13 +258,26 @@ def main():
         print(
             f"Per-GPU batch={args.batch_size}, global batch={args.batch_size * world_size}"
         )
+        print(f"Cond LR scale={cond_lr_scale}")
 
-    optimizer = torch.optim.AdamW(flow.parameters(), lr=lr, weight_decay=weight_decay)
+    cond_params = list(flow_model.cond_encoder.parameters()) + list(
+        flow_model.cond_mlp.parameters()
+    )
+    cond_param_ids = {id(p) for p in cond_params}
+    other_params = [p for p in flow_model.parameters() if id(p) not in cond_param_ids]
+    param_groups = [
+        {"params": other_params, "lr": lr},
+        {"params": cond_params, "lr": lr * cond_lr_scale},
+    ]
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     start_epoch = 0
     ema_state = None
     if resume_state is not None:
-        if "optimizer" in resume_state:
+        if not args.reset_optimizer and "optimizer" in resume_state:
             optimizer.load_state_dict(resume_state["optimizer"])
+        if args.reset_optimizer and is_main:
+            print("Resetting optimizer state for resume")
         if args.use_ema_teacher and "ema" in resume_state:
             ema_state = resume_state["ema"]
         start_epoch = int(resume_state.get("epoch", 0))
@@ -328,6 +346,9 @@ def main():
     last_path = os.path.join(
         args.checkpoint_dir, f"flow_round{args.reflow_round}_last.pt"
     )
+    last_good_path = os.path.join(
+        args.checkpoint_dir, f"flow_round{args.reflow_round}_last_good.pt"
+    )
     if not args.resume and is_main:
         init_state = {
             "model": flow_model.state_dict(),
@@ -337,6 +358,7 @@ def main():
         if ema is not None:
             init_state["ema"] = ema.state_dict()
         torch.save(init_state, last_path)
+        torch.save(init_state, last_good_path)
     if ddp:
         dist.barrier()
     tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
@@ -345,15 +367,18 @@ def main():
         if not bad_local and not ddp:
             return False
         if not ddp:
-            if bad_local and os.path.exists(last_path):
-                _restore_checkpoint(last_path, flow_model, optimizer, ema, device)
+            if bad_local:
+                restore_path = last_good_path if os.path.exists(last_good_path) else last_path
+                if os.path.exists(restore_path):
+                    _restore_checkpoint(restore_path, flow_model, optimizer, ema, device)
             return bad_local
         flag = torch.tensor([1 if bad_local else 0], device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item() > 0:
             dist.barrier()
-            if os.path.exists(last_path):
-                _restore_checkpoint(last_path, flow_model, optimizer, ema, device)
+            restore_path = last_good_path if os.path.exists(last_good_path) else last_path
+            if os.path.exists(restore_path):
+                _restore_checkpoint(restore_path, flow_model, optimizer, ema, device)
             dist.barrier()
             return True
         return False
@@ -528,6 +553,7 @@ def main():
                     state["ema"] = ema.state_dict()
                 if is_main:
                     torch.save(state, last_path)
+                    torch.save(state, last_good_path)
 
         if ddp:
             stats = torch.tensor(
@@ -565,20 +591,22 @@ def main():
                     f"backward={t_backward / total_count:.4f}"
                 )
 
-            state = {
-                "model": flow_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch + 1,
-            }
-            if ema is not None:
-                state["ema"] = ema.state_dict()
-            torch.save(state, last_path)
-            if (epoch + 1) % 1 == 0:
-                ckpt_path = os.path.join(
-                    args.checkpoint_dir,
-                    f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
-                )
-                torch.save(state, ckpt_path)
+            if total_count > 0:
+                state = {
+                    "model": flow_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch + 1,
+                }
+                if ema is not None:
+                    state["ema"] = ema.state_dict()
+                torch.save(state, last_path)
+                torch.save(state, last_good_path)
+                if save_every_epochs and (epoch + 1) % save_every_epochs == 0:
+                    ckpt_path = os.path.join(
+                        args.checkpoint_dir,
+                        f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
+                    )
+                    torch.save(state, ckpt_path)
         if ddp:
             dist.barrier()
 

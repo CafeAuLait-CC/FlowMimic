@@ -101,9 +101,11 @@ def cache_openpose_npy(npy_path, cache_path, src_fps=None, target_fps=None):
     return coords, vis
 
 
-def _aist_cache_path(cache_root, pkl_path):
+def _aist_cache_path(cache_root, pkl_path, camera=None):
     name = os.path.splitext(os.path.basename(pkl_path))[0]
-    return os.path.join(cache_root, "aist", f"{name}.npz")
+    if camera is None:
+        return os.path.join(cache_root, "aist", f"{name}.npz")
+    return os.path.join(cache_root, "aist", f"{name}_c{camera}.npz")
 
 
 def _mvh_cache_path(cache_root, mv_root, seq_dir, cam):
@@ -118,19 +120,25 @@ def load_aist_openpose(
     target_fps=None,
     cache_root=None,
     write_cache=False,
+    camera=None,
 ):
+    cache_path = None
     if cache_root:
-        cache_path = _aist_cache_path(cache_root, pkl_path)
+        cache_path = _aist_cache_path(cache_root, pkl_path, camera=camera)
         if os.path.exists(cache_path):
             return _load_openpose_cache(cache_path)
     name = os.path.splitext(os.path.basename(pkl_path))[0]
-    path = os.path.join(openpose_dir, f"{name}.npy")
-    if not os.path.exists(path):
-        return None, None
-    coords, vis = load_openpose_npy(path, src_fps=src_fps, target_fps=target_fps)
-    if cache_root and write_cache:
-        _save_openpose_cache(_aist_cache_path(cache_root, pkl_path), coords, vis)
-    return coords, vis
+    cam_list = [camera] if camera is not None else ["01", "02", "08", "09"]
+    for cam in cam_list:
+        name_cam = name.replace("_cAll_", f"_c{cam}_")
+        path = os.path.join(openpose_dir, f"{name_cam}.npy")
+        if not os.path.exists(path):
+            continue
+        coords, vis = load_openpose_npy(path, src_fps=src_fps, target_fps=target_fps)
+        if cache_root and write_cache:
+            _save_openpose_cache(_aist_cache_path(cache_root, pkl_path, camera=cam), coords, vis)
+        return coords, vis
+    return None, None
 
 
 def load_mvh_openpose(
@@ -178,6 +186,8 @@ def compute_openpose_stats(
     eps=1e-6,
     progress=None,
     cache_root=None,
+    aist_cameras=None,
+    mvh_cameras=None,
 ):
     sum_xy = np.zeros((25, 2), dtype=np.float64)
     sum_sq = np.zeros((25, 2), dtype=np.float64)
@@ -206,18 +216,22 @@ def compute_openpose_stats(
         aist_iter = progress(aist_paths, desc="OpenPose stats (AIST)", leave=False)
         mvh_iter = progress(mvh_dirs, desc="OpenPose stats (MVH)", leave=True)
 
+    cam_list = aist_cameras or ["01", "02", "08", "09"]
+    mvh_cam_list = mvh_cameras or cameras
     for path in aist_iter:
-        k2d, vis = load_aist_openpose(
-            path,
-            aist_openpose_dir,
-            src_fps=aist_fps,
-            target_fps=target_fps,
-            cache_root=cache_root,
-        )
-        _accumulate(k2d, vis)
+        for cam in cam_list:
+            k2d, vis = load_aist_openpose(
+                path,
+                aist_openpose_dir,
+                src_fps=aist_fps,
+                target_fps=target_fps,
+                cache_root=cache_root,
+                camera=cam,
+            )
+            _accumulate(k2d, vis)
 
     for seq_dir in mvh_iter:
-        for cam in cameras:
+        for cam in mvh_cam_list:
             k2d, vis = load_mvh_openpose(
                 seq_dir,
                 mv_root,

@@ -45,6 +45,8 @@ class AISTDataset(Dataset):
         cache_root=None,
         target_fps=30,
         src_fps=60,
+        camera_ids=None,
+        expand_cameras=False,
     ):
         if files is None:
             self.files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
@@ -60,6 +62,8 @@ class AISTDataset(Dataset):
         self.cache_root = cache_root
         self.target_fps = target_fps
         self.src_fps = src_fps
+        self.camera_ids = list(camera_ids) if camera_ids else []
+        self.expand_cameras = expand_cameras
         self._clip_counts = None
         self._index_map = None
         self._build_index_map()
@@ -68,7 +72,12 @@ class AISTDataset(Dataset):
         return len(self._index_map)
 
     def __getitem__(self, idx):
-        path = self.files[self._index_map[idx]]
+        entry = self._index_map[idx]
+        if isinstance(entry, tuple):
+            file_idx, camera = entry
+        else:
+            file_idx, camera = entry, None
+        path = self.files[file_idx]
         motion = None
         if self.cache_root:
             name = os.path.splitext(os.path.basename(path))[0]
@@ -105,23 +114,32 @@ class AISTDataset(Dataset):
 
         genre = get_genre_code(path)
         style_id = self.genre_to_id.get(genre, 0)
+        meta = {"path": path, "genre": genre, "start": start, "orig_len": orig_len}
+        if camera is not None:
+            meta["camera"] = camera
         sample = {
             "motion": torch.from_numpy(motion).float(),
             "domain_id": torch.tensor(1, dtype=torch.long),
             "style_id": torch.tensor(style_id, dtype=torch.long),
             "mask": torch.from_numpy(mask),
-            "meta": {"path": path, "genre": genre, "start": start, "orig_len": orig_len},
+            "meta": meta,
         }
         return sample
 
     def _build_index_map(self):
         clip_counts = []
         index_map = []
+        cams = self.camera_ids if self.expand_cameras and self.camera_ids else None
         for i, path in enumerate(self.files):
             length = self._sequence_length(path)
             clips = max(1, length // self.seq_len)
             clip_counts.append(clips)
-            index_map.extend([i] * clips)
+            if cams is None:
+                index_map.extend([i] * clips)
+            else:
+                for _ in range(clips):
+                    for cam in cams:
+                        index_map.append((i, cam))
         self._clip_counts = clip_counts
         self._index_map = index_map
 

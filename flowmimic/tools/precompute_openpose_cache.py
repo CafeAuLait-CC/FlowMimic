@@ -40,18 +40,20 @@ def _aist_split_paths(aist_dir, split_path):
 def _cache_aist(args):
     pkl_path, openpose_dir, cache_root, overwrite, target_fps, aist_fps = args
     name = os.path.splitext(os.path.basename(pkl_path))[0]
-    out_path = os.path.join(cache_root, "aist", f"{name}.npz")
-    if os.path.exists(out_path) and not overwrite:
-        return
-    coords, _vis = load_aist_openpose(
-        pkl_path,
-        openpose_dir,
-        src_fps=aist_fps,
-        target_fps=target_fps,
-        cache_root=cache_root,
-        write_cache=True,
-    )
-    if coords is None:
+    missing = False
+    for cam in ["01", "02", "08", "09"]:
+        out_path = os.path.join(cache_root, "aist", f"{name}_c{cam}.npz")
+        if os.path.exists(out_path) and not overwrite:
+            continue
+        name_cam = name.replace("_cAll_", f"_c{cam}_")
+        in_path = os.path.join(openpose_dir, f"{name_cam}.npy")
+        if not os.path.exists(in_path):
+            missing = True
+            continue
+        coords, vis = load_openpose_npy(in_path, src_fps=aist_fps, target_fps=target_fps)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        np.savez(out_path, coords=coords.astype(np.float32), vis=vis.astype(np.float32))
+    if missing:
         return ("aist", pkl_path)
 
 
@@ -82,6 +84,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--only", type=str, choices=["aist", "mvh", "all"], default="all"
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -123,24 +128,26 @@ def main():
     ]
 
     bad_aist = []
-    with Pool(processes=args.workers, initializer=_init_worker) as pool:
-        for result in tqdm(
-            pool.imap_unordered(_cache_aist, tasks_aist),
-            total=len(tasks_aist),
-            desc="Cache OpenPose AIST",
-        ):
-            if result:
-                bad_aist.append(result[1])
+    if args.only in ("aist", "all"):
+        with Pool(processes=args.workers, initializer=_init_worker) as pool:
+            for result in tqdm(
+                pool.imap_unordered(_cache_aist, tasks_aist),
+                total=len(tasks_aist),
+                desc="Cache OpenPose AIST",
+            ):
+                if result:
+                    bad_aist.append(result[1])
 
     bad_mvh = []
-    with Pool(processes=args.workers, initializer=_init_worker) as pool:
-        for result in tqdm(
-            pool.imap_unordered(_cache_mvh, tasks_mvh),
-            total=len(tasks_mvh),
-            desc="Cache OpenPose MVH",
-        ):
-            if result:
-                bad_mvh.append(result[1])
+    if args.only in ("mvh", "all"):
+        with Pool(processes=args.workers, initializer=_init_worker) as pool:
+            for result in tqdm(
+                pool.imap_unordered(_cache_mvh, tasks_mvh),
+                total=len(tasks_mvh),
+                desc="Cache OpenPose MVH",
+            ):
+                if result:
+                    bad_mvh.append(result[1])
 
     if bad_aist:
         os.makedirs(cache_root, exist_ok=True)

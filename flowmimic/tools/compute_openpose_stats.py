@@ -41,6 +41,7 @@ def main():
     aist_openpose_dir = config.get("aist_openpose_dir", "data/AIST++/Annotations/openpose")
     mvh_openpose_root = config.get("mvh_openpose_root", "data/MVHumanNet")
     mvh_cameras = config.get("mvh_cameras", ["22327091", "22327113", "22327084"])
+    aist_cameras = config.get("aist_cameras", ["01", "02", "08", "09"])
     cond_cache_root = config.get("cond_cache_root", "data/cached_cond")
     target_fps = config.get("target_fps", 30)
     aist_fps = config.get("aist_fps", 60)
@@ -62,6 +63,8 @@ def main():
         out_path,
         progress=tqdm,
         cache_root=cond_cache_root,
+        aist_cameras=aist_cameras,
+        mvh_cameras=mvh_cameras,
     )
     tqdm.write(f"Saved OpenPose stats to {out_path}")
 

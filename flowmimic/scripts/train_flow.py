@@ -91,6 +91,7 @@ def main():
     )
     openpose_mvh_root = config.get("mvh_openpose_root", "data/MVHumanNet")
     mvh_cameras = config.get("mvh_cameras", ["22327091", "22327113", "22327084"])
+    aist_cameras = config.get("aist_cameras", ["01", "02", "08", "09"])
     openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
     cond_cache_root = config.get("cond_cache_root", "data/cached_cond")
 
@@ -140,6 +141,8 @@ def main():
         cache_root=config["cache_root"],
         target_fps=target_fps,
         src_fps=aist_fps,
+        camera_ids=aist_cameras,
+        expand_cameras=True,
     )
     if is_main:
         print(f"Building datasets -- MVH (train split: {len(mvh_train_dirs)})")
@@ -270,12 +273,14 @@ def main():
                 mvh_openpose_root=openpose_mvh_root,
                 mv_root=mv_root,
                 cameras=mvh_cameras,
-                target_fps=target_fps,
-                aist_fps=aist_fps,
-                mvh_fps=mvh_fps,
-                out_path=openpose_stats_path,
-                cache_root=cond_cache_root,
-            )
+            target_fps=target_fps,
+            aist_fps=aist_fps,
+            mvh_fps=mvh_fps,
+            out_path=openpose_stats_path,
+            cache_root=cond_cache_root,
+            aist_cameras=aist_cameras,
+            mvh_cameras=mvh_cameras,
+        )
         if ddp:
             dist.barrier()
     stats = np.load(openpose_stats_path)
@@ -634,6 +639,7 @@ def _load_cond_batch(
                 src_fps=aist_fps,
                 target_fps=target_fps,
                 cache_root=cache_root,
+                camera=meta.get("camera"),
             )
         else:
             k2d, vis = load_mvh_openpose(

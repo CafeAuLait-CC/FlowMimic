@@ -20,6 +20,9 @@ class EMA:
     def state_dict(self):
         return self.shadow
 
+    def load_state_dict(self, state):
+        self.shadow = {k: v.detach().clone() for k, v in state.items()}
+
 
 class Teacher:
     def __init__(self, model, solver_cfg):

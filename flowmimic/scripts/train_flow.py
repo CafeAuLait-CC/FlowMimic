@@ -58,14 +58,15 @@ def main():
     parser.add_argument(
         "--lr-scale-mode", type=str, choices=["none", "linear"], default="none"
     )
+    parser.add_argument("--max-bad-steps", type=int, default=50)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     ddp = args.ddp
     if ddp:
-        dist.init_process_group(backend="nccl")
         local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", device_id=local_rank)
         device = torch.device("cuda", local_rank)
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -116,6 +117,7 @@ def main():
     cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
     save_every_steps = args.save_every_steps or flow_cfg.get("save_every_steps", 0)
+    max_bad_steps = args.max_bad_steps
     seed = config.get("seed", 42)
     seed_rank = seed + rank
     random.seed(seed_rank)
@@ -202,7 +204,7 @@ def main():
         max_len=seq_len,
     )
     vae_ckpt = torch.load(
-        config.get("vae_ckpt", "checkpoints/motion_vae_best.pt"),
+        config.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt"),
         map_location=device,
     )
     vae.load_state_dict(vae_ckpt["model"])
@@ -273,14 +275,14 @@ def main():
                 mvh_openpose_root=openpose_mvh_root,
                 mv_root=mv_root,
                 cameras=mvh_cameras,
-            target_fps=target_fps,
-            aist_fps=aist_fps,
-            mvh_fps=mvh_fps,
-            out_path=openpose_stats_path,
-            cache_root=cond_cache_root,
-            aist_cameras=aist_cameras,
-            mvh_cameras=mvh_cameras,
-        )
+                target_fps=target_fps,
+                aist_fps=aist_fps,
+                mvh_fps=mvh_fps,
+                out_path=openpose_stats_path,
+                cache_root=cond_cache_root,
+                aist_cameras=aist_cameras,
+                mvh_cameras=mvh_cameras,
+            )
         if ddp:
             dist.barrier()
     stats = np.load(openpose_stats_path)
@@ -362,6 +364,7 @@ def main():
         flow.train()
         total_loss = 0.0
         total_count = 0
+        bad_streak = 0
         t_load = 0.0
         t_encode = 0.0
         t_cond = 0.0
@@ -478,7 +481,9 @@ def main():
                             target = z_data - x0
                             if not torch.isfinite(target).all():
                                 if args.debug:
-                                    print("Warning: non-finite teacher target; skipping")
+                                    print(
+                                        "Warning: non-finite teacher target; skipping"
+                                    )
                                 bad_local = True
 
                 if not bad_local:
@@ -489,9 +494,19 @@ def main():
                         bad_local = True
 
             if _sync_restore_if_needed(bad_local):
+                bad_streak += 1
+                if max_bad_steps and bad_streak >= max_bad_steps:
+                    for group in optimizer.param_groups:
+                        group["lr"] *= 0.5
+                    if is_main:
+                        print(
+                            f"Warning: too many bad steps; reducing lr to {optimizer.param_groups[0]['lr']:.6g}"
+                        )
+                    bad_streak = 0
                 continue
             if loss is None:
                 continue
+            bad_streak = 0
             optimizer.zero_grad()
             loss.backward()
             if grad_clip_norm is not None and grad_clip_norm > 0:
@@ -536,6 +551,10 @@ def main():
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
+            if total_count == 0:
+                print(
+                    "Warning: no valid batches this epoch; enable --debug to inspect."
+                )
             if args.debug and total_count > 0:
                 print(
                     "Timing (s) "
@@ -554,7 +573,7 @@ def main():
             if ema is not None:
                 state["ema"] = ema.state_dict()
             torch.save(state, last_path)
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 1 == 0:
                 ckpt_path = os.path.join(
                     args.checkpoint_dir,
                     f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",

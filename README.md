@@ -170,6 +170,12 @@ Training (round 0):
 python flowmimic/scripts/train_flow.py --reflow-round 0
 ```
 
+Reflow rounds:
+```
+python flowmimic/scripts/train_flow.py --reflow-round 1 --teacher-ckpt checkpoints_flow/flow_round0_last.pt
+python flowmimic/scripts/train_flow.py --reflow-round 2 --teacher-ckpt checkpoints_flow/flow_round1_last.pt
+```
+
 Sampling:
 ```
 python flowmimic/scripts/sample_flow.py --checkpoint <flow_ckpt>

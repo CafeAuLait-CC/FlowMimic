@@ -17,6 +17,7 @@
   "num_styles": 11,
   "d_in": 263,
   "d_z": 256,
+  "seed": 42,
   "seq_len": 120,
   "target_fps": 30,
   "aist_fps": 60,

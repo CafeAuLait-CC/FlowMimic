@@ -1,11 +1,13 @@
 import argparse
 import os
+import random
 import sys
 import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -39,6 +41,8 @@ def main():
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--reflow-round", type=int, default=0)
     parser.add_argument("--teacher-ckpt", type=str, default=None)
     parser.add_argument("--teacher-steps", type=int, default=None)
@@ -48,13 +52,32 @@ def main():
         "--teacher-mode", type=str, choices=["strict", "mixed"], default=None
     )
     parser.add_argument("--p-teacher", type=float, default=None)
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_flow")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/flow")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--save-every-steps", type=int, default=None)
+    parser.add_argument("--save-every-steps", type=int, default=100)
+    parser.add_argument(
+        "--lr-scale-mode", type=str, choices=["none", "linear"], default="none"
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    print("Loading config")
+    ddp = args.ddp
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        local_rank = 0
+        device = torch.device(args.device)
+        rank = 0
+        world_size = 1
+    is_main = rank == 0
+
+    if is_main:
+        print("Loading config")
     config = load_config()
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
@@ -71,7 +94,8 @@ def main():
     openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
     cond_cache_root = config.get("cond_cache_root", "data/cached_cond")
 
-    print("Loading 263D stats")
+    if is_main:
+        print("Loading 263D stats")
     mean, std = load_mean_std(stats_path)
 
     genre_to_id = build_genre_to_id(config.get("aist_genres", []))
@@ -91,10 +115,21 @@ def main():
     cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
     save_every_steps = args.save_every_steps or flow_cfg.get("save_every_steps", 0)
+    seed = config.get("seed", 42)
+    seed_rank = seed + rank
+    random.seed(seed_rank)
+    np.random.seed(seed_rank)
+    torch.manual_seed(seed_rank)
+    torch.cuda.manual_seed_all(seed_rank)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     aist_train_paths = _aist_split_paths(aist_dir, config["aist_split_train"])
     mvh_train_dirs = _read_lines(config["mvh_split_train"])
-    print(f"Building datasets -- AIST++ (train split: {len(aist_train_paths)})")
+    if is_main:
+        print(f"Building datasets -- AIST++ (train split: {len(aist_train_paths)})")
     dataset_a = AISTDataset(
         aist_dir,
         genre_to_id=genre_to_id,
@@ -106,7 +141,8 @@ def main():
         target_fps=target_fps,
         src_fps=aist_fps,
     )
-    print(f"Building datasets -- MVH (train split: {len(mvh_train_dirs)})")
+    if is_main:
+        print(f"Building datasets -- MVH (train split: {len(mvh_train_dirs)})")
     dataset_b = MVHumanNetDataset(
         mv_root,
         seq_len=seq_len,
@@ -120,24 +156,42 @@ def main():
         expand_cameras=True,
     )
 
-    print("Building dataloaders")
+    if is_main:
+        print("Building dataloaders")
+    sampler_a = None
+    sampler_b = None
+    if ddp:
+        sampler_a = DistributedSampler(dataset_a, shuffle=True, drop_last=True)
+        sampler_b = DistributedSampler(dataset_b, shuffle=True, drop_last=True)
+
+    def _seed_worker(worker_id):
+        worker_seed = seed_rank + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     loader_a = DataLoader(
         dataset_a,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler_a is None),
         drop_last=True,
         num_workers=args.num_workers,
+        sampler=sampler_a,
+        worker_init_fn=_seed_worker,
     )
     loader_b = DataLoader(
         dataset_b,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler_b is None),
         drop_last=True,
         num_workers=args.num_workers,
+        sampler=sampler_b,
+        worker_init_fn=_seed_worker,
     )
     batch_iter = balanced_batch_iter(loader_a, loader_b, 1, 1)
 
-    print("Loading VAE checkpoint")
+    if is_main:
+        print("Loading VAE checkpoint")
     vae = MotionVAE(
         d_in=config["d_in"],
         d_z=config["d_z"],
@@ -146,15 +200,16 @@ def main():
     )
     vae_ckpt = torch.load(
         config.get("vae_ckpt", "checkpoints/motion_vae_best.pt"),
-        map_location=args.device,
+        map_location=device,
     )
     vae.load_state_dict(vae_ckpt["model"])
-    vae.to(args.device)
+    vae.to(device)
     vae.eval()
     for p in vae.parameters():
         p.requires_grad = False
 
-    print("Building flow model")
+    if is_main:
+        print("Building flow model")
     flow = ConditionalRectFlow(
         d_z=config["d_z"],
         d_model=flow_cfg.get("d_model", 512),
@@ -169,37 +224,60 @@ def main():
         cond_heads=flow_cfg.get("cond_heads", 4),
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
     )
-    flow.to(args.device)
+    flow.to(device)
+    resume_state = None
+    if args.resume:
+        if is_main:
+            print(f"Resuming from {args.resume}")
+        resume_state = torch.load(args.resume, map_location=device)
+        flow.load_state_dict(resume_state["model"])
+
+    if ddp:
+        flow = torch.nn.parallel.DistributedDataParallel(
+            flow,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+    flow_model = flow.module if ddp else flow
+
+    if ddp and args.lr_scale_mode == "linear":
+        lr = lr * world_size
+    if is_main:
+        print(f"LR={lr} (mode={args.lr_scale_mode}, world_size={world_size})")
+        print(
+            f"Per-GPU batch={args.batch_size}, global batch={args.batch_size * world_size}"
+        )
+
     optimizer = torch.optim.AdamW(flow.parameters(), lr=lr, weight_decay=weight_decay)
     start_epoch = 0
+    ema_state = None
+    if resume_state is not None:
+        if "optimizer" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer"])
+        if args.use_ema_teacher and "ema" in resume_state:
+            ema_state = resume_state["ema"]
+        start_epoch = int(resume_state.get("epoch", 0))
 
-    if args.resume:
-        print(f"Resuming from {args.resume}")
-        state = torch.load(args.resume, map_location=args.device)
-        flow.load_state_dict(state["model"])
-        if "optimizer" in state:
-            optimizer.load_state_dict(state["optimizer"])
-        if args.use_ema_teacher and "ema" in state:
-            ema_state = state["ema"]
-        else:
-            ema_state = None
-        start_epoch = int(state.get("epoch", 0))
-
-    print("Loading OpenPose stats")
+    if is_main:
+        print("Loading OpenPose stats")
     if not os.path.exists(openpose_stats_path):
-        compute_openpose_stats(
-            aist_paths=_aist_split_paths(aist_dir, config["aist_split_train"]),
-            mvh_dirs=_read_lines(config["mvh_split_train"]),
-            aist_openpose_dir=openpose_aist_dir,
-            mvh_openpose_root=openpose_mvh_root,
-            mv_root=mv_root,
-            cameras=mvh_cameras,
-            target_fps=target_fps,
-            aist_fps=aist_fps,
-            mvh_fps=mvh_fps,
-            out_path=openpose_stats_path,
-            cache_root=cond_cache_root,
-        )
+        if is_main:
+            compute_openpose_stats(
+                aist_paths=_aist_split_paths(aist_dir, config["aist_split_train"]),
+                mvh_dirs=_read_lines(config["mvh_split_train"]),
+                aist_openpose_dir=openpose_aist_dir,
+                mvh_openpose_root=openpose_mvh_root,
+                mv_root=mv_root,
+                cameras=mvh_cameras,
+                target_fps=target_fps,
+                aist_fps=aist_fps,
+                mvh_fps=mvh_fps,
+                out_path=openpose_stats_path,
+                cache_root=cond_cache_root,
+            )
+        if ddp:
+            dist.barrier()
     stats = np.load(openpose_stats_path)
     k2d_mean = stats["mean"]
     k2d_std = stats["std"]
@@ -224,18 +302,18 @@ def main():
             cond_heads=flow_cfg.get("cond_heads", 4),
             p_style_drop=flow_cfg.get("p_style_drop", 0.5),
         )
-        state = torch.load(args.teacher_ckpt, map_location=args.device)
+        state = torch.load(args.teacher_ckpt, map_location=device)
         if "ema" in state:
             teacher_flow.load_state_dict(state["ema"])
         else:
             teacher_flow.load_state_dict(state["model"])
-        teacher_flow.to(args.device)
+        teacher_flow.to(device)
         teacher = Teacher(
             teacher_flow,
             solver_cfg={"num_steps": teacher_steps, "method": teacher_solver},
         )
 
-    ema = EMA(flow, decay=ema_decay) if args.use_ema_teacher else None
+    ema = EMA(flow_model, decay=ema_decay) if args.use_ema_teacher else None
     if ema is not None and args.resume and ema_state is not None:
         ema.load_state_dict(ema_state)
 
@@ -243,14 +321,38 @@ def main():
     last_path = os.path.join(
         args.checkpoint_dir, f"flow_round{args.reflow_round}_last.pt"
     )
-    if not args.resume:
-        init_state = {"model": flow.state_dict(), "optimizer": optimizer.state_dict(), "epoch": 0}
+    if not args.resume and is_main:
+        init_state = {
+            "model": flow_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": 0,
+        }
         if ema is not None:
             init_state["ema"] = ema.state_dict()
         torch.save(init_state, last_path)
-    tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=args.device)
+    if ddp:
+        dist.barrier()
+    tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
 
-    print("Starting training loop")
+    def _sync_restore_if_needed(bad_local):
+        if not bad_local and not ddp:
+            return False
+        if not ddp:
+            if bad_local and os.path.exists(last_path):
+                _restore_checkpoint(last_path, flow_model, optimizer, ema, device)
+            return bad_local
+        flag = torch.tensor([1 if bad_local else 0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if flag.item() > 0:
+            dist.barrier()
+            if os.path.exists(last_path):
+                _restore_checkpoint(last_path, flow_model, optimizer, ema, device)
+            dist.barrier()
+            return True
+        return False
+
+    if is_main:
+        print("Starting training loop")
     for epoch in range(start_epoch, args.epochs):
         flow.train()
         total_loss = 0.0
@@ -260,165 +362,204 @@ def main():
         t_cond = 0.0
         t_forward = 0.0
         t_backward = 0.0
-        for step_idx in tqdm(
-            range(max(len(loader_a), len(loader_b))),
-            desc=f"Flow Epoch {epoch + 1}",
-            leave=False,
-        ):
+        if ddp:
+            sampler_a.set_epoch(epoch)
+            sampler_b.set_epoch(epoch)
+        steps_per_epoch = max(len(loader_a), len(loader_b))
+        iter_range = range(steps_per_epoch)
+        if is_main:
+            iter_range = tqdm(
+                iter_range,
+                desc=f"Flow Epoch {epoch + 1}",
+                leave=False,
+            )
+        for step_idx in iter_range:
+            bad_local = False
+            loss = None
             t0 = time.perf_counter()
             batch = next(batch_iter)
             motion, domain_id, style_id, mask, metas = _merge_batches(batch)
-            motion = motion.to(args.device)
-            domain_id = domain_id.to(args.device)
-            style_id = style_id.to(args.device)
+            motion = motion.to(device)
+            domain_id = domain_id.to(device)
+            style_id = style_id.to(device)
             if not torch.isfinite(motion).all():
                 if args.debug:
                     print("Warning: non-finite motion batch; skipping")
-                continue
-            t1 = time.perf_counter()
-            t_load += t1 - t0
+                bad_local = True
+            if not bad_local:
+                t1 = time.perf_counter()
+                t_load += t1 - t0
 
-            with torch.no_grad():
-                enc_h, mu, _logvar = vae.encode(
-                    motion, vae.cond(domain_id, style_id), mask=mask.to(args.device)
+                with torch.no_grad():
+                    enc_h, mu, _logvar = vae.encode(
+                        motion, vae.cond(domain_id, style_id), mask=mask.to(device)
+                    )
+                    z_data = mu
+                if not torch.isfinite(z_data).all():
+                    if args.debug:
+                        print("Warning: non-finite z_data; skipping")
+                    bad_local = True
+            if not bad_local:
+                t2 = time.perf_counter()
+                t_encode += t2 - t1
+
+                x0 = torch.randn_like(z_data)
+                t = torch.rand(z_data.shape[0], device=device)
+                x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
+
+                k2d_batch, vis_batch, tau_cond, mask_cond = _load_cond_batch(
+                    metas,
+                    openpose_aist_dir,
+                    openpose_mvh_root,
+                    mv_root,
+                    mvh_cameras,
+                    seq_len,
+                    cond_frames_min,
+                    cond_frames_max,
+                    cond_drop_prob,
+                    aist_fps,
+                    mvh_fps,
+                    target_fps,
+                    cond_cache_root,
                 )
-                z_data = mu
-            if not torch.isfinite(z_data).all():
-                if args.debug:
-                    print("Warning: non-finite z_data; skipping")
-                continue
-            t2 = time.perf_counter()
-            t_encode += t2 - t1
+                k2d_batch = k2d_batch.to(device)
+                vis_batch = vis_batch.to(device)
+                tau_cond = tau_cond.to(device)
+                mask_cond = mask_cond.to(device)
+                if not torch.isfinite(k2d_batch).all():
+                    if args.debug:
+                        print("Warning: non-finite keypoints batch; skipping")
+                    bad_local = True
+            if not bad_local:
+                g2d, mem, _vis = flow_model.cond_encoder(
+                    k2d_batch,
+                    tau_cond,
+                    vis_mask=vis_batch,
+                    mask_cond=mask_cond,
+                    mean=k2d_mean,
+                    std=k2d_std,
+                )
+                if not torch.isfinite(g2d).all() or not torch.isfinite(mem).all():
+                    if args.debug:
+                        print("Warning: non-finite cond encoder output; skipping")
+                    bad_local = True
+            if not bad_local:
+                style = flow_model.style_emb(style_id, domain_id, apply_dropout=True)
+                g = flow_model.cond_mlp(torch.cat([g2d, style], dim=-1))
+                t3 = time.perf_counter()
+                t_cond += t3 - t2
+                v_pred = flow_model.flow(x_t, t, tau_out, mem, g)
+                target = z_data - x0
+                if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
+                    if args.debug:
+                        print("Warning: non-finite v_pred/target; skipping")
+                    bad_local = True
+            if not bad_local:
+                t4 = time.perf_counter()
+                t_forward += t4 - t3
 
-            x0 = torch.randn_like(z_data)
-            t = torch.rand(z_data.shape[0], device=args.device)
-            x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
+                if teacher is not None and args.reflow_round >= 1:
+                    use_teacher = True
+                    if teacher_mode == "mixed":
+                        use_teacher = torch.rand(1).item() < p_teacher
+                    if use_teacher:
+                        with torch.no_grad():
+                            style_t = flow_model.style_emb(
+                                style_id, domain_id, apply_dropout=False
+                            )
+                            g_t = flow_model.cond_mlp(torch.cat([g2d, style_t], dim=-1))
+                            cond_batch = {"tau_out": tau_out, "mem": mem, "g": g_t}
+                            z_data = teacher.generate_x1_hat(x0, cond_batch)
+                            target = z_data - x0
+                            if not torch.isfinite(target).all():
+                                if args.debug:
+                                    print("Warning: non-finite teacher target; skipping")
+                                bad_local = True
 
-            k2d_batch, vis_batch, tau_cond, mask_cond = _load_cond_batch(
-                metas,
-                openpose_aist_dir,
-                openpose_mvh_root,
-                mv_root,
-                mvh_cameras,
-                seq_len,
-                cond_frames_min,
-                cond_frames_max,
-                cond_drop_prob,
-                aist_fps,
-                mvh_fps,
-                target_fps,
-                cond_cache_root,
-            )
-            k2d_batch = k2d_batch.to(args.device)
-            vis_batch = vis_batch.to(args.device)
-            tau_cond = tau_cond.to(args.device)
-            mask_cond = mask_cond.to(args.device)
-            if not torch.isfinite(k2d_batch).all():
-                if args.debug:
-                    print("Warning: non-finite keypoints batch; skipping")
-                continue
-            g2d, mem, _vis = flow.cond_encoder(
-                k2d_batch,
-                tau_cond,
-                vis_mask=vis_batch,
-                mask_cond=mask_cond,
-                mean=k2d_mean,
-                std=k2d_std,
-            )
-            if not torch.isfinite(g2d).all() or not torch.isfinite(mem).all():
-                if args.debug:
-                    print("Warning: non-finite cond encoder output; skipping")
-                if os.path.exists(last_path):
-                    _restore_checkpoint(last_path, flow, optimizer, ema, args.device)
-                continue
-            style = flow.style_emb(style_id, domain_id, apply_dropout=True)
-            g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
-            t3 = time.perf_counter()
-            t_cond += t3 - t2
-            v_pred = flow.flow(x_t, t, tau_out, mem, g)
-            target = z_data - x0
-            if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
-                if args.debug:
-                    print("Warning: non-finite v_pred/target; skipping")
-                if os.path.exists(last_path):
-                    _restore_checkpoint(last_path, flow, optimizer, ema, args.device)
-                continue
-            t4 = time.perf_counter()
-            t_forward += t4 - t3
+                if not bad_local:
+                    loss = torch.mean((v_pred - target) ** 2)
+                    if not torch.isfinite(loss):
+                        if args.debug:
+                            print("Warning: non-finite loss; skipping")
+                        bad_local = True
 
-            if teacher is not None and args.reflow_round >= 1:
-                use_teacher = True
-                if teacher_mode == "mixed":
-                    use_teacher = torch.rand(1).item() < p_teacher
-                if use_teacher:
-                    with torch.no_grad():
-                        style_t = flow.style_emb(
-                            style_id, domain_id, apply_dropout=False
-                        )
-                        g_t = flow.cond_mlp(torch.cat([g2d, style_t], dim=-1))
-                        cond_batch = {"tau_out": tau_out, "mem": mem, "g": g_t}
-                        z_data = teacher.generate_x1_hat(x0, cond_batch)
-                        target = z_data - x0
-                        if not torch.isfinite(target).all():
-                            if args.debug:
-                                print("Warning: non-finite teacher target; skipping")
-                            if os.path.exists(last_path):
-                                _restore_checkpoint(
-                                    last_path, flow, optimizer, ema, args.device
-                                )
-                            continue
-
-            loss = torch.mean((v_pred - target) ** 2)
-            if not torch.isfinite(loss):
-                if args.debug:
-                    print("Warning: non-finite loss; skipping")
-                if os.path.exists(last_path):
-                    _restore_checkpoint(last_path, flow, optimizer, ema, args.device)
+            if _sync_restore_if_needed(bad_local):
+                continue
+            if loss is None:
                 continue
             optimizer.zero_grad()
             loss.backward()
             if grad_clip_norm is not None and grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(flow.parameters(), grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(flow_model.parameters(), grad_clip_norm)
             optimizer.step()
             if ema is not None:
-                ema.update(flow)
+                ema.update(flow_model)
             t5 = time.perf_counter()
             t_backward += t5 - t4
             total_loss += loss.item()
             total_count += 1
             if save_every_steps and (step_idx + 1) % save_every_steps == 0:
                 state = {
-                    "model": flow.state_dict(),
+                    "model": flow_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch + 1,
                 }
                 if ema is not None:
                     state["ema"] = ema.state_dict()
-                torch.save(state, last_path)
+                if is_main:
+                    torch.save(state, last_path)
 
-        print(
-            f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
-        )
-        if args.debug and total_count > 0:
+        if ddp:
+            stats = torch.tensor(
+                [
+                    total_loss,
+                    total_count,
+                    t_load,
+                    t_encode,
+                    t_cond,
+                    t_forward,
+                    t_backward,
+                ],
+                device=device,
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            total_loss, total_count = stats[0].item(), int(stats[1].item())
+            t_load, t_encode, t_cond, t_forward, t_backward = [
+                s.item() for s in stats[2:]
+            ]
+        if is_main:
             print(
-                "Timing (s) "
-                f"load={t_load / total_count:.4f} "
-                f"encode={t_encode / total_count:.4f} "
-                f"cond={t_cond / total_count:.4f} "
-                f"forward={t_forward / total_count:.4f} "
-                f"backward={t_backward / total_count:.4f}"
+                f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
+            if args.debug and total_count > 0:
+                print(
+                    "Timing (s) "
+                    f"load={t_load / total_count:.4f} "
+                    f"encode={t_encode / total_count:.4f} "
+                    f"cond={t_cond / total_count:.4f} "
+                    f"forward={t_forward / total_count:.4f} "
+                    f"backward={t_backward / total_count:.4f}"
+                )
 
-        state = {"model": flow.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch + 1}
-        if ema is not None:
-            state["ema"] = ema.state_dict()
-        torch.save(state, last_path)
-        if (epoch + 1) % 10 == 0:
-            ckpt_path = os.path.join(
-                args.checkpoint_dir,
-                f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
-            )
-            torch.save(state, ckpt_path)
+            state = {
+                "model": flow_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch + 1,
+            }
+            if ema is not None:
+                state["ema"] = ema.state_dict()
+            torch.save(state, last_path)
+            if (epoch + 1) % 10 == 0:
+                ckpt_path = os.path.join(
+                    args.checkpoint_dir,
+                    f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
+                )
+                torch.save(state, ckpt_path)
+        if ddp:
+            dist.barrier()
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 def _merge_batches(batches):

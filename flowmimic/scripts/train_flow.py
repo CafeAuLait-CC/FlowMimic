@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--p-teacher", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_flow")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--save-every-steps", type=int, default=None)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -88,6 +89,8 @@ def main():
     cond_frames_min = flow_cfg.get("cond_frames_min", 2)
     cond_frames_max = flow_cfg.get("cond_frames_max", 10)
     cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
+    grad_clip_norm = config.get("grad_clip_norm", 1.0)
+    save_every_steps = args.save_every_steps or flow_cfg.get("save_every_steps", 0)
 
     aist_train_paths = _aist_split_paths(aist_dir, config["aist_split_train"])
     mvh_train_dirs = _read_lines(config["mvh_split_train"])
@@ -208,7 +211,18 @@ def main():
         if not args.teacher_ckpt:
             raise ValueError("teacher_ckpt is required for reflow_round >= 1")
         teacher_flow = ConditionalRectFlow(
-            d_z=config["d_z"], num_styles=config["num_styles"]
+            d_z=config["d_z"],
+            d_model=flow_cfg.get("d_model", 512),
+            n_layers=flow_cfg.get("n_layers", 8),
+            n_heads=flow_cfg.get("n_heads", 8),
+            ffn_dim=flow_cfg.get("ffn_dim", 2048),
+            dropout=flow_cfg.get("dropout", 0.1),
+            num_styles=config["num_styles"],
+            style_dim=flow_cfg.get("style_dim", 32),
+            cond_dim=flow_cfg.get("cond_dim", 256),
+            cond_layers=flow_cfg.get("cond_layers", 4),
+            cond_heads=flow_cfg.get("cond_heads", 4),
+            p_style_drop=flow_cfg.get("p_style_drop", 0.5),
         )
         state = torch.load(args.teacher_ckpt, map_location=args.device)
         if "ema" in state:
@@ -229,6 +243,11 @@ def main():
     last_path = os.path.join(
         args.checkpoint_dir, f"flow_round{args.reflow_round}_last.pt"
     )
+    if not args.resume:
+        init_state = {"model": flow.state_dict(), "optimizer": optimizer.state_dict(), "epoch": 0}
+        if ema is not None:
+            init_state["ema"] = ema.state_dict()
+        torch.save(init_state, last_path)
     tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=args.device)
 
     print("Starting training loop")
@@ -241,7 +260,7 @@ def main():
         t_cond = 0.0
         t_forward = 0.0
         t_backward = 0.0
-        for _ in tqdm(
+        for step_idx in tqdm(
             range(max(len(loader_a), len(loader_b))),
             desc=f"Flow Epoch {epoch + 1}",
             leave=False,
@@ -358,6 +377,8 @@ def main():
                 continue
             optimizer.zero_grad()
             loss.backward()
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(flow.parameters(), grad_clip_norm)
             optimizer.step()
             if ema is not None:
                 ema.update(flow)
@@ -365,6 +386,15 @@ def main():
             t_backward += t5 - t4
             total_loss += loss.item()
             total_count += 1
+            if save_every_steps and (step_idx + 1) % save_every_steps == 0:
+                state = {
+                    "model": flow.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch + 1,
+                }
+                if ema is not None:
+                    state["ema"] = ema.state_dict()
+                torch.save(state, last_path)
 
         print(
             f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"

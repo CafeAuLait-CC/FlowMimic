@@ -95,6 +95,18 @@ def _load_openpose_cache(cache_path):
     return data["coords"], data["vis"]
 
 
+def _sanitize_openpose(coords, vis):
+    if coords is None or vis is None:
+        return coords, vis
+    coords = coords.astype(np.float32, copy=False)
+    vis = vis.astype(np.float32, copy=False)
+    coords[~np.isfinite(coords)] = 0.0
+    vis[~np.isfinite(vis)] = 0.0
+    vis = np.clip(vis, 0.0, 1.0)
+    coords = np.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
+    return coords, vis
+
+
 def cache_openpose_npy(npy_path, cache_path, src_fps=None, target_fps=None):
     coords, vis = load_openpose_npy(npy_path, src_fps=src_fps, target_fps=target_fps)
     _save_openpose_cache(cache_path, coords, vis)
@@ -126,7 +138,8 @@ def load_aist_openpose(
     if cache_root:
         cache_path = _aist_cache_path(cache_root, pkl_path, camera=camera)
         if os.path.exists(cache_path):
-            return _load_openpose_cache(cache_path)
+            coords, vis = _load_openpose_cache(cache_path)
+            return _sanitize_openpose(coords, vis)
     name = os.path.splitext(os.path.basename(pkl_path))[0]
     cam_list = [camera] if camera is not None else ["01", "02", "08", "09"]
     for cam in cam_list:
@@ -137,7 +150,7 @@ def load_aist_openpose(
         coords, vis = load_openpose_npy(path, src_fps=src_fps, target_fps=target_fps)
         if cache_root and write_cache:
             _save_openpose_cache(_aist_cache_path(cache_root, pkl_path, camera=cam), coords, vis)
-        return coords, vis
+        return _sanitize_openpose(coords, vis)
     return None, None
 
 
@@ -162,13 +175,14 @@ def load_mvh_openpose(
         if cache_root:
             cache_path = _mvh_cache_path(cache_root, mv_root, seq_dir, cam)
             if os.path.exists(cache_path):
-                return _load_openpose_cache(cache_path)
+                coords, vis = _load_openpose_cache(cache_path)
+                return _sanitize_openpose(coords, vis)
         path = os.path.join(openpose_root, part, motion, f"{cam}_2d_body25.npy")
         if os.path.exists(path):
             coords, vis = load_openpose_npy(path, src_fps=src_fps, target_fps=target_fps)
             if cache_root and write_cache:
                 _save_openpose_cache(cache_path, coords, vis)
-            return coords, vis
+            return _sanitize_openpose(coords, vis)
     return None, None
 
 

@@ -59,7 +59,7 @@ def main():
         "--lr-scale-mode", type=str, choices=["none", "linear"], default="none"
     )
     parser.add_argument("--max-bad-steps", type=int, default=50)
-    parser.add_argument("--cond-lr-scale", type=float, default=0.2)
+    parser.add_argument("--cond-lr-scale", type=float, default=0.1)
     parser.add_argument("--reset-optimizer", action="store_true")
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
@@ -98,6 +98,7 @@ def main():
     aist_cameras = config.get("aist_cameras", ["01", "02", "08", "09"])
     openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
     cond_cache_root = config.get("cond_cache_root", "data/cached_cond")
+    latent_stats_path = config.get("latent_stats_path", "data/latent_stats.npz")
 
     if is_main:
         print("Loading 263D stats")
@@ -309,6 +310,17 @@ def main():
     if not np.isfinite(k2d_mean).all() or not np.isfinite(k2d_std).all():
         raise ValueError("OpenPose mean/std contain non-finite values")
 
+    latent_mean = None
+    latent_std = None
+    if os.path.exists(latent_stats_path):
+        latent_stats = np.load(latent_stats_path)
+        latent_mean = torch.tensor(
+            latent_stats["mean"], device=device, dtype=torch.float32
+        )
+        latent_std = torch.tensor(
+            latent_stats["std"], device=device, dtype=torch.float32
+        )
+
     teacher = None
     if args.reflow_round >= 1:
         if not args.teacher_ckpt:
@@ -368,15 +380,21 @@ def main():
             return False
         if not ddp:
             if bad_local:
-                restore_path = last_good_path if os.path.exists(last_good_path) else last_path
+                restore_path = (
+                    last_good_path if os.path.exists(last_good_path) else last_path
+                )
                 if os.path.exists(restore_path):
-                    _restore_checkpoint(restore_path, flow_model, optimizer, ema, device)
+                    _restore_checkpoint(
+                        restore_path, flow_model, optimizer, ema, device
+                    )
             return bad_local
         flag = torch.tensor([1 if bad_local else 0], device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item() > 0:
             dist.barrier()
-            restore_path = last_good_path if os.path.exists(last_good_path) else last_path
+            restore_path = (
+                last_good_path if os.path.exists(last_good_path) else last_path
+            )
             if os.path.exists(restore_path):
                 _restore_checkpoint(restore_path, flow_model, optimizer, ema, device)
             dist.barrier()
@@ -427,7 +445,9 @@ def main():
                     enc_h, mu, _logvar = vae.encode(
                         motion, vae.cond(domain_id, style_id), mask=mask.to(device)
                     )
-                    z_data = mu
+                z_data = mu
+                if latent_mean is not None and latent_std is not None:
+                    z_data = (z_data - latent_mean) / (latent_std + 1e-6)
                 if not torch.isfinite(z_data).all():
                     if args.debug:
                         print("Warning: non-finite z_data; skipping")
@@ -502,14 +522,12 @@ def main():
                             )
                             g_t = flow_model.cond_mlp(torch.cat([g2d, style_t], dim=-1))
                             cond_batch = {"tau_out": tau_out, "mem": mem, "g": g_t}
-                            z_data = teacher.generate_x1_hat(x0, cond_batch)
-                            target = z_data - x0
-                            if not torch.isfinite(target).all():
-                                if args.debug:
-                                    print(
-                                        "Warning: non-finite teacher target; skipping"
-                                    )
-                                bad_local = True
+                        z_data = teacher.generate_x1_hat(x0, cond_batch)
+                        target = z_data - x0
+                        if not torch.isfinite(target).all():
+                            if args.debug:
+                                print("Warning: non-finite teacher target; skipping")
+                            bad_local = True
 
                 if not bad_local:
                     loss = torch.mean((v_pred - target) ** 2)

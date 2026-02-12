@@ -181,6 +181,16 @@ Sampling:
 python flowmimic/scripts/sample_flow.py --checkpoint <flow_ckpt>
 ```
 
+Random sample from val split (auto dataset):
+```
+python flowmimic/scripts/sample_flow.py --checkpoint checkpoints/flow/flow_round0_last.pt
+```
+
+Specific sample with camera:
+```
+python flowmimic/scripts/sample_flow.py --checkpoint checkpoints/flow/flow_round0_last.pt --dataset aist --sample-path data/AIST++/Annotations/motions/xxx.pkl --camera 01
+```
+
 ## Config highlights
 
 Main config: `flowmimic/src/config/config.json`

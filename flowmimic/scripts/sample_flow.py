@@ -19,6 +19,7 @@ from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import ik263_to_smpl22
 from flowmimic.src.data.openpose import load_aist_openpose, load_mvh_openpose
 from flowmimic.src.model.vae.stats import load_mean_std
+from flowmimic.src.data.dataloader import yup_to_blender
 
 
 def main():
@@ -231,6 +232,8 @@ def main():
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     ik263[:, :cont_end] = ik263[:, :cont_end] * std + mean
     joints = ik263_to_smpl22(ik263)
+    joints = yup_to_blender(joints)
+    joints = joints - joints[0:1, 0:1, :]
 
     os.makedirs(args.out_dir, exist_ok=True)
     out_npy = os.path.join(args.out_dir, args.out)

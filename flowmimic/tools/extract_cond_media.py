@@ -75,6 +75,8 @@ def main():
 
     tag = "result"
     out_dir = args.out_dir
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     frame_dir = os.path.join(out_dir, f"{tag}_frames")
     os.makedirs(frame_dir, exist_ok=True)

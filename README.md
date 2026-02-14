@@ -148,7 +148,18 @@ python flowmimic/tools/validate_cache.py
 bash flowmimic/tools/run_openpose_on_aist.sh
 python flowmimic/tools/json2npy_openpose.py --video_dir <json_dir> --out <output.npy>
 bash flowmimic/tools/combine_mvh_openpose.sh
+python flowmimic/tools/precompute_openpose_cache.py --workers 10
 python flowmimic/tools/compute_openpose_stats.py
+```
+
+6) Condition media extraction (AIST/MVH):
+```
+python flowmimic/tools/extract_cond_media.py --meta output/flow/result_meta.json
+```
+
+7) Flow path visualization:
+```
+python flowmimic/tools/vis_path.py --flow-ckpt checkpoints/flow/flow_round0_last.pt
 ```
 
 ## VAE training / evaluation
@@ -172,8 +183,8 @@ python flowmimic/scripts/train_flow.py --reflow-round 0
 
 Reflow rounds:
 ```
-python flowmimic/scripts/train_flow.py --reflow-round 1 --teacher-ckpt checkpoints_flow/flow_round0_last.pt
-python flowmimic/scripts/train_flow.py --reflow-round 2 --teacher-ckpt checkpoints_flow/flow_round1_last.pt
+python flowmimic/scripts/train_flow.py --reflow-round 1 --teacher-ckpt checkpoints/flow/flow_round0_last.pt
+python flowmimic/scripts/train_flow.py --reflow-round 2 --teacher-ckpt checkpoints/flow/flow_round1_last.pt
 ```
 
 Sampling:
@@ -190,6 +201,11 @@ Specific sample with camera:
 ```
 python flowmimic/scripts/sample_flow.py --checkpoint checkpoints/flow/flow_round0_last.pt --dataset aist --sample-path data/AIST++/Annotations/motions/xxx.pkl --camera 01
 ```
+Output files:
+```
+output/flow/result_smpl22.npy
+output/flow/result_meta.json
+```
 
 ## Config highlights
 
@@ -198,6 +214,7 @@ Main config: `flowmimic/src/config/config.json`
 - FPS: `target_fps=30` (`aist_fps=60`, `mvh_fps=5`)
 - 263D stats: `stats_path`
 - OpenPose stats: `openpose_stats_path`
+- Latent stats: `latent_stats_path`
 - Flow hyperparams: `flow.*`
 
 ## Notes

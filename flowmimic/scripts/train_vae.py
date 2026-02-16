@@ -23,9 +23,9 @@ from flowmimic.src.model.vae.datasets.label_map_builder import (
     save_genre_to_id,
 )
 from flowmimic.src.model.vae.losses import (
+    continuous_smoothness_loss,
     grouped_recon_loss,
     masked_kl,
-    smoothness_loss,
     style_ce_loss,
 )
 from flowmimic.src.model.vae.motion_vae import MotionVAE
@@ -54,6 +54,16 @@ def kl_weight(step, warmup_steps, max_weight):
     if warmup_steps <= 0:
         return max_weight
     return min(max_weight, max_weight * (step / warmup_steps))
+
+
+def _ramp_weight(step, total_steps, target, warmup_frac):
+    if total_steps <= 0:
+        return target
+    progress = step / float(total_steps)
+    if progress <= warmup_frac:
+        return 0.0
+    ramp = (progress - warmup_frac) / max(1e-8, 1.0 - warmup_frac)
+    return target * min(1.0, ramp)
 
 
 def apply_style_dropout(style_id, domain_id, p):
@@ -90,6 +100,8 @@ def main():
     parser.add_argument("--kl-weight", type=float, default=None)
     parser.add_argument("--w-vel", type=float, default=None)
     parser.add_argument("--w-acc", type=float, default=None)
+    parser.add_argument("--vel-warmup-frac", type=float, default=0.1)
+    parser.add_argument("--acc-warmup-frac", type=float, default=0.1)
     parser.add_argument("--w-style", type=float, default=None)
     parser.add_argument("--w-contact", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
@@ -98,6 +110,8 @@ def main():
     )
     parser.add_argument("--debug-timing", action="store_true")
     parser.add_argument("--debug-every", type=int, default=50)
+    parser.add_argument("--resume-ckpt", type=str, default=None)
+    parser.add_argument("--finetune-decoder", action="store_true")
     # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 
@@ -128,6 +142,8 @@ def main():
     w_root_late_factor = config.get("w_root_late_factor", 1.0)
     style_dropout_p = config["style_dropout_p"]
     stats_path = config["stats_path"]
+    vel_warmup_frac = args.vel_warmup_frac
+    acc_warmup_frac = args.acc_warmup_frac
     target_fps = config.get("target_fps", 30)
     aist_fps = config.get("aist_fps", 60)
     mvh_fps = config.get("mvh_fps", 5)
@@ -193,13 +209,31 @@ def main():
     print("Starting training loop")
 
     model = MotionVAE(d_in=d_in, d_z=d_z, num_styles=num_styles, max_len=seq_len)
+    if args.finetune_decoder and not args.resume_ckpt:
+        raise ValueError("--finetune-decoder requires --resume-ckpt")
+    if args.resume_ckpt:
+        state = torch.load(args.resume_ckpt, map_location=args.device)
+        model.load_state_dict(state["model"])
     model.to(args.device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    if args.finetune_decoder:
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.decoder.parameters():
+            p.requires_grad = True
+        for p in model.dec_in.parameters():
+            p.requires_grad = True
+        model.dec_pos.requires_grad = True
+        for p in model.to_out.parameters():
+            p.requires_grad = True
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=1e-2
+    )
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     step = 0
+    total_steps_est = 1
     best_val = None
     best_epoch = None
     for epoch in range(args.epochs):
@@ -237,6 +271,8 @@ def main():
         )
 
         num_steps = min(len(loader_a), len(loader_b))
+        if epoch == 0:
+            total_steps_est = max(1, args.epochs * num_steps)
         if num_steps == 0:
             raise ValueError(
                 "No training steps available; check batch size and split sizes."
@@ -294,13 +330,15 @@ def main():
                 x_hat, motion, mask, w_contact=w_contact, w_root=w_root_epoch
             )
             kl = masked_kl(outputs["mu"], outputs["logvar"], mask)
-            vel, acc = smoothness_loss(x_hat, motion, mask)
+            vel, acc = continuous_smoothness_loss(x_hat, motion, mask)
             style_loss = style_ce_loss(
                 outputs.get("style_logits"), style_id_in, domain_id
             )
 
             kld_weight = kl_weight(step, kl_warmup, kl_weight_target)
-            loss = recon + kld_weight * kl + w_vel * vel + w_acc * acc
+            vel_w = _ramp_weight(step, total_steps_est, w_vel, vel_warmup_frac)
+            acc_w = _ramp_weight(step, total_steps_est, w_acc, acc_warmup_frac)
+            loss = recon + kld_weight * kl + vel_w * vel + acc_w * acc
             if style_loss is not None:
                 loss = loss + w_style * style_loss
             if args.device.startswith("cuda"):

@@ -83,6 +83,23 @@ def smoothness_loss(x_hat, x, mask=None, slices=None):
     return vel, acc
 
 
+def continuous_smoothness_loss(x_hat, x, mask=None):
+    cont_end = LAYOUT_SLICES["feet_contact"][0]
+    x_hat_s = x_hat[..., :cont_end]
+    x_s = x[..., :cont_end]
+
+    dx_hat = x_hat_s[:, 1:] - x_hat_s[:, :-1]
+    dx = x_s[:, 1:] - x_s[:, :-1]
+    vel_mask = mask[:, 1:] if mask is not None else None
+    vel = masked_smooth_l1(dx_hat, dx, vel_mask)
+
+    ddx_hat = dx_hat[:, 1:] - dx_hat[:, :-1]
+    ddx = dx[:, 1:] - dx[:, :-1]
+    acc_mask = mask[:, 2:] if mask is not None else None
+    acc = masked_smooth_l1(ddx_hat, ddx, acc_mask)
+    return vel, acc
+
+
 def style_ce_loss(logits, style_id, domain_id):
     if logits is None:
         return None

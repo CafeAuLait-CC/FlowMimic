@@ -4,6 +4,7 @@ import os
 import random
 import sys
 import time
+from datetime import datetime
 
 import torch
 from tqdm import tqdm
@@ -100,8 +101,7 @@ def main():
     parser.add_argument("--kl-weight", type=float, default=None)
     parser.add_argument("--w-vel", type=float, default=None)
     parser.add_argument("--w-acc", type=float, default=None)
-    parser.add_argument("--vel-warmup-frac", type=float, default=0.1)
-    parser.add_argument("--acc-warmup-frac", type=float, default=0.1)
+    parser.add_argument("--smooth-warmup-frac", type=float, default=0.2)
     parser.add_argument("--w-style", type=float, default=None)
     parser.add_argument("--w-contact", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
@@ -112,11 +112,58 @@ def main():
     parser.add_argument("--debug-every", type=int, default=50)
     parser.add_argument("--resume-ckpt", type=str, default=None)
     parser.add_argument("--finetune-decoder", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="FlowMimic")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="online",
+        choices=("online", "offline", "disabled"),
+    )
     # stats paths are taken from config (separate per dataset)
     args = parser.parse_args()
 
     config = load_config()
     print("Config loaded")
+    wandb_run = None
+    try:
+        import wandb  # type: ignore
+    except ModuleNotFoundError:
+        wandb = None
+        print("wandb not installed; continuing without logging.")
+    if wandb is not None:
+        tags = [t for t in (args.wandb_tags or "").split(",") if t]
+        run_name = args.wandb_name
+        if run_name is None:
+            stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+            run_name = f"vae-{stamp}"
+        run_group = args.wandb_group or "VAE"
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            group=run_group,
+            tags=tags or None,
+            mode=args.wandb_mode,
+            config={
+                "seq_len": args.seq_len,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "kl_warmup": args.kl_warmup,
+                "kl_weight": args.kl_weight,
+                "w_vel": args.w_vel,
+                "w_acc": args.w_acc,
+                "smooth_warmup_frac": args.smooth_warmup_frac,
+                "w_style": args.w_style,
+                "w_contact": args.w_contact,
+                "resume_ckpt": args.resume_ckpt,
+                "finetune_decoder": args.finetune_decoder,
+            },
+        )
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     aist_genres = config["aist_genres"]
@@ -142,8 +189,7 @@ def main():
     w_root_late_factor = config.get("w_root_late_factor", 1.0)
     style_dropout_p = config["style_dropout_p"]
     stats_path = config["stats_path"]
-    vel_warmup_frac = args.vel_warmup_frac
-    acc_warmup_frac = args.acc_warmup_frac
+    smooth_warmup_frac = args.smooth_warmup_frac
     target_fps = config.get("target_fps", 30)
     aist_fps = config.get("aist_fps", 60)
     mvh_fps = config.get("mvh_fps", 5)
@@ -336,8 +382,8 @@ def main():
             )
 
             kld_weight = kl_weight(step, kl_warmup, kl_weight_target)
-            vel_w = _ramp_weight(step, total_steps_est, w_vel, vel_warmup_frac)
-            acc_w = _ramp_weight(step, total_steps_est, w_acc, acc_warmup_frac)
+            vel_w = _ramp_weight(step, total_steps_est, w_vel, smooth_warmup_frac)
+            acc_w = _ramp_weight(step, total_steps_est, w_acc, smooth_warmup_frac)
             loss = recon + kld_weight * kl + vel_w * vel + acc_w * acc
             if style_loss is not None:
                 loss = loss + w_style * style_loss
@@ -402,6 +448,21 @@ def main():
                 avg_style,
             )
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "loss/total": avg_total,
+                    "loss/recon": avg_recon,
+                    "loss/cont": avg_cont,
+                    "loss/contact": avg_contact,
+                    "loss/root": avg_root,
+                    "loss/kl": avg_kl,
+                    "loss/vel": avg_vel,
+                    "loss/acc": avg_acc,
+                    "loss/style": avg_style,
+                },
+                step=epoch + 1,
+            )
 
         save_ckpt = (epoch + 1) % val_every_epochs == 0
         if save_ckpt:
@@ -467,6 +528,11 @@ def main():
                         val_count += 1
             val_recon = val_recon_sum / max(val_count, 1)
             print(f"Validation recon={val_recon:.6f}")
+            if wandb_run is not None:
+                wandb_run.log(
+                    {"val/recon": val_recon},
+                    step=epoch + 1,
+                )
             model.train()
 
         if save_ckpt:

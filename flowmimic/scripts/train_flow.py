@@ -3,6 +3,7 @@ import os
 import random
 import sys
 import time
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -63,6 +64,17 @@ def main():
     parser.add_argument("--reset-optimizer", action="store_true")
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="FlowMimic")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="online",
+        choices=("online", "offline", "disabled"),
+    )
     args = parser.parse_args()
 
     ddp = args.ddp
@@ -83,6 +95,40 @@ def main():
     if is_main:
         print("Loading config")
     config = load_config()
+    wandb_run = None
+    if is_main:
+        try:
+            import wandb  # type: ignore
+        except ModuleNotFoundError:
+            wandb = None
+            print("wandb not installed; continuing without logging.")
+        if wandb is not None:
+            tags = [t for t in (args.wandb_tags or "").split(",") if t]
+            run_name = args.wandb_name
+            if run_name is None:
+                stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+                run_name = f"flow-{stamp}"
+            run_group = args.wandb_group or "Flow"
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                group=run_group,
+                tags=tags or None,
+                mode=args.wandb_mode,
+                config={
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "seq_len": config.get("seq_len"),
+                    "lr": args.lr,
+                    "cond_lr_scale": args.cond_lr_scale,
+                    "reflow_round": args.reflow_round,
+                    "teacher_mode": args.teacher_mode,
+                    "p_teacher": args.p_teacher,
+                    "cond_frames_min": config.get("flow", {}).get("cond_frames_min"),
+                    "cond_frames_max": config.get("flow", {}).get("cond_frames_max"),
+                },
+            )
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     seq_len = config["seq_len"]
@@ -595,6 +641,18 @@ def main():
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "loss/avg_velocity_mse": total_loss / max(total_count, 1),
+                        "timing/load": t_load / max(total_count, 1),
+                        "timing/encode": t_encode / max(total_count, 1),
+                        "timing/cond": t_cond / max(total_count, 1),
+                        "timing/forward": t_forward / max(total_count, 1),
+                        "timing/backward": t_backward / max(total_count, 1),
+                    },
+                    step=epoch + 1,
+                )
             if total_count == 0:
                 print(
                     "Warning: no valid batches this epoch; enable --debug to inspect."

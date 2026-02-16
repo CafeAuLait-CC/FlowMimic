@@ -449,6 +449,7 @@ def main():
 
     if is_main:
         print("Starting training loop")
+    lr_halved = False
     for epoch in range(start_epoch, args.epochs):
         flow.train()
         total_loss = 0.0
@@ -463,6 +464,14 @@ def main():
             sampler_a.set_epoch(epoch)
             sampler_b.set_epoch(epoch)
         steps_per_epoch = max(len(loader_a), len(loader_b))
+        if not lr_halved and (epoch + 1) >= max(1, args.epochs // 2):
+            for group in optimizer.param_groups:
+                group["lr"] *= 0.5
+            lr_halved = True
+            if is_main:
+                print(
+                    f"Halved learning rate at epoch {epoch + 1}: {optimizer.param_groups[0]['lr']:.6g}"
+                )
         iter_range = range(steps_per_epoch)
         if is_main:
             iter_range = tqdm(

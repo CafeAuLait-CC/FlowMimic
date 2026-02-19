@@ -801,11 +801,12 @@ def _load_cond_batch(
                 [vis, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
             )
         t_len = k2d.shape[0]
-        k_frames = int(np.random.randint(cond_frames_min, cond_frames_max + 1))
+        k_frames = cond_frames_min
         if t_len <= k_frames:
             idx = np.arange(t_len)
         else:
-            idx = np.sort(np.random.choice(t_len, size=k_frames, replace=False))
+            idx = np.linspace(0, t_len - 1, k_frames)
+            idx = np.unique(np.round(idx).astype(int))
         k2d_sparse = k2d[idx]
         vis_sparse = vis[idx]
         if cond_drop_prob > 0:

@@ -20,6 +20,8 @@ from flowmimic.src.motion.process_motion import ik263_to_smpl22
 from flowmimic.src.data.openpose import load_aist_openpose, load_mvh_openpose
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.data.dataloader import yup_to_blender
+from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
+from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 
 
 def main():
@@ -69,6 +71,7 @@ def main():
     mv_root = config["mvhumannet_root"]
     aist_split_val = config.get("aist_split_val")
     mvh_split_val = config.get("mvh_split_val")
+    genre_to_id = build_genre_to_id(config.get("aist_genres", []))
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -118,6 +121,8 @@ def main():
         latent_std = torch.tensor(stats["std"], device=device, dtype=torch.float32)
 
     meta = {}
+    style_id_value = args.style_id
+    domain_id_value = args.domain_id
     k2d = None
     vis = None
     if args.k2d_npy:
@@ -149,7 +154,10 @@ def main():
                 cache_root=cond_cache_root,
                 camera=cam,
             )
-            meta = {"dataset": "aist", "path": pkl_path, "camera": cam}
+            genre = get_genre_code(pkl_path)
+            style_id_value = genre_to_id.get(genre, 0)
+            domain_id_value = 1
+            meta = {"dataset": "aist", "path": pkl_path, "camera": cam, "genre": genre}
         else:
             if args.sample_path:
                 seq_dir = args.sample_path
@@ -170,6 +178,8 @@ def main():
                 cache_root=cond_cache_root,
                 camera=cam,
             )
+            style_id_value = 0
+            domain_id_value = 0
             meta = {"dataset": "mvh", "path": seq_dir, "camera": cam}
 
     if k2d is None:
@@ -195,11 +205,12 @@ def main():
         meta["orig_len"] = orig_len
         meta["start"] = start
         t_len = k2d.shape[0]
-        k_frames = int(np.random.randint(cond_frames_min, cond_frames_max + 1))
+        k_frames = cond_frames_min
         if t_len <= k_frames:
             sample_idx = np.arange(t_len)
         else:
-            sample_idx = np.sort(np.random.choice(t_len, size=k_frames, replace=False))
+            sample_idx = np.linspace(0, t_len - 1, k_frames)
+            sample_idx = np.unique(np.round(sample_idx).astype(int))
         tau_cond = sample_idx.astype(np.float32) / max(t_len - 1, 1)
         k2d_sparse = k2d[sample_idx]
         vis_sparse = vis[sample_idx] if vis is not None else None
@@ -215,8 +226,8 @@ def main():
         mean=k2d_mean,
         std=k2d_std,
     )
-    style_id = torch.tensor([args.style_id], device=device)
-    domain_id = torch.tensor([args.domain_id], device=device)
+    style_id = torch.tensor([style_id_value], device=device)
+    domain_id = torch.tensor([domain_id_value], device=device)
     style = flow.style_emb(style_id, domain_id, apply_dropout=False)
     g = flow.cond_mlp(torch.cat([g, style], dim=-1))
 
@@ -244,6 +255,8 @@ def main():
         "dataset": meta.get("dataset", "unknown"),
         "path": meta.get("path", ""),
         "camera": meta.get("camera", ""),
+        "style_id": style_id_value,
+        "domain_id": domain_id_value,
         "orig_len": meta.get("orig_len", ""),
         "start": meta.get("start", ""),
         "seq_len": seq_len,

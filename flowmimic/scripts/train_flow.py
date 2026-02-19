@@ -31,6 +31,7 @@ from flowmimic.src.data.openpose import (
     load_aist_openpose,
     load_mvh_openpose,
 )
+from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
 def main():
@@ -692,6 +693,86 @@ def main():
                         f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
                     )
                     torch.save(state, ckpt_path)
+            if wandb_run is not None and save_every_epochs and (epoch + 1) % save_every_epochs == 0:
+                print("Running AIST eval (steps=4)")
+                flow_model.eval()
+                vae.eval()
+                mapping, computed = _build_smpl22_to_body25(
+                    config["smpl45_to_body25_def"]
+                )
+                aist_val_paths = _aist_split_paths(
+                    aist_dir, config["aist_split_val"]
+                )
+                aist_val = AISTDataset(
+                    aist_dir,
+                    genre_to_id,
+                    seq_len,
+                    mean=mean,
+                    std=std,
+                    files=aist_val_paths,
+                    cache_root=config["cache_root"],
+                    target_fps=target_fps,
+                    src_fps=aist_fps,
+                    camera_ids=aist_cameras,
+                    expand_cameras=True,
+                )
+                aist_loader = DataLoader(
+                    aist_val,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                )
+                eval_cfg = type(
+                    "EvalCfg",
+                    (),
+                    {
+                        "seq_len": seq_len,
+                        "d_z": config["d_z"],
+                        "fps": target_fps,
+                        "slack_seconds": 0.1,
+                        "cam_mode": "fixed",
+                    },
+                )()
+                openpose_cfg = {
+                    "aist_dir": openpose_aist_dir,
+                    "mvh_root": openpose_mvh_root,
+                    "mv_root": mv_root,
+                    "mvh_cameras": mvh_cameras,
+                    "cond_frames_min": flow_cfg.get("cond_frames_min", 7),
+                    "cond_frames_max": flow_cfg.get("cond_frames_max", 7),
+                    "cond_drop_prob": flow_cfg.get("cond_drop_prob", 0.0),
+                    "aist_fps": aist_fps,
+                    "mvh_fps": mvh_fps,
+                    "target_fps": target_fps,
+                    "cond_cache_root": cond_cache_root,
+                    "mean": k2d_mean,
+                    "std": k2d_std,
+                }
+                eval_summary, _ = evaluate_dataset(
+                    "AIST",
+                    aist_loader,
+                    flow_model,
+                    vae,
+                    eval_cfg,
+                    mapping,
+                    computed,
+                    openpose_cfg,
+                    (mean, std),
+                    (latent_mean, latent_std),
+                    steps=4,
+                    solver="heun",
+                    num_samples=0,
+                    seed=seed,
+                    device=device,
+                    compute_dist=True,
+                    save_per_sample=False,
+                )
+                if eval_summary:
+                    wandb_run.log(
+                        {f"eval/aist/{k}": v for k, v in eval_summary.items()},
+                        step=epoch + 1,
+                    )
+                flow_model.train()
         if ddp:
             dist.barrier()
 

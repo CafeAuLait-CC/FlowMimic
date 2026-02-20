@@ -553,20 +553,7 @@ def main():
                         print("Warning: non-finite cond encoder output; skipping")
                     bad_local = True
             if not bad_local:
-                style = flow_model.style_emb(style_id, domain_id, apply_dropout=True)
-                g = flow_model.cond_mlp(torch.cat([g2d, style], dim=-1))
-                t3 = time.perf_counter()
-                t_cond += t3 - t2
-                v_pred = flow_model.flow(x_t, t, tau_out, mem, g)
-                target = z_data - x0
-                if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
-                    if args.debug:
-                        print("Warning: non-finite v_pred/target; skipping")
-                    bad_local = True
-            if not bad_local:
-                t4 = time.perf_counter()
-                t_forward += t4 - t3
-
+                use_teacher = False
                 if teacher is not None and args.reflow_round >= 1:
                     use_teacher = True
                     if teacher_mode == "mixed":
@@ -579,18 +566,34 @@ def main():
                             g_t = flow_model.cond_mlp(torch.cat([g2d, style_t], dim=-1))
                             cond_batch = {"tau_out": tau_out, "mem": mem, "g": g_t}
                         z_data = teacher.generate_x1_hat(x0, cond_batch)
-                        target = z_data - x0
-                        if not torch.isfinite(target).all():
+                        if not torch.isfinite(z_data).all():
                             if args.debug:
                                 print("Warning: non-finite teacher target; skipping")
                             bad_local = True
 
-                if not bad_local:
-                    loss = torch.mean((v_pred - target) ** 2)
-                    if not torch.isfinite(loss):
-                        if args.debug:
-                            print("Warning: non-finite loss; skipping")
-                        bad_local = True
+            if not bad_local:
+                x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
+                style = flow_model.style_emb(
+                    style_id, domain_id, apply_dropout=not use_teacher
+                )
+                g = flow_model.cond_mlp(torch.cat([g2d, style], dim=-1))
+                t3 = time.perf_counter()
+                t_cond += t3 - t2
+                v_pred = flow_model.flow(x_t, t, tau_out, mem, g)
+                target = z_data - x0
+                if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
+                    if args.debug:
+                        print("Warning: non-finite v_pred/target; skipping")
+                    bad_local = True
+
+            if not bad_local:
+                t4 = time.perf_counter()
+                t_forward += t4 - t3
+                loss = torch.mean((v_pred - target) ** 2)
+                if not torch.isfinite(loss):
+                    if args.debug:
+                        print("Warning: non-finite loss; skipping")
+                    bad_local = True
 
             if _sync_restore_if_needed(bad_local):
                 bad_streak += 1

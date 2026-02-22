@@ -676,8 +676,8 @@ def main():
                         "timing/backward": t_backward / max(total_count, 1),
                     },
                     step=epoch + 1,
+                    commit=True,
                 )
-                wandb_run.flush()
             if total_count == 0:
                 print(
                     "Warning: no valid batches this epoch; enable --debug to inspect."
@@ -789,8 +789,8 @@ def main():
                     wandb_run.log(
                         {f"eval/aist/{k}": v for k, v in eval_summary.items()},
                         step=epoch + 1,
+                        commit=True,
                     )
-                    wandb_run.flush()
                 flow_model.load_state_dict(eval_state)
                 flow_model.train()
         if ddp:

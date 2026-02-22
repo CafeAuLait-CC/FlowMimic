@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--teacher-steps", type=int, default=None)
     parser.add_argument("--teacher-solver", type=str, default=None)
     parser.add_argument("--use-ema-teacher", action="store_true")
+    parser.add_argument("--eval-use-ema", action="store_true", default=True)
+    parser.add_argument("--no-eval-use-ema", dest="eval_use_ema", action="store_false")
     parser.add_argument(
         "--teacher-mode", type=str, choices=["strict", "mixed"], default=None
     )
@@ -70,6 +72,13 @@ def main():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-group", type=str, default=None)
     parser.add_argument("--wandb-tags", type=str, default=None)
+    parser.add_argument("--wandb-id", type=str, default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        type=str,
+        default="allow",
+        choices=("allow", "must", "never"),
+    )
     parser.add_argument(
         "--wandb-mode",
         type=str,
@@ -115,6 +124,8 @@ def main():
                 entity=args.wandb_entity,
                 name=run_name,
                 group=run_group,
+                id=args.wandb_id,
+                resume=args.wandb_resume if args.wandb_id else None,
                 tags=tags or None,
                 mode=args.wandb_mode,
                 config={
@@ -700,6 +711,9 @@ def main():
             if wandb_run is not None and save_every_epochs and (epoch + 1) % save_every_epochs == 0:
                 print("Running AIST eval (steps=4)")
                 flow_model.eval()
+                eval_state = flow_model.state_dict()
+                if args.eval_use_ema and ema is not None:
+                    flow_model.load_state_dict(ema.state_dict())
                 vae.eval()
                 mapping, computed = _build_smpl22_to_body25(
                     config["smpl45_to_body25_def"]
@@ -777,6 +791,7 @@ def main():
                         step=epoch + 1,
                     )
                     wandb_run.flush()
+                flow_model.load_state_dict(eval_state)
                 flow_model.train()
         if ddp:
             dist.barrier()

@@ -117,6 +117,13 @@ def main():
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-group", type=str, default=None)
     parser.add_argument("--wandb-tags", type=str, default=None)
+    parser.add_argument("--wandb-id", type=str, default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        type=str,
+        default="allow",
+        choices=("allow", "must", "never"),
+    )
     parser.add_argument(
         "--wandb-mode",
         type=str,
@@ -146,6 +153,8 @@ def main():
             entity=args.wandb_entity,
             name=run_name,
             group=run_group,
+            id=args.wandb_id,
+            resume=args.wandb_resume if args.wandb_id else None,
             tags=tags or None,
             mode=args.wandb_mode,
             config={

@@ -666,6 +666,7 @@ def main():
                     },
                     step=epoch + 1,
                 )
+                wandb_run.flush()
             if total_count == 0:
                 print(
                     "Warning: no valid batches this epoch; enable --debug to inspect."
@@ -775,6 +776,7 @@ def main():
                         {f"eval/aist/{k}": v for k, v in eval_summary.items()},
                         step=epoch + 1,
                     )
+                    wandb_run.flush()
                 flow_model.train()
         if ddp:
             dist.barrier()

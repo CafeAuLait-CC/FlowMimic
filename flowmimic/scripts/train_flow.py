@@ -665,6 +665,11 @@ def main():
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
+            do_eval = (
+                wandb_run is not None
+                and save_every_epochs
+                and (epoch + 1) % save_every_epochs == 0
+            )
             if wandb_run is not None:
                 wandb_run.log(
                     {
@@ -676,7 +681,7 @@ def main():
                         "timing/backward": t_backward / max(total_count, 1),
                     },
                     step=epoch + 1,
-                    commit=True,
+                    commit=not do_eval,
                 )
             if total_count == 0:
                 print(
@@ -708,7 +713,7 @@ def main():
                         f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
                     )
                     torch.save(state, ckpt_path)
-            if wandb_run is not None and save_every_epochs and (epoch + 1) % save_every_epochs == 0:
+            if do_eval:
                 print("Running AIST eval (steps=4)")
                 flow_model.eval()
                 eval_state = flow_model.state_dict()

@@ -26,11 +26,13 @@ from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.model.vae.datasets.balanced_batch_sampler import balanced_batch_iter
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
+from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.data.openpose import (
     compute_openpose_stats,
     load_aist_openpose,
     load_mvh_openpose,
 )
+from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
@@ -67,6 +69,10 @@ def main():
     parser.add_argument("--reset-optimizer", action="store_true")
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--smooth-warmup-epochs", type=int, default=0)
+    parser.add_argument("--smooth-ramp-epochs", type=int, default=0)
+    parser.add_argument("--smooth-lambda-acc", type=float, default=1e-3)
+    parser.add_argument("--smooth-lambda-jerk", type=float, default=1e-5)
     parser.add_argument("--wandb-project", type=str, default="FlowMimic")
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-name", type=str, default=None)
@@ -178,6 +184,17 @@ def main():
     cond_frames_min = flow_cfg.get("cond_frames_min", 2)
     cond_frames_max = flow_cfg.get("cond_frames_max", 10)
     cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
+    smooth_warmup_epochs = args.smooth_warmup_epochs
+    smooth_ramp_epochs = args.smooth_ramp_epochs
+    smooth_lambda_acc = args.smooth_lambda_acc
+    smooth_lambda_jerk = args.smooth_lambda_jerk
+    smooth_slices = [
+        ("root_yaw_vel", 0, 1, 0.5),
+        ("root_xz_vel", 1, 3, 0.5),
+        ("root_y", 3, 4, 0.3),
+        ("ric", 4, 67, 1.0),
+        ("local_vel", 193, 259, 1.0),
+    ]
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
     save_every_steps = args.save_every_steps or flow_cfg.get("save_every_steps", 0)
     save_every_epochs = args.save_every_epochs
@@ -464,8 +481,16 @@ def main():
     lr_halved = False
     for epoch in range(start_epoch, args.epochs):
         flow.train()
+        if smooth_warmup_epochs > 0 and epoch < smooth_warmup_epochs:
+            w_smooth_epoch = 0.0
+        elif smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs:
+            w_smooth_epoch = (epoch - smooth_warmup_epochs) / float(smooth_ramp_epochs)
+        else:
+            w_smooth_epoch = 1.0
         total_loss = 0.0
         total_count = 0
+        smooth_acc_sum = 0.0
+        smooth_jerk_sum = 0.0
         bad_streak = 0
         t_load = 0.0
         t_encode = 0.0
@@ -601,6 +626,33 @@ def main():
                 t4 = time.perf_counter()
                 t_forward += t4 - t3
                 loss = torch.mean((v_pred - target) ** 2)
+                smooth_acc = None
+                smooth_jerk = None
+                if smooth_lambda_acc > 0.0 or smooth_lambda_jerk > 0.0:
+                    if w_smooth_epoch > 0.0:
+                        z_hat = x0 + v_pred
+                        if latent_mean is not None and latent_std is not None:
+                            z_hat = z_hat * (latent_std + 1e-6) + latent_mean
+                        x_hat = vae.decode(z_hat, vae.cond(domain_id, style_id))
+                        cont_end = LAYOUT_SLICES["feet_contact"][0]
+                        mean_t = torch.as_tensor(mean, device=device, dtype=x_hat.dtype)
+                        std_t = torch.as_tensor(std, device=device, dtype=x_hat.dtype)
+                        x_hat = x_hat.clone()
+                        x_hat[..., :cont_end] = x_hat[..., :cont_end] * std_t + mean_t
+                        smooth_acc = torch.zeros((), device=device)
+                        smooth_jerk = torch.zeros((), device=device)
+                        for _name, start, end, weight in smooth_slices:
+                            x_slice = x_hat[..., start:end]
+                            v = x_slice[:, 1:] - x_slice[:, :-1]
+                            a = v[:, 1:] - v[:, :-1]
+                            smooth_acc = smooth_acc + weight * torch.mean(a**2)
+                            if smooth_lambda_jerk > 0.0:
+                                j = a[:, 1:] - a[:, :-1]
+                                smooth_jerk = smooth_jerk + weight * torch.mean(j**2)
+                        loss = loss + w_smooth_epoch * (
+                            smooth_lambda_acc * smooth_acc
+                            + smooth_lambda_jerk * smooth_jerk
+                        )
                 if not torch.isfinite(loss):
                     if args.debug:
                         print("Warning: non-finite loss; skipping")
@@ -631,6 +683,10 @@ def main():
             t_backward += t5 - t4
             total_loss += loss.item()
             total_count += 1
+            if smooth_acc is not None:
+                smooth_acc_sum += smooth_acc.detach().item()
+            if smooth_jerk is not None:
+                smooth_jerk_sum += smooth_jerk.detach().item()
             if save_every_steps and (step_idx + 1) % save_every_steps == 0:
                 state = {
                     "model": flow_model.state_dict(),
@@ -665,6 +721,13 @@ def main():
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
+            print(
+                "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f}".format(
+                    epoch + 1,
+                    smooth_acc_sum / max(total_count, 1),
+                    smooth_jerk_sum / max(total_count, 1),
+                )
+            )
             do_eval = (
                 wandb_run is not None
                 and save_every_epochs
@@ -679,6 +742,8 @@ def main():
                         "timing/cond": t_cond / max(total_count, 1),
                         "timing/forward": t_forward / max(total_count, 1),
                         "timing/backward": t_backward / max(total_count, 1),
+                        "loss/smooth_acc": smooth_acc_sum / max(total_count, 1),
+                        "loss/smooth_jerk": smooth_jerk_sum / max(total_count, 1),
                     },
                     step=epoch + 1,
                     commit=not do_eval,
@@ -723,9 +788,7 @@ def main():
                 mapping, computed = _build_smpl22_to_body25(
                     config["smpl45_to_body25_def"]
                 )
-                aist_val_paths = _aist_split_paths(
-                    aist_dir, config["aist_split_val"]
-                )
+                aist_val_paths = _aist_split_paths(aist_dir, config["aist_split_val"])
                 aist_val = AISTDataset(
                     aist_dir,
                     genre_to_id,

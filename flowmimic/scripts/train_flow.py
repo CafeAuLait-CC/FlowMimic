@@ -4,6 +4,7 @@ import random
 import sys
 import time
 from datetime import datetime
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -70,7 +71,7 @@ def main():
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--smooth-warmup-epochs", type=int, default=0)
-    parser.add_argument("--smooth-ramp-epochs", type=int, default=0)
+    parser.add_argument("--smooth-ramp-epochs", type=int, default=10)
     parser.add_argument("--smooth-lambda-acc", type=float, default=1e-3)
     parser.add_argument("--smooth-lambda-jerk", type=float, default=1e-5)
     parser.add_argument("--wandb-project", type=str, default="FlowMimic")
@@ -107,6 +108,14 @@ def main():
         rank = 0
         world_size = 1
     is_main = rank == 0
+
+    def _debug_log(msg, epoch_idx=None):
+        if not args.debug or not is_main:
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        epoch_val = epoch_idx if epoch_idx is not None else "-"
+        with open("debug.log", "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] [epoch {epoch_val}] {msg}\n")
 
     if is_main:
         print("Loading config")
@@ -483,7 +492,9 @@ def main():
         flow.train()
         if smooth_warmup_epochs > 0 and epoch < smooth_warmup_epochs:
             w_smooth_epoch = 0.0
-        elif smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs:
+        elif (
+            smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs
+        ):
             w_smooth_epoch = (epoch - smooth_warmup_epochs) / float(smooth_ramp_epochs)
         else:
             w_smooth_epoch = 1.0
@@ -655,7 +666,7 @@ def main():
                         )
                 if not torch.isfinite(loss):
                     if args.debug:
-                        print("Warning: non-finite loss; skipping")
+                        _debug_log("Warning: non-finite loss; skipping", epoch + 1)
                     bad_local = True
 
             if _sync_restore_if_needed(bad_local):
@@ -666,6 +677,10 @@ def main():
                     if is_main:
                         print(
                             f"Warning: too many bad steps; reducing lr to {optimizer.param_groups[0]['lr']:.6g}"
+                        )
+                        _debug_log(
+                            f"Too many bad steps; reducing lr to {optimizer.param_groups[0]['lr']:.6g}",
+                            epoch + 1,
                         )
                     bad_streak = 0
                 continue
@@ -753,13 +768,14 @@ def main():
                     "Warning: no valid batches this epoch; enable --debug to inspect."
                 )
             if args.debug and total_count > 0:
-                print(
+                _debug_log(
                     "Timing (s) "
                     f"load={t_load / total_count:.4f} "
                     f"encode={t_encode / total_count:.4f} "
                     f"cond={t_cond / total_count:.4f} "
                     f"forward={t_forward / total_count:.4f} "
-                    f"backward={t_backward / total_count:.4f}"
+                    f"backward={t_backward / total_count:.4f}",
+                    epoch + 1,
                 )
 
             if total_count > 0:

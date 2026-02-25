@@ -269,7 +269,9 @@ def main():
         json.dump(meta_out, f, indent=2)
     if meta.get("dataset") in ("aist", "mvh"):
         print(
-            "Run 'python flowmimic/tools/extract_cond_media.py' to see original data used as condition"
+            "Run 'python flowmimic/tools/extract_cond_media.py --meta {}' to see original data used as condition".format(
+                meta_path
+            )
         )
 
 

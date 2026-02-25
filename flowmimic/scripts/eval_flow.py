@@ -5,6 +5,7 @@ import os
 import random
 import sys
 import warnings
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -438,6 +439,7 @@ def _generate_batch(
     compute_feat=False,
 ):
     feats = None
+    t_start = time.perf_counter()
     with torch.inference_mode():
         seq_len = motion.shape[1]
         tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
@@ -460,12 +462,16 @@ def _generate_batch(
         if compute_feat:
             _, mu, _ = vae.encode(x_hat, vae.cond(domain_id, style_id), mask=None)
             feats = _feature_from_mu(mu)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    net_time = time.perf_counter() - t_start
     x_hat_np = x_hat.cpu().numpy()
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     x_hat_np[..., :cont_end] = x_hat_np[..., :cont_end] * std + mean
     contact_logits = x_hat_np[..., LAYOUT_SLICES["feet_contact"][0] : LAYOUT_SLICES["feet_contact"][1]]
     joints = ik263_to_smpl22(x_hat_np)
-    return x_hat_np, joints, contact_logits, feats
+    full_time = time.perf_counter() - t_start
+    return x_hat_np, joints, contact_logits, feats, net_time, full_time
 
 
 def _collect_features(vae, motion, domain_id, style_id):
@@ -501,6 +507,9 @@ def evaluate_dataset(
     results = []
     feats_gen_list = []
     feats_ref = []
+    total_time_net = 0.0
+    total_time_full = 0.0
+    seq_count = 0
     rng = np.random.RandomState(seed)
     edges = _edges_from_chain(t2m_kinematic_chain)
 
@@ -544,7 +553,7 @@ def evaluate_dataset(
         if skip_empty_cond and k2d_batch.shape[1] == 0:
             continue
 
-        x_hat_np, joints, contact_logits, feats_gen = _generate_batch(
+        x_hat_np, joints, contact_logits, feats_gen, net_time, full_time = _generate_batch(
             flow,
             vae,
             mean,
@@ -566,6 +575,9 @@ def evaluate_dataset(
             cfg.d_z,
             compute_feat=compute_dist,
         )
+        total_time_net += net_time
+        total_time_full += full_time
+        seq_count += batch_size
         joints = joints if isinstance(joints, np.ndarray) else joints
 
         for i in range(batch_size):
@@ -617,6 +629,9 @@ def evaluate_dataset(
         keys = [k for k in results[0].keys() if k not in ("dataset")]
         for k in keys:
             summary[k] = float(np.mean([r[k] for r in results]))
+    if seq_count > 0:
+        summary["aits_full"] = total_time_full / seq_count
+        summary["aits_net"] = total_time_net / seq_count
     if compute_dist and feats_gen_list and feats_ref:
         f_gen = np.concatenate(feats_gen_list, axis=0)
         f_ref = np.concatenate(feats_ref, axis=0)
@@ -638,9 +653,9 @@ def main():
     parser.add_argument("--cam-mode", type=str, default="fixed", choices=["fixed", "per_frame"])
     parser.add_argument("--slack-seconds", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-json", type=str, default="output/flow_eval.json")
-    parser.add_argument("--save-csv", type=str, default="output/flow_eval.csv")
-    parser.add_argument("--save-plot", type=str, default="output/flow_eval_steps.png")
+    parser.add_argument("--save-json", type=str, default=None)
+    parser.add_argument("--save-csv", type=str, default=None)
+    parser.add_argument("--save-plot", type=str, default=None)
     parser.add_argument("--no-dist", action="store_true")
     parser.add_argument("--save-per-sample", action="store_true")
     args = parser.parse_args()
@@ -763,6 +778,12 @@ def main():
     }
 
     steps_list = [int(s.strip()) for s in args.steps.split(",") if s.strip()]
+    model_dir = os.path.basename(os.path.dirname(args.flow_ckpt.rstrip(os.sep)))
+    out_dir = os.path.join("output", "eval", model_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    save_json = args.save_json or os.path.join(out_dir, "flow_eval.json")
+    save_csv = args.save_csv or os.path.join(out_dir, "flow_eval.csv")
+    save_plot = args.save_plot or os.path.join(out_dir, "flow_eval_steps.png")
     summary_rows = []
     per_sample = []
     for steps in steps_list:
@@ -795,15 +816,18 @@ def main():
                     rec["steps"] = steps
                     per_sample.append(rec)
 
-    print(f"Writing outputs: {args.save_csv}, {args.save_json}, {args.save_plot}")
-    os.makedirs(os.path.dirname(args.save_csv), exist_ok=True)
-    with open(args.save_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=sorted(summary_rows[0].keys()))
+    print(f"Writing outputs: {save_csv}, {save_json}, {save_plot}")
+    os.makedirs(os.path.dirname(save_csv), exist_ok=True)
+    fieldnames = ["dataset", "steps"] + [
+        k for k in summary_rows[0].keys() if k not in ("dataset", "steps")
+    ]
+    with open(save_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
 
     out = {"summary": summary_rows, "per_sample": per_sample}
-    with open(args.save_json, "w", encoding="utf-8") as f:
+    with open(save_json, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
 
     try:
@@ -826,7 +850,7 @@ def main():
         plt.ylabel("E2D strict")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(args.save_plot)
+        plt.savefig(save_plot)
     except Exception:
         pass
 

@@ -462,7 +462,7 @@ def _generate_batch(
         if compute_feat:
             _, mu, _ = vae.encode(x_hat, vae.cond(domain_id, style_id), mask=None)
             feats = _feature_from_mu(mu)
-    if device.type == "cuda":
+    if isinstance(device, torch.device) and device.type == "cuda":
         torch.cuda.synchronize()
     net_time = time.perf_counter() - t_start
     x_hat_np = x_hat.cpu().numpy()

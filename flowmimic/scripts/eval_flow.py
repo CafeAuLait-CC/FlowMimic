@@ -440,6 +440,7 @@ def _generate_batch(
 ):
     feats = None
     t_start = time.perf_counter()
+    t_flow_start = time.perf_counter()
     with torch.inference_mode():
         seq_len = motion.shape[1]
         tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
@@ -456,12 +457,19 @@ def _generate_batch(
         g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
         cond_batch = {"tau_out": tau_out, "mem": mem, "g": g}
         z_hat = solve_flow(flow.flow, x0, cond_batch, num_steps=steps, method=solver)
+        if isinstance(device, torch.device) and device.type == "cuda":
+            torch.cuda.synchronize()
+        t_flow = time.perf_counter() - t_flow_start
+        t_vae_start = time.perf_counter()
         if latent_mean is not None and latent_std is not None:
             z_hat = z_hat * (latent_std + 1e-6) + latent_mean
         x_hat = vae.decode(z_hat, vae.cond(domain_id, style_id))
         if compute_feat:
             _, mu, _ = vae.encode(x_hat, vae.cond(domain_id, style_id), mask=None)
             feats = _feature_from_mu(mu)
+        if isinstance(device, torch.device) and device.type == "cuda":
+            torch.cuda.synchronize()
+        t_vae = time.perf_counter() - t_vae_start
     if isinstance(device, torch.device) and device.type == "cuda":
         torch.cuda.synchronize()
     net_time = time.perf_counter() - t_start
@@ -471,7 +479,7 @@ def _generate_batch(
     contact_logits = x_hat_np[..., LAYOUT_SLICES["feet_contact"][0] : LAYOUT_SLICES["feet_contact"][1]]
     joints = ik263_to_smpl22(x_hat_np)
     full_time = time.perf_counter() - t_start
-    return x_hat_np, joints, contact_logits, feats, net_time, full_time
+    return x_hat_np, joints, contact_logits, feats, net_time, full_time, t_flow, t_vae
 
 
 def _collect_features(vae, motion, domain_id, style_id):
@@ -509,6 +517,8 @@ def evaluate_dataset(
     feats_ref = []
     total_time_net = 0.0
     total_time_full = 0.0
+    total_time_flow = 0.0
+    total_time_vae = 0.0
     seq_count = 0
     rng = np.random.RandomState(seed)
     edges = _edges_from_chain(t2m_kinematic_chain)
@@ -553,7 +563,16 @@ def evaluate_dataset(
         if skip_empty_cond and k2d_batch.shape[1] == 0:
             continue
 
-        x_hat_np, joints, contact_logits, feats_gen, net_time, full_time = _generate_batch(
+        (
+            x_hat_np,
+            joints,
+            contact_logits,
+            feats_gen,
+            net_time,
+            full_time,
+            flow_time,
+            vae_time,
+        ) = _generate_batch(
             flow,
             vae,
             mean,
@@ -577,6 +596,8 @@ def evaluate_dataset(
         )
         total_time_net += net_time
         total_time_full += full_time
+        total_time_flow += flow_time
+        total_time_vae += vae_time
         seq_count += batch_size
         joints = joints if isinstance(joints, np.ndarray) else joints
 
@@ -632,6 +653,8 @@ def evaluate_dataset(
     if seq_count > 0:
         summary["aits_full"] = total_time_full / seq_count
         summary["aits_net"] = total_time_net / seq_count
+        summary["aits_flow"] = total_time_flow / seq_count
+        summary["aits_vae"] = total_time_vae / seq_count
     if compute_dist and feats_gen_list and feats_ref:
         f_gen = np.concatenate(feats_gen_list, axis=0)
         f_ref = np.concatenate(feats_ref, axis=0)

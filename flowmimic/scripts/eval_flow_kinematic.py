@@ -478,26 +478,32 @@ def evaluate_dataset(
             metas = metas[:keep]
             batch_size = keep
 
-        k2d_batch, vis_batch, tau_cond, mask_cond, k2d_list, vis_list = _load_cond_batch(
-            metas,
-            openpose_cfg["aist_dir"],
-            openpose_cfg["mvh_root"],
-            openpose_cfg["mv_root"],
-            openpose_cfg["mvh_cameras"],
-            cfg.seq_len,
-            openpose_cfg["cond_frames_min"],
-            openpose_cfg["cond_frames_max"],
-            openpose_cfg["cond_drop_prob"],
-            openpose_cfg["aist_fps"],
-            openpose_cfg["mvh_fps"],
-            openpose_cfg["target_fps"],
-            cache_root=openpose_cfg["cond_cache_root"],
-            rng=rng,
-        )
-        k2d_batch = k2d_batch.to(device)
-        vis_batch = vis_batch.to(device)
-        tau_cond = tau_cond.to(device)
-        mask_cond = mask_cond.to(device)
+        if "k2d" in batch:
+            k2d_batch = batch["k2d"].to(device)
+            vis_batch = batch["vis"].to(device)
+            tau_cond = batch["tau_cond"].to(device)
+            mask_cond = batch["mask_cond"].to(device)
+        else:
+            k2d_batch, vis_batch, tau_cond, mask_cond, k2d_list, vis_list = _load_cond_batch(
+                metas,
+                openpose_cfg["aist_dir"],
+                openpose_cfg["mvh_root"],
+                openpose_cfg["mv_root"],
+                openpose_cfg["mvh_cameras"],
+                cfg.seq_len,
+                openpose_cfg["cond_frames_min"],
+                openpose_cfg["cond_frames_max"],
+                openpose_cfg["cond_drop_prob"],
+                openpose_cfg["aist_fps"],
+                openpose_cfg["mvh_fps"],
+                openpose_cfg["target_fps"],
+                cache_root=openpose_cfg["cond_cache_root"],
+                rng=rng,
+            )
+            k2d_batch = k2d_batch.to(device)
+            vis_batch = vis_batch.to(device)
+            tau_cond = tau_cond.to(device)
+            mask_cond = mask_cond.to(device)
         if skip_empty_cond and k2d_batch.shape[1] == 0:
             continue
 
@@ -532,12 +538,20 @@ def evaluate_dataset(
         total_time_net += flow_time
         seq_count += batch_size
 
+        k2d_np = k2d_batch.cpu().numpy()
+        vis_np = vis_batch.cpu().numpy()
+        tau_np = tau_cond.cpu().numpy()
+        mask_np = mask_cond.cpu().numpy()
         for i in range(batch_size):
+            valid_mask = mask_np[i].astype(bool)
+            k2d_i = k2d_np[i][valid_mask]
+            vis_i = vis_np[i][valid_mask]
+            tau_i = tau_np[i][valid_mask]
             err = _condition_error(
                 joints[i],
-                k2d_list[i],
-                vis_list[i],
-                tau_cond[i][: len(k2d_list[i])].cpu().numpy(),
+                k2d_i,
+                vis_i,
+                tau_i,
                 cfg.fps,
                 cfg.slack_seconds,
                 cfg.cam_mode,
@@ -709,6 +723,12 @@ def main():
         src_fps=cfg.get("aist_fps", 60),
         camera_ids=cfg.get("aist_cameras", ["01", "02", "08", "09"]),
         expand_cameras=True,
+        include_cond=True,
+        openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
+        cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
+        cond_frames_min=flow_cfg.get("cond_frames_min", 7),
+        cond_frames_max=flow_cfg.get("cond_frames_max", 7),
+        cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
     )
     mvh_ds = MVHumanNetDataset(
         cfg["mvhumannet_root"],
@@ -721,6 +741,12 @@ def main():
         src_fps=cfg.get("mvh_fps", 5),
         camera_ids=cfg.get("mvh_cameras", ["22327091", "22327113", "22327084"]),
         expand_cameras=True,
+        include_cond=True,
+        openpose_root=cfg.get("mvh_openpose_root", "data/MVHumanNet"),
+        cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
+        cond_frames_min=flow_cfg.get("cond_frames_min", 7),
+        cond_frames_max=flow_cfg.get("cond_frames_max", 7),
+        cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
     )
     aist_loader = torch.utils.data.DataLoader(
         aist_ds, batch_size=args.batch_size, shuffle=False, num_workers=0

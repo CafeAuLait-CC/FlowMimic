@@ -58,6 +58,10 @@ def _merge_batches(batches):
     style_ids = []
     masks = []
     metas = []
+    k2d_list = []
+    vis_list = []
+    tau_list = []
+    mask_cond_list = []
     for batch in batches:
         motions.append(batch["motion"])
         domain_ids.append(batch["domain_id"])
@@ -65,11 +69,20 @@ def _merge_batches(batches):
         masks.append(batch["mask"])
         metas_raw = batch["meta"]
         metas.extend(_normalize_meta(metas_raw))
+        if "k2d" in batch:
+            k2d_list.append(batch["k2d"])
+            vis_list.append(batch["vis"])
+            tau_list.append(batch["tau_cond"])
+            mask_cond_list.append(batch["mask_cond"])
     motion = torch.cat(motions, dim=0)
     domain_id = torch.cat(domain_ids, dim=0)
     style_id = torch.cat(style_ids, dim=0)
     mask = torch.cat(masks, dim=0)
-    return motion, domain_id, style_id, mask, metas
+    k2d = torch.cat(k2d_list, dim=0) if k2d_list else None
+    vis = torch.cat(vis_list, dim=0) if vis_list else None
+    tau_cond = torch.cat(tau_list, dim=0) if tau_list else None
+    mask_cond = torch.cat(mask_cond_list, dim=0) if mask_cond_list else None
+    return motion, domain_id, style_id, mask, metas, k2d, vis, tau_cond, mask_cond
 
 
 def _load_cond_batch(
@@ -319,6 +332,12 @@ def main():
         src_fps=aist_fps,
         camera_ids=aist_cameras,
         expand_cameras=True,
+        include_cond=True,
+        openpose_dir=openpose_aist_dir,
+        cond_cache_root=cond_cache_root,
+        cond_frames_min=cond_frames_min,
+        cond_frames_max=cond_frames_max,
+        cond_drop_prob=cond_drop_prob,
     )
     if is_main:
         print(f"Building datasets -- MVH (train split: {len(mvh_train_dirs)})")
@@ -333,10 +352,24 @@ def main():
         src_fps=mvh_fps,
         camera_ids=mvh_cameras,
         expand_cameras=True,
+        include_cond=True,
+        openpose_root=openpose_mvh_root,
+        cond_cache_root=cond_cache_root,
+        cond_frames_min=cond_frames_min,
+        cond_frames_max=cond_frames_max,
+        cond_drop_prob=cond_drop_prob,
     )
 
-    sampler_a = DistributedSampler(dataset_a, num_replicas=world_size, rank=rank) if ddp else None
-    sampler_b = DistributedSampler(dataset_b, num_replicas=world_size, rank=rank) if ddp else None
+    sampler_a = (
+        DistributedSampler(dataset_a, num_replicas=world_size, rank=rank)
+        if ddp
+        else None
+    )
+    sampler_b = (
+        DistributedSampler(dataset_b, num_replicas=world_size, rank=rank)
+        if ddp
+        else None
+    )
 
     def _seed_worker(worker_id):
         worker_seed = seed_rank + worker_id
@@ -464,7 +497,9 @@ def main():
         ema = EMA(flow_core, decay=ema_decay)
         if ema_state is not None:
             ema.load_state_dict(ema_state)
-        teacher = Teacher(ema, solver_cfg={"num_steps": teacher_steps, "method": teacher_solver})
+        teacher = Teacher(
+            ema, solver_cfg={"num_steps": teacher_steps, "method": teacher_solver}
+        )
     elif args.reflow_round >= 1:
         if not args.teacher_ckpt:
             raise ValueError("teacher_ckpt is required for reflow_round >= 1")
@@ -485,22 +520,31 @@ def main():
         state = torch.load(args.teacher_ckpt, map_location=device)
         teacher_flow.load_state_dict(state["model"])
         teacher_flow.eval()
-        teacher = Teacher(teacher_flow, solver_cfg={"num_steps": teacher_steps, "method": teacher_solver})
+        teacher = Teacher(
+            teacher_flow,
+            solver_cfg={"num_steps": teacher_steps, "method": teacher_solver},
+        )
 
     def _sync_restore_if_needed(bad_local):
         if not bad_local and not ddp:
             return False
         if not ddp:
             if bad_local:
-                restore_path = last_good_path if os.path.exists(last_good_path) else last_path
+                restore_path = (
+                    last_good_path if os.path.exists(last_good_path) else last_path
+                )
                 if os.path.exists(restore_path):
-                    _restore_checkpoint(restore_path, flow_model, optimizer, ema, device)
+                    _restore_checkpoint(
+                        restore_path, flow_model, optimizer, ema, device
+                    )
             return bad_local
         flag = torch.tensor([1 if bad_local else 0], device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item() > 0:
             dist.barrier()
-            restore_path = last_good_path if os.path.exists(last_good_path) else last_path
+            restore_path = (
+                last_good_path if os.path.exists(last_good_path) else last_path
+            )
             if os.path.exists(restore_path):
                 _restore_checkpoint(restore_path, flow_model, optimizer, ema, device)
             dist.barrier()
@@ -514,7 +558,9 @@ def main():
         flow_model.train()
         if smooth_warmup_epochs > 0 and epoch < smooth_warmup_epochs:
             w_smooth_epoch = 0.0
-        elif smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs:
+        elif (
+            smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs
+        ):
             w_smooth_epoch = (epoch - smooth_warmup_epochs) / float(smooth_ramp_epochs)
         else:
             w_smooth_epoch = 1.0
@@ -552,7 +598,17 @@ def main():
             loss = None
             t0 = time.perf_counter()
             batch = next(batch_iter)
-            motion, domain_id, style_id, mask, metas = _merge_batches(batch)
+            (
+                motion,
+                domain_id,
+                style_id,
+                mask,
+                metas,
+                k2d_batch,
+                vis_batch,
+                tau_cond,
+                mask_cond,
+            ) = _merge_batches(batch)
             motion = motion.to(device)
             domain_id = domain_id.to(device)
             style_id = style_id.to(device)
@@ -576,30 +632,22 @@ def main():
                 t = torch.rand(z_data.shape[0], device=device)
                 x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
                 tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
-
-                k2d_batch, vis_batch, tau_cond, mask_cond = _load_cond_batch(
-                    metas,
-                    openpose_aist_dir,
-                    openpose_mvh_root,
-                    mv_root,
-                    mvh_cameras,
-                    seq_len,
-                    cond_frames_min,
-                    cond_frames_max,
-                    cond_drop_prob,
-                    aist_fps,
-                    mvh_fps,
-                    target_fps,
-                    cond_cache_root,
-                )
-                k2d_batch = k2d_batch.to(device)
-                vis_batch = vis_batch.to(device)
-                tau_cond = tau_cond.to(device)
-                mask_cond = mask_cond.to(device)
-                if not torch.isfinite(k2d_batch).all():
+                if k2d_batch is None:
                     if args.debug:
-                        _debug_log("Warning: non-finite keypoints batch; skipping", epoch + 1)
+                        _debug_log("Warning: missing k2d batch; skipping", epoch + 1)
                     bad_local = True
+                else:
+                    k2d_batch = k2d_batch.to(device)
+                    vis_batch = vis_batch.to(device)
+                    tau_cond = tau_cond.to(device)
+                    mask_cond = mask_cond.to(device)
+                    if not torch.isfinite(k2d_batch).all():
+                        if args.debug:
+                            _debug_log(
+                                "Warning: non-finite keypoints batch; skipping",
+                                epoch + 1,
+                            )
+                        bad_local = True
             if not bad_local:
                 g2d, mem, _vis = flow_core.cond_encoder(
                     k2d_batch,
@@ -611,7 +659,10 @@ def main():
                 )
                 if not torch.isfinite(g2d).all() or not torch.isfinite(mem).all():
                     if args.debug:
-                        _debug_log("Warning: non-finite cond encoder output; skipping", epoch + 1)
+                        _debug_log(
+                            "Warning: non-finite cond encoder output; skipping",
+                            epoch + 1,
+                        )
                     bad_local = True
             if not bad_local:
                 use_teacher = False
@@ -624,15 +675,18 @@ def main():
                             style_t = flow_core.style_emb(
                                 style_id, domain_id, apply_dropout=False
                             )
-                            g_t = flow_core.cond_mlp(
-                                torch.cat([g2d, style_t], dim=-1)
+                            g_t = flow_core.cond_mlp(torch.cat([g2d, style_t], dim=-1))
+                            tau_out = torch.linspace(
+                                0.0, 1.0, steps=seq_len, device=device
                             )
-                            tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
                             cond_batch = {"tau_out": tau_out, "mem": mem, "g": g_t}
                         z_data = teacher.generate_x1_hat(x0, cond_batch)
                         if not torch.isfinite(z_data).all():
                             if args.debug:
-                                _debug_log("Warning: non-finite teacher target; skipping", epoch + 1)
+                                _debug_log(
+                                    "Warning: non-finite teacher target; skipping",
+                                    epoch + 1,
+                                )
                             bad_local = True
 
             if not bad_local:
@@ -647,7 +701,9 @@ def main():
                 target = z_data - x0
                 if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
                     if args.debug:
-                        _debug_log("Warning: non-finite v_pred/target; skipping", epoch + 1)
+                        _debug_log(
+                            "Warning: non-finite v_pred/target; skipping", epoch + 1
+                        )
                     bad_local = True
 
             if not bad_local:
@@ -731,15 +787,17 @@ def main():
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
-            print(
-                "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f}".format(
-                    epoch + 1,
-                    smooth_acc_sum / max(total_count, 1),
-                    smooth_jerk_sum / max(total_count, 1),
-                )
-            )
+            # print(
+            #     "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f}".format(
+            #         epoch + 1,
+            #         smooth_acc_sum / max(total_count, 1),
+            #         smooth_jerk_sum / max(total_count, 1),
+            #     )
+            # )
             if total_count == 0:
-                print("Warning: no valid batches this epoch; enable --debug to inspect.")
+                print(
+                    "Warning: no valid batches this epoch; enable --debug to inspect."
+                )
             if args.debug and total_count > 0:
                 _debug_log(
                     "Timing (s) "

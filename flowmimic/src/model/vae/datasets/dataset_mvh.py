@@ -48,6 +48,12 @@ class MVHumanNetDataset(Dataset):
         src_fps=5,
         camera_ids=None,
         expand_cameras=False,
+        include_cond=False,
+        openpose_root=None,
+        cond_cache_root=None,
+        cond_frames_min=None,
+        cond_frames_max=None,
+        cond_drop_prob=0.0,
     ):
         if sequence_dirs is None:
             self.sequence_dirs = sorted(
@@ -69,6 +75,12 @@ class MVHumanNetDataset(Dataset):
         self.src_fps = src_fps
         self.camera_ids = list(camera_ids) if camera_ids else []
         self.expand_cameras = expand_cameras
+        self.include_cond = include_cond
+        self.openpose_root = openpose_root
+        self.cond_cache_root = cond_cache_root
+        self.cond_frames_min = cond_frames_min
+        self.cond_frames_max = cond_frames_max
+        self.cond_drop_prob = cond_drop_prob
         self._clip_counts = None
         self._index_map = None
         self._build_index_map()
@@ -127,6 +139,73 @@ class MVHumanNetDataset(Dataset):
             "mask": torch.from_numpy(mask),
             "meta": meta,
         }
+        if self.include_cond:
+            if not self.openpose_root:
+                raise ValueError("openpose_root is required when include_cond=True")
+            from flowmimic.src.data.openpose import load_mvh_openpose
+
+            k2d, vis = load_mvh_openpose(
+                seq_dir,
+                self.mv_root,
+                self.openpose_root,
+                self.camera_ids,
+                src_fps=self.src_fps,
+                target_fps=self.target_fps,
+                cache_root=self.cond_cache_root,
+                camera=camera,
+            )
+            if k2d is None:
+                k2d = np.zeros((self.seq_len, 25, 2), dtype=np.float32)
+                vis = np.zeros((self.seq_len, 25), dtype=np.float32)
+            if orig_len >= self.seq_len:
+                k2d = k2d[start : start + self.seq_len]
+                vis = vis[start : start + self.seq_len]
+            else:
+                pad_len = self.seq_len - orig_len
+                k2d = np.concatenate(
+                    [k2d, np.zeros((pad_len, 25, 2), dtype=np.float32)], axis=0
+                )
+                vis = np.concatenate(
+                    [vis, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
+                )
+            t_len = k2d.shape[0]
+            k_frames = self.cond_frames_min or 1
+            if t_len <= k_frames:
+                idxs = np.arange(t_len)
+            else:
+                idxs = np.linspace(0, t_len - 1, k_frames)
+                idxs = np.unique(np.round(idxs).astype(int))
+            k2d_sparse = k2d[idxs]
+            vis_sparse = vis[idxs]
+            valid_len = k2d_sparse.shape[0]
+            if self.cond_drop_prob > 0:
+                drop = np.random.rand(*vis_sparse.shape) < self.cond_drop_prob
+                vis_sparse = vis_sparse * (~drop)
+                k2d_sparse = k2d_sparse * vis_sparse[..., None]
+            pad = k_frames - valid_len
+            if pad > 0:
+                k2d_sparse = np.concatenate(
+                    [k2d_sparse, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0
+                )
+                vis_sparse = np.concatenate(
+                    [vis_sparse, np.zeros((pad, 25), dtype=np.float32)], axis=0
+                )
+                mask_cond = np.concatenate(
+                    [np.ones(valid_len, dtype=bool), np.zeros(pad, dtype=bool)]
+                )
+                tau_cond = np.concatenate(
+                    [
+                        idxs.astype(np.float32) / max(t_len - 1, 1),
+                        np.zeros(pad, dtype=np.float32),
+                    ]
+                )
+            else:
+                mask_cond = np.ones((k2d_sparse.shape[0],), dtype=bool)
+                tau_cond = idxs.astype(np.float32) / max(t_len - 1, 1)
+            sample["k2d"] = torch.from_numpy(k2d_sparse).float()
+            sample["vis"] = torch.from_numpy(vis_sparse).float()
+            sample["tau_cond"] = torch.from_numpy(tau_cond).float()
+            sample["mask_cond"] = torch.from_numpy(mask_cond)
         return sample
 
     def _build_index_map(self):

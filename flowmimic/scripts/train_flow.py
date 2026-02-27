@@ -235,6 +235,12 @@ def main():
         src_fps=aist_fps,
         camera_ids=aist_cameras,
         expand_cameras=True,
+        include_cond=True,
+        openpose_dir=openpose_aist_dir,
+        cond_cache_root=cond_cache_root,
+        cond_frames_min=cond_frames_min,
+        cond_frames_max=cond_frames_max,
+        cond_drop_prob=cond_drop_prob,
     )
     if is_main:
         print(f"Building datasets -- MVH (train split: {len(mvh_train_dirs)})")
@@ -249,6 +255,12 @@ def main():
         src_fps=mvh_fps,
         camera_ids=mvh_cameras,
         expand_cameras=True,
+        include_cond=True,
+        openpose_root=openpose_mvh_root,
+        cond_cache_root=cond_cache_root,
+        cond_frames_min=cond_frames_min,
+        cond_frames_max=cond_frames_max,
+        cond_drop_prob=cond_drop_prob,
     )
 
     if is_main:
@@ -532,7 +544,7 @@ def main():
             loss = None
             t0 = time.perf_counter()
             batch = next(batch_iter)
-            motion, domain_id, style_id, mask, metas = _merge_batches(batch)
+            motion, domain_id, style_id, mask, metas, k2d_batch, vis_batch, tau_cond, mask_cond = _merge_batches(batch)
             motion = motion.to(device)
             domain_id = domain_id.to(device)
             style_id = style_id.to(device)
@@ -562,30 +574,19 @@ def main():
                 x0 = torch.randn_like(z_data)
                 t = torch.rand(z_data.shape[0], device=device)
                 x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
-
-                k2d_batch, vis_batch, tau_cond, mask_cond = _load_cond_batch(
-                    metas,
-                    openpose_aist_dir,
-                    openpose_mvh_root,
-                    mv_root,
-                    mvh_cameras,
-                    seq_len,
-                    cond_frames_min,
-                    cond_frames_max,
-                    cond_drop_prob,
-                    aist_fps,
-                    mvh_fps,
-                    target_fps,
-                    cond_cache_root,
-                )
-                k2d_batch = k2d_batch.to(device)
-                vis_batch = vis_batch.to(device)
-                tau_cond = tau_cond.to(device)
-                mask_cond = mask_cond.to(device)
-                if not torch.isfinite(k2d_batch).all():
+                if k2d_batch is None:
                     if args.debug:
-                        _debug_log("Warning: non-finite keypoints batch; skipping", epoch + 1)
+                        _debug_log("Warning: missing k2d batch; skipping", epoch + 1)
                     bad_local = True
+                else:
+                    k2d_batch = k2d_batch.to(device)
+                    vis_batch = vis_batch.to(device)
+                    tau_cond = tau_cond.to(device)
+                    mask_cond = mask_cond.to(device)
+                    if not torch.isfinite(k2d_batch).all():
+                        if args.debug:
+                            _debug_log("Warning: non-finite keypoints batch; skipping", epoch + 1)
+                        bad_local = True
             if not bad_local:
                 g2d, mem, _vis = flow_model.cond_encoder(
                     k2d_batch,
@@ -892,6 +893,10 @@ def _merge_batches(batches):
     style_ids = []
     masks = []
     metas = []
+    k2d_list = []
+    vis_list = []
+    tau_list = []
+    mask_cond_list = []
     for batch in batches:
         motions.append(batch["motion"])
         domain_ids.append(batch["domain_id"])
@@ -899,11 +904,20 @@ def _merge_batches(batches):
         masks.append(batch["mask"])
         metas_raw = batch["meta"]
         metas.extend(_normalize_meta(metas_raw))
+        if "k2d" in batch:
+            k2d_list.append(batch["k2d"])
+            vis_list.append(batch["vis"])
+            tau_list.append(batch["tau_cond"])
+            mask_cond_list.append(batch["mask_cond"])
     motion = torch.cat(motions, dim=0)
     domain_id = torch.cat(domain_ids, dim=0)
     style_id = torch.cat(style_ids, dim=0)
     mask = torch.cat(masks, dim=0)
-    return motion, domain_id, style_id, mask, metas
+    k2d = torch.cat(k2d_list, dim=0) if k2d_list else None
+    vis = torch.cat(vis_list, dim=0) if vis_list else None
+    tau_cond = torch.cat(tau_list, dim=0) if tau_list else None
+    mask_cond = torch.cat(mask_cond_list, dim=0) if mask_cond_list else None
+    return motion, domain_id, style_id, mask, metas, k2d, vis, tau_cond, mask_cond
 
 
 def _normalize_meta(metas_raw):

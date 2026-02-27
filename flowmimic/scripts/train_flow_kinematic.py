@@ -26,6 +26,7 @@ from flowmimic.src.model.vae.datasets.balanced_batch_sampler import balanced_bat
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.data.openpose import compute_openpose_stats
+from flowmimic.scripts.eval_flow_kinematic import _build_smpl22_to_body25, evaluate_dataset
 
 
 def _read_lines(path):
@@ -226,6 +227,26 @@ def main():
     parser.add_argument("--smooth-ramp-epochs", type=int, default=0)
     parser.add_argument("--smooth-lambda-acc", type=float, default=0.0)
     parser.add_argument("--smooth-lambda-jerk", type=float, default=0.0)
+    parser.add_argument("--wandb-project", type=str, default="FlowMimic")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, default=None)
+    parser.add_argument("--wandb-id", type=str, default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        type=str,
+        default="allow",
+        choices=("allow", "must", "never"),
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="online",
+        choices=("online", "offline", "disabled"),
+    )
+    parser.add_argument("--eval-use-ema", action="store_true", default=True)
+    parser.add_argument("--no-eval-use-ema", dest="eval_use_ema", action="store_false")
     args = parser.parse_args()
 
     ddp = args.ddp
@@ -254,6 +275,42 @@ def main():
     if is_main:
         print("Loading config")
     config = load_config()
+    wandb_run = None
+    if is_main:
+        try:
+            import wandb  # type: ignore
+        except ModuleNotFoundError:
+            wandb = None
+            print("wandb not installed; continuing without logging.")
+        if wandb is not None:
+            tags = [t for t in (args.wandb_tags or "").split(",") if t]
+            run_name = args.wandb_name
+            if run_name is None:
+                stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+                run_name = f"flow-kinematic-{stamp}"
+            run_group = args.wandb_group or "Flow"
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                group=run_group,
+                id=args.wandb_id,
+                resume=args.wandb_resume if args.wandb_id else None,
+                tags=tags or None,
+                mode=args.wandb_mode,
+                config={
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "seq_len": config.get("seq_len"),
+                    "lr": args.lr,
+                    "cond_lr_scale": args.cond_lr_scale,
+                    "reflow_round": args.reflow_round,
+                    "teacher_mode": args.teacher_mode,
+                    "p_teacher": args.p_teacher,
+                    "cond_frames_min": config.get("flow", {}).get("cond_frames_min", 7),
+                    "cond_frames_max": config.get("flow", {}).get("cond_frames_max", 7),
+                },
+            )
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     seq_len = config["seq_len"]
@@ -787,6 +844,24 @@ def main():
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
+            do_eval = (
+                wandb_run is not None
+                and save_every_epochs
+                and (epoch + 1) % save_every_epochs == 0
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "loss/avg_velocity_mse": total_loss / max(total_count, 1),
+                        "timing/load": t_load / max(total_count, 1),
+                        "timing/encode": t_encode / max(total_count, 1),
+                        "timing/cond": t_cond / max(total_count, 1),
+                        "timing/forward": t_forward / max(total_count, 1),
+                        "timing/backward": t_backward / max(total_count, 1),
+                    },
+                    step=epoch + 1,
+                    commit=not do_eval,
+                )
             # print(
             #     "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f}".format(
             #         epoch + 1,
@@ -824,6 +899,94 @@ def main():
                         f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
                     )
                     torch.save(state, ckpt_path)
+            if do_eval:
+                print("Running AIST eval (steps=4)")
+                flow_core.eval()
+                eval_state = flow_core.state_dict()
+                if args.eval_use_ema and ema is not None:
+                    flow_core.load_state_dict(ema.state_dict())
+                mapping, computed = _build_smpl22_to_body25(
+                    config["smpl45_to_body25_def"]
+                )
+                aist_val_paths = _aist_split_paths(
+                    aist_dir, config["aist_split_val"]
+                )
+                aist_val = AISTDataset(
+                    aist_dir,
+                    genre_to_id,
+                    seq_len,
+                    mean=mean,
+                    std=std,
+                    files=aist_val_paths,
+                    cache_root=config["cache_root"],
+                    target_fps=target_fps,
+                    src_fps=aist_fps,
+                    camera_ids=aist_cameras,
+                    expand_cameras=True,
+                    include_cond=True,
+                    openpose_dir=openpose_aist_dir,
+                    cond_cache_root=cond_cache_root,
+                    cond_frames_min=cond_frames_min,
+                    cond_frames_max=cond_frames_max,
+                    cond_drop_prob=cond_drop_prob,
+                )
+                aist_loader = DataLoader(
+                    aist_val,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                )
+                eval_cfg = type(
+                    "EvalCfg",
+                    (),
+                    {
+                        "seq_len": seq_len,
+                        "d_z": d_z,
+                        "fps": target_fps,
+                        "slack_seconds": 0.1,
+                        "cam_mode": "fixed",
+                    },
+                )()
+                openpose_cfg = {
+                    "aist_dir": openpose_aist_dir,
+                    "mvh_root": openpose_mvh_root,
+                    "mv_root": mv_root,
+                    "mvh_cameras": mvh_cameras,
+                    "cond_frames_min": cond_frames_min,
+                    "cond_frames_max": cond_frames_max,
+                    "cond_drop_prob": cond_drop_prob,
+                    "aist_fps": aist_fps,
+                    "mvh_fps": mvh_fps,
+                    "target_fps": target_fps,
+                    "cond_cache_root": cond_cache_root,
+                    "mean": k2d_mean,
+                    "std": k2d_std,
+                }
+                eval_summary, _ = evaluate_dataset(
+                    "AIST",
+                    aist_loader,
+                    flow_core,
+                    eval_cfg,
+                    mapping,
+                    computed,
+                    openpose_cfg,
+                    (mean, std),
+                    steps=4,
+                    solver="heun",
+                    num_samples=0,
+                    seed=seed,
+                    device=device,
+                    compute_dist=True,
+                    save_per_sample=False,
+                )
+                if eval_summary:
+                    wandb_run.log(
+                        {f"eval/aist/{k}": v for k, v in eval_summary.items()},
+                        step=epoch + 1,
+                        commit=True,
+                    )
+                flow_core.load_state_dict(eval_state)
+                flow_core.train()
         if ddp:
             dist.barrier()
 

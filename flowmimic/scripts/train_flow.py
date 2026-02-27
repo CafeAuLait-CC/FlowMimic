@@ -538,7 +538,7 @@ def main():
             style_id = style_id.to(device)
             if not torch.isfinite(motion).all():
                 if args.debug:
-                    print("Warning: non-finite motion batch; skipping")
+                    _debug_log("Warning: non-finite motion batch; skipping", epoch + 1)
                 bad_local = True
             if not bad_local:
                 t1 = time.perf_counter()
@@ -553,7 +553,7 @@ def main():
                     z_data = (z_data - latent_mean) / (latent_std + 1e-6)
                 if not torch.isfinite(z_data).all():
                     if args.debug:
-                        print("Warning: non-finite z_data; skipping")
+                        _debug_log("Warning: non-finite z_data; skipping", epoch + 1)
                     bad_local = True
             if not bad_local:
                 t2 = time.perf_counter()
@@ -584,7 +584,7 @@ def main():
                 mask_cond = mask_cond.to(device)
                 if not torch.isfinite(k2d_batch).all():
                     if args.debug:
-                        print("Warning: non-finite keypoints batch; skipping")
+                        _debug_log("Warning: non-finite keypoints batch; skipping", epoch + 1)
                     bad_local = True
             if not bad_local:
                 g2d, mem, _vis = flow_model.cond_encoder(
@@ -597,7 +597,7 @@ def main():
                 )
                 if not torch.isfinite(g2d).all() or not torch.isfinite(mem).all():
                     if args.debug:
-                        print("Warning: non-finite cond encoder output; skipping")
+                        _debug_log("Warning: non-finite cond encoder output; skipping", epoch + 1)
                     bad_local = True
             if not bad_local:
                 use_teacher = False
@@ -615,7 +615,7 @@ def main():
                         z_data = teacher.generate_x1_hat(x0, cond_batch)
                         if not torch.isfinite(z_data).all():
                             if args.debug:
-                                print("Warning: non-finite teacher target; skipping")
+                                _debug_log("Warning: non-finite teacher target; skipping", epoch + 1)
                             bad_local = True
 
             if not bad_local:
@@ -630,7 +630,7 @@ def main():
                 target = z_data - x0
                 if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
                     if args.debug:
-                        print("Warning: non-finite v_pred/target; skipping")
+                        _debug_log("Warning: non-finite v_pred/target; skipping", epoch + 1)
                     bad_local = True
 
             if not bad_local:
@@ -670,6 +670,8 @@ def main():
                     bad_local = True
 
             if _sync_restore_if_needed(bad_local):
+                if args.debug:
+                    _debug_log("Recover triggered; skipping step", epoch + 1)
                 bad_streak += 1
                 if max_bad_steps and bad_streak >= max_bad_steps:
                     for group in optimizer.param_groups:

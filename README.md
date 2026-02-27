@@ -220,4 +220,6 @@ Main config: `flowmimic/src/config/config.json`
 ## Notes
 
 - MVH has NaNs in raw joints; those sequences are skipped in caching/stats.
-- Flow training currently uses sparse 2D conditions sampled on the fly.
+- Flow training/eval now load sparse 2D conditions in the dataset (parallel via DataLoader).
+  - `AISTDataset`/`MVHumanNetDataset` accept `include_cond=True` and return `k2d`, `vis`, `tau_cond`, `mask_cond`.
+  - Sparse frames are evenly spaced with `cond_frames_min=cond_frames_max=7` (config).

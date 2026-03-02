@@ -500,11 +500,18 @@ def evaluate_dataset(
                 cache_root=openpose_cfg["cond_cache_root"],
                 rng=rng,
             )
-            k2d_batch = k2d_batch.to(device)
-            vis_batch = vis_batch.to(device)
-            tau_cond = tau_cond.to(device)
-            mask_cond = mask_cond.to(device)
+        k2d_batch = k2d_batch.to(device)
+        vis_batch = vis_batch.to(device)
+        tau_cond = tau_cond.to(device)
+        mask_cond = mask_cond.to(device)
+        if num_samples and batch_size < k2d_batch.shape[0]:
+            k2d_batch = k2d_batch[:batch_size]
+            vis_batch = vis_batch[:batch_size]
+            tau_cond = tau_cond[:batch_size]
+            mask_cond = mask_cond[:batch_size]
         if skip_empty_cond and k2d_batch.shape[1] == 0:
+            continue
+        if skip_empty_cond and mask_cond.sum().item() == 0:
             continue
 
         (
@@ -704,7 +711,10 @@ def main():
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
     ).to(args.device)
     state = torch.load(args.flow_ckpt, map_location=args.device)
-    flow.load_state_dict(state["model"])
+    model_state = state.get("model", state)
+    if any(k.startswith("module.") for k in model_state.keys()):
+        model_state = {k.replace("module.", "", 1): v for k, v in model_state.items()}
+    flow.load_state_dict(model_state, strict=False)
     flow.eval()
 
     print("Building datasets")

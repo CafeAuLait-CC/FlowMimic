@@ -87,7 +87,10 @@ def main():
     )
     device = torch.device(args.device)
     state = torch.load(args.checkpoint, map_location=device)
-    flow.load_state_dict(state["model"])
+    model_state = state.get("model", state)
+    if any(k.startswith("module.") for k in model_state.keys()):
+        model_state = {k.replace("module.", "", 1): v for k, v in model_state.items()}
+    flow.load_state_dict(model_state, strict=False)
     flow.to(device)
     flow.eval()
 
@@ -211,9 +214,10 @@ def main():
     g = flow.cond_mlp(torch.cat([g, style], dim=-1))
 
     cond_batch = {"tau_out": tau_out, "mem": mem, "g": g}
-    z_hat = solve_flow(flow.flow, x0, cond_batch, num_steps=args.steps, method=args.solver)
+    with torch.inference_mode():
+        z_hat = solve_flow(flow.flow, x0, cond_batch, num_steps=args.steps, method=args.solver)
 
-    ik263 = z_hat.squeeze(0).cpu().numpy()
+    ik263 = z_hat.squeeze(0).detach().cpu().numpy()
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     ik263[:, :cont_end] = ik263[:, :cont_end] * std + mean
     joints = ik263_to_smpl22(ik263)

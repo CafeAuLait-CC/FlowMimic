@@ -134,7 +134,12 @@ def main():
     elif args.sample_path or args.dataset in ("aist", "mvh", "auto"):
         dataset = args.dataset
         if dataset == "auto":
-            dataset = "aist" if random.random() < 0.5 else "mvh"
+            if args.sample_path and args.sample_path.endswith(".pkl"):
+                dataset = "aist"
+            elif args.sample_path:
+                dataset = "mvh"
+            else:
+                dataset = "aist" if random.random() < 0.5 else "mvh"
         if dataset == "aist":
             if args.sample_path:
                 pkl_path = args.sample_path
@@ -251,6 +256,10 @@ def main():
     np.save(out_npy, joints)
 
     meta_path = os.path.join(args.out_dir, "result_meta.json")
+    if hasattr(sample_idx, "tolist"):
+        sample_idx_out = sample_idx.tolist()
+    else:
+        sample_idx_out = list(sample_idx)
     meta_out = {
         "dataset": meta.get("dataset", "unknown"),
         "path": meta.get("path", ""),
@@ -260,7 +269,7 @@ def main():
         "orig_len": meta.get("orig_len", ""),
         "start": meta.get("start", ""),
         "seq_len": seq_len,
-        "sparse_indices": sample_idx.tolist(),
+        "sparse_indices": sample_idx_out,
         "tau_cond": tau_cond.tolist(),
     }
     with open(meta_path, "w", encoding="utf-8") as f:

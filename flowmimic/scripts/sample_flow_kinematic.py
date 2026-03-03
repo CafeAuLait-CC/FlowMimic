@@ -116,7 +116,12 @@ def main():
     elif args.sample_path or args.dataset in ("aist", "mvh", "auto"):
         dataset = args.dataset
         if dataset == "auto":
-            dataset = "aist" if random.random() < 0.5 else "mvh"
+            if args.sample_path and args.sample_path.endswith(".pkl"):
+                dataset = "aist"
+            elif args.sample_path:
+                dataset = "mvh"
+            else:
+                dataset = "aist" if random.random() < 0.5 else "mvh"
         if dataset == "aist":
             if args.sample_path:
                 pkl_path = args.sample_path

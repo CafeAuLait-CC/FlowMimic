@@ -148,8 +148,11 @@ def main():
         print(f"Saved smpl22: {smpl_out}")
         return
 
-    if dataset != "mvh":
+    if dataset not in ("mvh", "mvh_kinematic"):
         raise ValueError(f"Unsupported dataset in meta: {dataset}")
+
+    if dataset == "mvh_kinematic" and motion_path.endswith(".pkl"):
+        raise ValueError("mvh_kinematic meta expects a MVHumanNet sequence directory")
 
     parts = motion_path.split(os.sep)
     if len(parts) < 3:

@@ -147,6 +147,65 @@ def _rollout(flow_model, x0, tau_out, mem, g, mem_mask, steps, method):
     return torch.stack(traj, dim=1)
 
 
+def _path_deviation_stream(flow_model, x0, tau_out, mem, g, mem_mask, steps, method):
+    t_grid = torch.linspace(0.0, 1.0, steps=steps, device=x0.device)
+    x = x0
+    if steps == 1:
+        x1 = x0
+    else:
+        for i in range(steps - 1):
+            t = t_grid[i].expand(x0.shape[0])
+            t_next = t_grid[i + 1]
+            dt = t_next - t_grid[i]
+            if method == "heun":
+                v1 = flow_model.flow(x, t, tau_out, mem, g, mem_mask=mem_mask)
+                x1 = x + v1 * dt
+                v2 = flow_model.flow(
+                    x1, t_next.expand(x0.shape[0]), tau_out, mem, g, mem_mask=mem_mask
+                )
+                x = x + 0.5 * (v1 + v2) * dt
+            else:
+                v = flow_model.flow(x, t, tau_out, mem, g, mem_mask=mem_mask)
+                x = x + v * dt
+        x1 = x
+
+    x = x0
+    sum_dev = torch.zeros((x0.shape[0],), device=x0.device)
+    max_dev = torch.zeros((x0.shape[0],), device=x0.device)
+    for i in range(steps):
+        t = t_grid[i]
+        line = (1 - t) * x0 + t * x1
+        diff = x - line
+        dev = torch.linalg.norm(diff.reshape(diff.shape[0], -1), dim=1)
+        sum_dev += dev
+        max_dev = torch.maximum(max_dev, dev)
+        if i == steps - 1:
+            break
+        t_next = t_grid[i + 1]
+        dt = t_next - t_grid[i]
+        if method == "heun":
+            v1 = flow_model.flow(
+                x, t_grid[i].expand(x0.shape[0]), tau_out, mem, g, mem_mask=mem_mask
+            )
+            x1_tmp = x + v1 * dt
+            v2 = flow_model.flow(
+                x1_tmp,
+                t_next.expand(x0.shape[0]),
+                tau_out,
+                mem,
+                g,
+                mem_mask=mem_mask,
+            )
+            x = x + 0.5 * (v1 + v2) * dt
+        else:
+            v = flow_model.flow(
+                x, t_grid[i].expand(x0.shape[0]), tau_out, mem, g, mem_mask=mem_mask
+            )
+            x = x + v * dt
+    avg_dev = sum_dev / max(steps, 1)
+    return avg_dev, max_dev
+
+
 def _project_pca(traj_list, shared_basis=True):
     from sklearn.decomposition import PCA
 
@@ -183,6 +242,7 @@ def _plot_traj(ax, traj2, title):
 
 def _path_deviation(traj, t_grid):
     # traj: [N, K, T, D], t_grid: [K]
+    t_grid = np.asarray(t_grid, dtype=np.float32).reshape(-1)
     x0 = traj[:, 0:1]
     x1 = traj[:, -1:]
     t = t_grid[None, :, None, None]
@@ -257,10 +317,10 @@ def main():
     parser.add_argument("--reflow-ckpt", default=None)
     parser.add_argument("--vae-ckpt", default=None)
     parser.add_argument("--num-samples", type=int, default=64)
-    parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--solver", type=str, default="heun")
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--out", type=str, default="output/flow/path_vis.png")
+    parser.add_argument("--out-dir", type=str, default="output/flow/vis_path")
+    parser.add_argument("--plot-steps", type=int, default=30)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -374,45 +434,77 @@ def main():
     tau_cond = torch.tensor(tau_np, device=device)
     mask_cond = torch.tensor(mask_np, device=device)
 
-    g2d, mem, _vis = flow.cond_encoder(
-        k2d, tau_cond, vis_mask=vis, mask_cond=mask_cond, mean=k2d_mean, std=k2d_std
-    )
-    style = flow.style_emb(style_id, domain_id, apply_dropout=False)
-    g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
-    mem_mask = ~mask_cond
-    tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
-
-    traj1 = _rollout(flow, x0, tau_out, mem, g, mem_mask, args.steps, args.solver)
-    traj_list = [traj1.detach().cpu().numpy()]
-
-    if flow2 is not None:
-        g2d2, mem2, _vis2 = flow2.cond_encoder(
+    with torch.inference_mode():
+        g2d, mem, _vis = flow.cond_encoder(
             k2d, tau_cond, vis_mask=vis, mask_cond=mask_cond, mean=k2d_mean, std=k2d_std
         )
-        style2 = flow2.style_emb(style_id, domain_id, apply_dropout=False)
-        g2 = flow2.cond_mlp(torch.cat([g2d2, style2], dim=-1))
-        traj2 = _rollout(
-            flow2, x0, tau_out, mem2, g2, mem_mask, args.steps, args.solver
-        )
-        traj_list.append(traj2.detach().cpu().numpy())
+        style = flow.style_emb(style_id, domain_id, apply_dropout=False)
+        g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
+        mem_mask = ~mask_cond
+        tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
 
-    proj = _project_pca(traj_list, shared_basis=True)
+        steps_list = [1, 2, 4, 8, 16, 20, 30, 50, 80, 100]
+        plot_steps = args.plot_steps
+        dev_means = []
+        dev_maxes = []
+        traj_plot = None
+        traj_plot2 = None
+        for steps in steps_list:
+            if steps == plot_steps:
+                traj1 = _rollout(
+                    flow, x0, tau_out, mem, g, mem_mask, steps, args.solver
+                )
+                traj1_np = traj1.detach().cpu().numpy()
+                t_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
+                avg_dev1, max_dev1 = _path_deviation(traj1_np, t_grid)
+            else:
+                avg_dev1, max_dev1 = _path_deviation_stream(
+                    flow, x0, tau_out, mem, g, mem_mask, steps, args.solver
+                )
+                avg_dev1 = avg_dev1.detach().cpu().numpy()
+                max_dev1 = max_dev1.detach().cpu().numpy()
+            dev_means.append(avg_dev1.mean())
+            dev_maxes.append(max_dev1.mean())
+            print(
+                f"steps={steps:>3d} avg_dev mean={avg_dev1.mean():.6f} std={avg_dev1.std():.6f} "
+                f"max={max_dev1.mean():.6f}"
+            )
+            if steps == plot_steps:
+                traj_plot = traj1_np
 
-    t_grid = np.linspace(0.0, 1.0, args.steps, dtype=np.float32)
-    avg_dev1, max_dev1 = _path_deviation(traj_list[0], t_grid)
-    print(
-        f"Z1 avg_dev mean={avg_dev1.mean():.6f} std={avg_dev1.std():.6f} max={max_dev1.mean():.6f}"
-    )
-    if len(traj_list) > 1:
-        avg_dev2, max_dev2 = _path_deviation(traj_list[1], t_grid)
-        print(
-            f"Z2 avg_dev mean={avg_dev2.mean():.6f} std={avg_dev2.std():.6f} max={max_dev2.mean():.6f}"
-        )
+            if flow2 is not None and steps == plot_steps:
+                g2d2, mem2, _vis2 = flow2.cond_encoder(
+                    k2d,
+                    tau_cond,
+                    vis_mask=vis,
+                    mask_cond=mask_cond,
+                    mean=k2d_mean,
+                    std=k2d_std,
+                )
+                style2 = flow2.style_emb(style_id, domain_id, apply_dropout=False)
+                g2 = flow2.cond_mlp(torch.cat([g2d2, style2], dim=-1))
+                traj2 = _rollout(
+                    flow2, x0, tau_out, mem2, g2, mem_mask, steps, args.solver
+                )
+                traj_plot2 = traj2.detach().cpu().numpy()
+
+        if traj_plot is None:
+            traj_plot = _rollout(
+                flow, x0, tau_out, mem, g, mem_mask, plot_steps, args.solver
+            ).detach().cpu().numpy()
 
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    traj_list = [traj_plot]
+    if traj_plot2 is not None:
+        traj_list.append(traj_plot2)
+    proj = _project_pca(traj_list, shared_basis=True)
+
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     _plot_traj(axes[0], proj[0], "(a) The 1st rectified flow Z1")
@@ -422,9 +514,19 @@ def main():
         axes[1].set_title("(b) Reflow Z2 (placeholder)")
         axes[1].axis("off")
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    fig.savefig(args.out, dpi=200, bbox_inches="tight")
-    print(f"Saved: {args.out}")
+    out_path = os.path.join(out_dir, "path_vis.png")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    print(f"Saved: {out_path}")
+
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.plot(steps_list, dev_means, marker="o", label="avg_dev")
+    ax2.set_xlabel("Steps")
+    ax2.set_ylabel("Avg deviation")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    dev_out = os.path.join(out_dir, "path_dev_steps.png")
+    fig2.savefig(dev_out, dpi=200, bbox_inches="tight")
+    print(f"Saved: {dev_out}")
 
 
 if __name__ == "__main__":

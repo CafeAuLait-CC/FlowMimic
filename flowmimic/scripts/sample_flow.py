@@ -17,7 +17,11 @@ from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import ik263_to_smpl22
-from flowmimic.src.data.openpose import load_aist_openpose, load_mvh_openpose
+from flowmimic.src.data.openpose import (
+    VIS_CONF_THRESHOLD,
+    load_aist_openpose,
+    load_mvh_openpose,
+)
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.data.dataloader import yup_to_blender
 from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
@@ -129,7 +133,7 @@ def main():
         k2d = np.load(args.k2d_npy)
         vis = None
         if k2d.ndim == 3 and k2d.shape[-1] == 3:
-            vis = k2d[..., 2] > 0.0
+            vis = k2d[..., 2] >= VIS_CONF_THRESHOLD
             k2d = k2d[..., :2]
     elif args.sample_path or args.dataset in ("aist", "mvh", "auto"):
         dataset = args.dataset

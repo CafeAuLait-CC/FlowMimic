@@ -1,9 +1,9 @@
 import argparse
+import json
 import os
 import random
 import sys
 import time
-from datetime import datetime
 from datetime import datetime
 
 import numpy as np
@@ -28,12 +28,12 @@ from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.model.vae.datasets.balanced_batch_sampler import balanced_batch_iter
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
+from flowmimic.src.motion.ik.common.quaternion import qinv, qrot
 from flowmimic.src.data.openpose import (
     compute_openpose_stats,
     load_aist_openpose,
     load_mvh_openpose,
 )
-from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
@@ -74,6 +74,20 @@ def main():
     parser.add_argument("--smooth-ramp-epochs", type=int, default=10)
     parser.add_argument("--smooth-lambda-acc", type=float, default=1e-3)
     parser.add_argument("--smooth-lambda-jerk", type=float, default=1e-5)
+    parser.add_argument("--solver-reg-every", type=int, default=4)
+    parser.add_argument("--solver-reg-solver", type=str, default="heun")
+    parser.add_argument("--solver-reg-start-epoch", type=int, default=30)
+    parser.add_argument("--cond-ramp-epochs", type=int, default=10)
+    parser.add_argument("--smooth-reg-start-epoch", type=int, default=40)
+    parser.add_argument("--smooth-reg-ramp-epochs", type=int, default=10)
+    parser.add_argument("--lambda-cond", type=float, default=0.01)
+    parser.add_argument("--lambda-acc", type=float, default=1e-4)
+    parser.add_argument("--lambda-jerk", type=float, default=1e-6)
+    parser.add_argument("--solver-steps-early", type=str, default="32")
+    parser.add_argument("--solver-steps-mid", type=str, default="16,32")
+    parser.add_argument("--solver-steps-late", type=str, default="8,16,4")
+    parser.add_argument("--solver-mid-epoch", type=int, default=80)
+    parser.add_argument("--solver-late-epoch", type=int, default=160)
     parser.add_argument("--wandb-project", type=str, default="FlowMimic")
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-name", type=str, default=None)
@@ -197,6 +211,18 @@ def main():
     smooth_ramp_epochs = args.smooth_ramp_epochs
     smooth_lambda_acc = args.smooth_lambda_acc
     smooth_lambda_jerk = args.smooth_lambda_jerk
+    solver_reg_every = max(1, args.solver_reg_every)
+    solver_reg_solver = args.solver_reg_solver
+    solver_reg_start_epoch = args.solver_reg_start_epoch
+    cond_ramp_epochs = args.cond_ramp_epochs
+    smooth_reg_start_epoch = args.smooth_reg_start_epoch
+    smooth_reg_ramp_epochs = args.smooth_reg_ramp_epochs
+    lambda_cond = args.lambda_cond
+    lambda_acc = args.lambda_acc
+    lambda_jerk = args.lambda_jerk
+    solver_steps_early = _parse_steps(args.solver_steps_early)
+    solver_steps_mid = _parse_steps(args.solver_steps_mid)
+    solver_steps_late = _parse_steps(args.solver_steps_late)
     smooth_slices = [
         ("root_yaw_vel", 0, 1, 0.5),
         ("root_xz_vel", 1, 3, 0.5),
@@ -416,6 +442,9 @@ def main():
         latent_std = torch.tensor(
             latent_stats["std"], device=device, dtype=torch.float32
         )
+    body25_to_smpl_idx, body25_to_smpl_valid = _build_body25_to_smpl22(
+        config["smpl45_to_body25_def"], device
+    )
 
     teacher = None
     if args.reflow_round >= 1:
@@ -500,20 +529,28 @@ def main():
     if is_main:
         print("Starting training loop")
     lr_halved = False
+    global_step = 0
     for epoch in range(start_epoch, args.epochs):
         flow.train()
         if smooth_warmup_epochs > 0 and epoch < smooth_warmup_epochs:
-            w_smooth_epoch = 0.0
+            w_smooth_legacy = 0.0
         elif (
             smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs
         ):
-            w_smooth_epoch = (epoch - smooth_warmup_epochs) / float(smooth_ramp_epochs)
+            w_smooth_legacy = (epoch - smooth_warmup_epochs) / float(smooth_ramp_epochs)
         else:
-            w_smooth_epoch = 1.0
+            w_smooth_legacy = 1.0
+        w_cond_epoch = _ramp_weight(epoch, solver_reg_start_epoch, cond_ramp_epochs)
+        w_smooth_epoch = _ramp_weight(
+            epoch, smooth_reg_start_epoch, smooth_reg_ramp_epochs
+        )
+        if smooth_lambda_acc > 0.0 or smooth_lambda_jerk > 0.0:
+            w_smooth_epoch = max(w_smooth_epoch, w_smooth_legacy)
         total_loss = 0.0
         total_count = 0
         smooth_acc_sum = 0.0
         smooth_jerk_sum = 0.0
+        cond_match_sum = 0.0
         bad_streak = 0
         t_load = 0.0
         t_encode = 0.0
@@ -540,11 +577,23 @@ def main():
                 leave=False,
             )
         for step_idx in iter_range:
+            global_step += 1
             bad_local = False
             loss = None
             t0 = time.perf_counter()
             batch = next(batch_iter)
-            motion, domain_id, style_id, mask, metas, k2d_batch, vis_batch, tau_cond, mask_cond = _merge_batches(batch)
+            (
+                motion,
+                domain_id,
+                style_id,
+                mask,
+                metas,
+                k2d_batch,
+                vis_batch,
+                conf_batch,
+                tau_cond,
+                mask_cond,
+            ) = _merge_batches(batch)
             motion = motion.to(device)
             domain_id = domain_id.to(device)
             style_id = style_id.to(device)
@@ -581,6 +630,9 @@ def main():
                 else:
                     k2d_batch = k2d_batch.to(device)
                     vis_batch = vis_batch.to(device)
+                    conf_batch = (
+                        conf_batch.to(device) if conf_batch is not None else vis_batch
+                    )
                     tau_cond = tau_cond.to(device)
                     mask_cond = mask_cond.to(device)
                     if not torch.isfinite(k2d_batch).all():
@@ -640,30 +692,67 @@ def main():
                 loss = torch.mean((v_pred - target) ** 2)
                 smooth_acc = None
                 smooth_jerk = None
-                if smooth_lambda_acc > 0.0 or smooth_lambda_jerk > 0.0:
-                    if w_smooth_epoch > 0.0:
-                        z_hat = x0 + v_pred
-                        if latent_mean is not None and latent_std is not None:
-                            z_hat = z_hat * (latent_std + 1e-6) + latent_mean
-                        x_hat = vae.decode(z_hat, vae.cond(domain_id, style_id))
-                        cont_end = LAYOUT_SLICES["feet_contact"][0]
-                        mean_t = torch.as_tensor(mean, device=device, dtype=x_hat.dtype)
-                        std_t = torch.as_tensor(std, device=device, dtype=x_hat.dtype)
-                        x_hat = x_hat.clone()
-                        x_hat[..., :cont_end] = x_hat[..., :cont_end] * std_t + mean_t
-                        smooth_acc = torch.zeros((), device=device)
-                        smooth_jerk = torch.zeros((), device=device)
-                        for _name, start, end, weight in smooth_slices:
-                            x_slice = x_hat[..., start:end]
-                            v = x_slice[:, 1:] - x_slice[:, :-1]
-                            a = v[:, 1:] - v[:, :-1]
-                            smooth_acc = smooth_acc + weight * torch.mean(a**2)
-                            if smooth_lambda_jerk > 0.0:
-                                j = a[:, 1:] - a[:, :-1]
-                                smooth_jerk = smooth_jerk + weight * torch.mean(j**2)
+                cond_match_loss = None
+                do_solver_reg = (
+                    epoch >= solver_reg_start_epoch
+                    and (global_step % solver_reg_every == 0)
+                    and (w_cond_epoch > 0.0 or w_smooth_epoch > 0.0)
+                )
+                if do_solver_reg:
+                    solver_steps = _pick_solver_steps(
+                        epoch,
+                        solver_steps_early,
+                        solver_steps_mid,
+                        solver_steps_late,
+                        args.solver_mid_epoch,
+                        args.solver_late_epoch,
+                    )
+                    cond_batch = {
+                        "tau_out": tau_out,
+                        "mem": mem,
+                        "g": g,
+                        "mem_mask": ~mask_cond,
+                    }
+                    z_reg = solve_flow(
+                        flow_model.flow,
+                        x0,
+                        cond_batch,
+                        num_steps=solver_steps,
+                        method=solver_reg_solver,
+                    )
+                    if latent_mean is not None and latent_std is not None:
+                        z_reg = z_reg * (latent_std + 1e-6) + latent_mean
+                    x_reg = vae.decode(z_reg, vae.cond(domain_id, style_id))
+                    cont_end = LAYOUT_SLICES["feet_contact"][0]
+                    mean_t = torch.as_tensor(mean, device=device, dtype=x_reg.dtype)
+                    std_t = torch.as_tensor(std, device=device, dtype=x_reg.dtype)
+                    x_reg = x_reg.clone()
+                    x_reg[..., :cont_end] = x_reg[..., :cont_end] * std_t + mean_t
+                    joints_reg = _ik263_to_smpl22_torch(x_reg)
+
+                    if lambda_cond > 0.0 and w_cond_epoch > 0.0:
+                        cond_match_loss = _condition_match_loss(
+                            joints_reg,
+                            k2d_batch,
+                            conf_batch,
+                            tau_cond,
+                            mask_cond,
+                            body25_to_smpl_idx,
+                            body25_to_smpl_valid,
+                        )
+                        loss = loss + (lambda_cond * w_cond_epoch) * cond_match_loss
+
+                    if (lambda_acc > 0.0 or lambda_jerk > 0.0) and w_smooth_epoch > 0.0:
+                        v_j = joints_reg[:, 1:] - joints_reg[:, :-1]
+                        a_j = v_j[:, 1:] - v_j[:, :-1]
+                        smooth_acc = torch.mean(a_j**2)
+                        if lambda_jerk > 0.0:
+                            j_j = a_j[:, 1:] - a_j[:, :-1]
+                            smooth_jerk = torch.mean(j_j**2)
+                        else:
+                            smooth_jerk = torch.zeros((), device=device)
                         loss = loss + w_smooth_epoch * (
-                            smooth_lambda_acc * smooth_acc
-                            + smooth_lambda_jerk * smooth_jerk
+                            lambda_acc * smooth_acc + lambda_jerk * smooth_jerk
                         )
                 if not torch.isfinite(loss):
                     if args.debug:
@@ -705,6 +794,8 @@ def main():
                 smooth_acc_sum += smooth_acc.detach().item()
             if smooth_jerk is not None:
                 smooth_jerk_sum += smooth_jerk.detach().item()
+            if cond_match_loss is not None:
+                cond_match_sum += cond_match_loss.detach().item()
             if save_every_steps and (step_idx + 1) % save_every_steps == 0:
                 state = {
                     "model": flow_model.state_dict(),
@@ -722,6 +813,9 @@ def main():
                 [
                     total_loss,
                     total_count,
+                    smooth_acc_sum,
+                    smooth_jerk_sum,
+                    cond_match_sum,
                     t_load,
                     t_encode,
                     t_cond,
@@ -732,18 +826,22 @@ def main():
             )
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             total_loss, total_count = stats[0].item(), int(stats[1].item())
+            smooth_acc_sum = stats[2].item()
+            smooth_jerk_sum = stats[3].item()
+            cond_match_sum = stats[4].item()
             t_load, t_encode, t_cond, t_forward, t_backward = [
-                s.item() for s in stats[2:]
+                s.item() for s in stats[5:]
             ]
         if is_main:
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
             print(
-                "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f}".format(
+                "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f} cond_match={:.6f}".format(
                     epoch + 1,
                     smooth_acc_sum / max(total_count, 1),
                     smooth_jerk_sum / max(total_count, 1),
+                    cond_match_sum / max(total_count, 1),
                 )
             )
             do_eval = (
@@ -762,6 +860,9 @@ def main():
                         "timing/backward": t_backward / max(total_count, 1),
                         "loss/smooth_acc": smooth_acc_sum / max(total_count, 1),
                         "loss/smooth_jerk": smooth_jerk_sum / max(total_count, 1),
+                        "loss/cond_match": cond_match_sum / max(total_count, 1),
+                        "schedule/w_cond_epoch": w_cond_epoch,
+                        "schedule/w_smooth_epoch": w_smooth_epoch,
                     },
                     step=epoch + 1,
                     commit=not do_eval,
@@ -895,6 +996,7 @@ def _merge_batches(batches):
     metas = []
     k2d_list = []
     vis_list = []
+    conf_list = []
     tau_list = []
     mask_cond_list = []
     for batch in batches:
@@ -907,6 +1009,7 @@ def _merge_batches(batches):
         if "k2d" in batch:
             k2d_list.append(batch["k2d"])
             vis_list.append(batch["vis"])
+            conf_list.append(batch.get("conf", batch["vis"]))
             tau_list.append(batch["tau_cond"])
             mask_cond_list.append(batch["mask_cond"])
     motion = torch.cat(motions, dim=0)
@@ -915,9 +1018,10 @@ def _merge_batches(batches):
     mask = torch.cat(masks, dim=0)
     k2d = torch.cat(k2d_list, dim=0) if k2d_list else None
     vis = torch.cat(vis_list, dim=0) if vis_list else None
+    conf = torch.cat(conf_list, dim=0) if conf_list else None
     tau_cond = torch.cat(tau_list, dim=0) if tau_list else None
     mask_cond = torch.cat(mask_cond_list, dim=0) if mask_cond_list else None
-    return motion, domain_id, style_id, mask, metas, k2d, vis, tau_cond, mask_cond
+    return motion, domain_id, style_id, mask, metas, k2d, vis, conf, tau_cond, mask_cond
 
 
 def _normalize_meta(metas_raw):
@@ -961,21 +1065,23 @@ def _load_cond_batch(
 ):
     k2d_list = []
     vis_list = []
+    conf_list = []
     mask_list = []
     tau_list = []
     for meta in metas:
         path = meta["path"]
         if path.endswith(".pkl"):
-            k2d, vis = load_aist_openpose(
+            k2d, vis, conf = load_aist_openpose(
                 path,
                 aist_openpose_dir,
                 src_fps=aist_fps,
                 target_fps=target_fps,
                 cache_root=cache_root,
                 camera=meta.get("camera"),
+                return_conf=True,
             )
         else:
-            k2d, vis = load_mvh_openpose(
+            k2d, vis, conf = load_mvh_openpose(
                 path,
                 mv_root,
                 mvh_openpose_root,
@@ -984,15 +1090,18 @@ def _load_cond_batch(
                 target_fps=target_fps,
                 cache_root=cache_root,
                 camera=meta.get("camera"),
+                return_conf=True,
             )
         if k2d is None:
             k2d = np.zeros((seq_len, 25, 2), dtype=np.float32)
             vis = np.zeros((seq_len, 25), dtype=np.float32)
+            conf = np.zeros((seq_len, 25), dtype=np.float32)
         start = meta.get("start", 0)
         orig_len = meta.get("orig_len", k2d.shape[0])
         if orig_len >= seq_len:
             k2d = k2d[start : start + seq_len]
             vis = vis[start : start + seq_len]
+            conf = conf[start : start + seq_len]
         else:
             pad_len = seq_len - orig_len
             k2d = np.concatenate(
@@ -1000,6 +1109,9 @@ def _load_cond_batch(
             )
             vis = np.concatenate(
                 [vis, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
+            )
+            conf = np.concatenate(
+                [conf, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
             )
         t_len = k2d.shape[0]
         k_frames = cond_frames_min
@@ -1010,42 +1122,218 @@ def _load_cond_batch(
             idx = np.unique(np.round(idx).astype(int))
         k2d_sparse = k2d[idx]
         vis_sparse = vis[idx]
+        conf_sparse = conf[idx]
         if cond_drop_prob > 0:
             drop = np.random.rand(*vis_sparse.shape) < cond_drop_prob
             vis_sparse = vis_sparse * (~drop)
+            conf_sparse = conf_sparse * (~drop)
             k2d_sparse = k2d_sparse * vis_sparse[..., None]
         mask_cond = np.ones((k2d_sparse.shape[0],), dtype=bool)
         tau_cond = idx.astype(np.float32) / max(t_len - 1, 1)
 
         k2d_list.append(k2d_sparse)
         vis_list.append(vis_sparse)
+        conf_list.append(conf_sparse)
         mask_list.append(mask_cond)
         tau_list.append(tau_cond)
 
     max_len = max(k.shape[0] for k in k2d_list)
     k2d_pad = []
     vis_pad = []
+    conf_pad = []
     mask_pad = []
     tau_pad = []
-    for k2d, vis, mask, tau in zip(k2d_list, vis_list, mask_list, tau_list):
+    for k2d, vis, conf, mask, tau in zip(
+        k2d_list, vis_list, conf_list, mask_list, tau_list
+    ):
         pad = max_len - k2d.shape[0]
         if pad > 0:
             k2d = np.concatenate(
                 [k2d, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0
             )
             vis = np.concatenate([vis, np.zeros((pad, 25), dtype=np.float32)], axis=0)
+            conf = np.concatenate(
+                [conf, np.zeros((pad, 25), dtype=np.float32)], axis=0
+            )
             mask = np.concatenate([mask, np.zeros((pad,), dtype=bool)], axis=0)
             tau = np.concatenate([tau, np.zeros((pad,), dtype=np.float32)], axis=0)
         k2d_pad.append(k2d)
         vis_pad.append(vis)
+        conf_pad.append(conf)
         mask_pad.append(mask)
         tau_pad.append(tau)
 
     k2d_batch = torch.from_numpy(np.stack(k2d_pad, axis=0)).float()
     vis_batch = torch.from_numpy(np.stack(vis_pad, axis=0)).float()
+    conf_batch = torch.from_numpy(np.stack(conf_pad, axis=0)).float()
     mask_batch = torch.from_numpy(np.stack(mask_pad, axis=0))
     tau_batch = torch.from_numpy(np.stack(tau_pad, axis=0)).float()
-    return k2d_batch, vis_batch, tau_batch, mask_batch
+    return k2d_batch, vis_batch, conf_batch, tau_batch, mask_batch
+
+
+def _parse_steps(raw):
+    vals = [int(v.strip()) for v in str(raw).split(",") if v.strip()]
+    vals = [v for v in vals if v > 0]
+    if not vals:
+        return [8]
+    return vals
+
+
+def _ramp_weight(epoch, start_epoch, ramp_epochs):
+    if epoch < start_epoch:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    if epoch >= start_epoch + ramp_epochs:
+        return 1.0
+    return (epoch - start_epoch) / float(ramp_epochs)
+
+
+def _pick_solver_steps(epoch, early, mid, late, mid_epoch, late_epoch):
+    if epoch < mid_epoch:
+        pool = early
+    elif epoch < late_epoch:
+        pool = mid
+    else:
+        pool = late
+    return random.choice(pool)
+
+
+def _build_body25_to_smpl22(def_path, device):
+    with open(def_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    smpl_name_to_idx = {}
+    body_to_smpl = np.full((22,), -1, dtype=np.int64)
+    for joint in cfg.get("smpl_joints", []):
+        smpl_idx = joint.get("smpl_idx")
+        body_idx = joint.get("body25_idx")
+        name = joint.get("name")
+        if name is not None and smpl_idx is not None:
+            smpl_name_to_idx[name] = smpl_idx
+        if smpl_idx is None or smpl_idx >= 22 or body_idx is None:
+            continue
+        body_to_smpl[smpl_idx] = int(body_idx)
+    for rule in cfg.get("computed_body25", []):
+        name = rule.get("name")
+        body_idx = rule.get("body25_idx")
+        if name is None or body_idx is None:
+            continue
+        smpl_idx = smpl_name_to_idx.get(name)
+        if smpl_idx is not None and smpl_idx < 22:
+            body_to_smpl[smpl_idx] = int(body_idx)
+    idx = torch.tensor(body_to_smpl, device=device, dtype=torch.long)
+    valid = idx >= 0
+    return idx.clamp_min(0), valid
+
+
+def _ik263_to_smpl22_torch(features):
+    rot_vel = features[..., 0]
+    r_rot_ang = torch.zeros_like(rot_vel)
+    r_rot_ang[..., 1:] = rot_vel[..., :-1]
+    r_rot_ang = torch.cumsum(r_rot_ang, dim=-1)
+
+    r_rot_quat = torch.zeros(
+        rot_vel.shape + (4,), dtype=features.dtype, device=features.device
+    )
+    r_rot_quat[..., 0] = torch.cos(r_rot_ang)
+    r_rot_quat[..., 2] = torch.sin(r_rot_ang)
+
+    r_pos = torch.zeros(
+        rot_vel.shape + (3,), dtype=features.dtype, device=features.device
+    )
+    r_pos[..., 1:, 0] = features[..., :-1, 1]
+    r_pos[..., 1:, 2] = features[..., :-1, 2]
+    r_pos = qrot(qinv(r_rot_quat), r_pos)
+    r_pos = torch.cumsum(r_pos, dim=-2)
+    r_pos[..., 1] = features[..., 3]
+
+    start = 4
+    end = start + (22 - 1) * 3
+    positions = features[..., start:end].reshape(
+        features.shape[:-1] + (22 - 1, 3)
+    )
+    r_rot_rep = r_rot_quat.unsqueeze(-2).expand(
+        *r_rot_quat.shape[:-1], positions.shape[-2], 4
+    )
+    positions = qrot(qinv(r_rot_rep), positions)
+    positions[..., 0] = positions[..., 0] + r_pos[..., 0:1]
+    positions[..., 2] = positions[..., 2] + r_pos[..., 2:3]
+    return torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
+
+
+def _condition_match_loss(
+    joints22,
+    k2d_body25,
+    conf_body25,
+    tau_cond,
+    mask_cond,
+    body25_to_smpl_idx,
+    body25_to_smpl_valid,
+    eps=1e-6,
+):
+    bsz, _, _, _ = joints22.shape
+    t_len = joints22.shape[1]
+    num_cond = tau_cond.shape[1]
+    idx = body25_to_smpl_idx.view(1, 1, 22, 1).expand(bsz, num_cond, 22, 1)
+    idx2 = body25_to_smpl_idx.view(1, 1, 22).expand(bsz, num_cond, 22)
+    k2d_smpl = torch.gather(k2d_body25, 2, idx.expand(-1, -1, -1, 2))
+    conf_smpl = torch.gather(conf_body25, 2, idx2)
+    valid_joint = body25_to_smpl_valid.view(1, 1, 22).to(conf_smpl.dtype)
+    valid_frame = mask_cond.unsqueeze(-1).to(conf_smpl.dtype)
+    conf_smpl = conf_smpl * valid_joint * valid_frame
+
+    t_idx = torch.clamp(
+        torch.round(tau_cond * float(t_len - 1)).long(), min=0, max=t_len - 1
+    )
+    gather_idx = t_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 22, 3)
+    joints_cond = torch.gather(joints22, 1, gather_idx)
+    xy = joints_cond[..., :2]
+
+    s, tx, ty, wsum = _fit_weak_persp_torch(xy, k2d_smpl, conf_smpl, eps=eps)
+    pred = s.unsqueeze(-1).unsqueeze(-1) * xy
+    pred[..., 0] = pred[..., 0] + tx.unsqueeze(-1)
+    pred[..., 1] = pred[..., 1] + ty.unsqueeze(-1)
+    err = torch.linalg.norm(pred - k2d_smpl, dim=-1)
+    frame_err = (err * conf_smpl).sum(dim=-1) / (wsum + eps)
+    valid = wsum > eps
+    if valid.any():
+        return frame_err[valid].mean()
+    return joints22.new_zeros(())
+
+
+def _fit_weak_persp_torch(xy, uv, w, eps=1e-6):
+    x = xy[..., 0]
+    y = xy[..., 1]
+    u = uv[..., 0]
+    v = uv[..., 1]
+    w = w.clamp_min(0.0)
+    sw = w.sum(dim=-1)
+    sxx = (w * (x * x + y * y)).sum(dim=-1)
+    sx = (w * x).sum(dim=-1)
+    sy = (w * y).sum(dim=-1)
+    su = (w * u).sum(dim=-1)
+    sv = (w * v).sum(dim=-1)
+    sxu = (w * (x * u + y * v)).sum(dim=-1)
+    n = x.shape[0] * x.shape[1]
+    a = torch.zeros((n, 3, 3), dtype=xy.dtype, device=xy.device)
+    b = torch.zeros((n, 3), dtype=xy.dtype, device=xy.device)
+    a[:, 0, 0] = sxx.reshape(-1)
+    a[:, 0, 1] = sx.reshape(-1)
+    a[:, 0, 2] = sy.reshape(-1)
+    a[:, 1, 0] = sx.reshape(-1)
+    a[:, 1, 1] = sw.reshape(-1)
+    a[:, 2, 0] = sy.reshape(-1)
+    a[:, 2, 2] = sw.reshape(-1)
+    b[:, 0] = sxu.reshape(-1)
+    b[:, 1] = su.reshape(-1)
+    b[:, 2] = sv.reshape(-1)
+    eye = torch.eye(3, dtype=xy.dtype, device=xy.device).unsqueeze(0)
+    theta = torch.linalg.solve(a + eps * eye, b)
+    theta = theta.view(x.shape[0], x.shape[1], 3)
+    s = theta[..., 0]
+    tx = theta[..., 1]
+    ty = theta[..., 2]
+    return s, tx, ty, sw
 
 
 def _restore_checkpoint(path, flow, optimizer, ema, device):

@@ -146,7 +146,7 @@ def _weighted_l2_error(pred, target, w, eps=1e-6):
 def _condition_error(
     joints3d,
     k2d,
-    vis,
+    conf,
     tau_cond,
     fps,
     slack_seconds,
@@ -168,23 +168,23 @@ def _condition_error(
     if cam_mode == "fixed":
         first = t_idx[0]
         xy = body25[first, :, :2]
-        mask = np.isfinite(xy).all(axis=1) & (vis[0] > 0)
-        cam_fixed = _fit_weak_persp(xy[mask], k2d[0][mask], vis[0][mask])
+        mask = np.isfinite(xy).all(axis=1) & (conf[0] > 0)
+        cam_fixed = _fit_weak_persp(xy[mask], k2d[0][mask], conf[0][mask])
         if cam_fixed is None:
             cam_fixed = (1.0, 0.0, 0.0)
 
     for i, t0 in enumerate(t_idx):
         xy0 = body25[t0, :, :2]
-        mask0 = np.isfinite(xy0).all(axis=1) & (vis[i] > 0)
+        mask0 = np.isfinite(xy0).all(axis=1) & (conf[i] > 0)
         if mask0.any():
             if cam_mode == "fixed":
                 cam0 = cam_fixed
             else:
-                cam0 = _fit_weak_persp(xy0[mask0], k2d[i][mask0], vis[i][mask0])
+                cam0 = _fit_weak_persp(xy0[mask0], k2d[i][mask0], conf[i][mask0])
                 if cam0 is None:
                     cam0 = (1.0, 0.0, 0.0)
             proj0 = _project_points(xy0[mask0], cam0)
-            strict_err.append(_weighted_l2_error(proj0, k2d[i][mask0], vis[i][mask0]))
+            strict_err.append(_weighted_l2_error(proj0, k2d[i][mask0], conf[i][mask0]))
 
         if slack <= 0:
             candidates = [t0]
@@ -196,17 +196,17 @@ def _condition_error(
         best_dt = 0
         for t in candidates:
             xy = body25[t, :, :2]
-            mask = np.isfinite(xy).all(axis=1) & (vis[i] > 0)
+            mask = np.isfinite(xy).all(axis=1) & (conf[i] > 0)
             if not mask.any():
                 continue
             if cam_mode == "fixed":
                 cam = cam_fixed
             else:
-                cam = _fit_weak_persp(xy[mask], k2d[i][mask], vis[i][mask])
+                cam = _fit_weak_persp(xy[mask], k2d[i][mask], conf[i][mask])
                 if cam is None:
                     cam = (1.0, 0.0, 0.0)
             proj = _project_points(xy[mask], cam)
-            err = _weighted_l2_error(proj, k2d[i][mask], vis[i][mask])
+            err = _weighted_l2_error(proj, k2d[i][mask], conf[i][mask])
             if best_err is None or err < best_err:
                 best_err = err
                 best_dt = t - t0
@@ -327,22 +327,24 @@ def _load_cond_batch(
     rng = rng or np.random
     k2d_list = []
     vis_list = []
+    conf_list = []
     mask_list = []
     tau_list = []
     idx_list = []
     for meta in metas:
         path = meta["path"]
         if path.endswith(".pkl"):
-            k2d, vis = load_aist_openpose(
+            k2d, vis, conf = load_aist_openpose(
                 path,
                 aist_openpose_dir,
                 src_fps=aist_fps,
                 target_fps=target_fps,
                 cache_root=cache_root,
                 camera=meta.get("camera"),
+                return_conf=True,
             )
         else:
-            k2d, vis = load_mvh_openpose(
+            k2d, vis, conf = load_mvh_openpose(
                 path,
                 mv_root,
                 mvh_openpose_root,
@@ -351,15 +353,18 @@ def _load_cond_batch(
                 target_fps=target_fps,
                 cache_root=cache_root,
                 camera=meta.get("camera"),
+                return_conf=True,
             )
         if k2d is None:
             k2d = np.zeros((seq_len, 25, 2), dtype=np.float32)
             vis = np.zeros((seq_len, 25), dtype=np.float32)
+            conf = np.zeros((seq_len, 25), dtype=np.float32)
         start = meta.get("start", 0)
         orig_len = meta.get("orig_len", k2d.shape[0])
         if orig_len >= seq_len:
             k2d = k2d[start : start + seq_len]
             vis = vis[start : start + seq_len]
+            conf = conf[start : start + seq_len]
         else:
             pad_len = seq_len - orig_len
             k2d = np.concatenate(
@@ -367,6 +372,9 @@ def _load_cond_batch(
             )
             vis = np.concatenate(
                 [vis, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
+            )
+            conf = np.concatenate(
+                [conf, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
             )
         t_len = k2d.shape[0]
         k_frames = cond_frames_min
@@ -377,15 +385,18 @@ def _load_cond_batch(
             idx = np.unique(np.round(idx).astype(int))
         k2d_sparse = k2d[idx]
         vis_sparse = vis[idx]
+        conf_sparse = conf[idx]
         if cond_drop_prob > 0:
             drop = rng.rand(*vis_sparse.shape) < cond_drop_prob
             vis_sparse = vis_sparse * (~drop)
+            conf_sparse = conf_sparse * (~drop)
             k2d_sparse = k2d_sparse * vis_sparse[..., None]
         mask_cond = np.ones((k2d_sparse.shape[0],), dtype=bool)
         tau_cond = idx.astype(np.float32) / max(t_len - 1, 1)
 
         k2d_list.append(k2d_sparse)
         vis_list.append(vis_sparse)
+        conf_list.append(conf_sparse)
         mask_list.append(mask_cond)
         tau_list.append(tau_cond)
         idx_list.append(idx)
@@ -393,27 +404,44 @@ def _load_cond_batch(
     max_len = max(k.shape[0] for k in k2d_list)
     k2d_pad = []
     vis_pad = []
+    conf_pad = []
     mask_pad = []
     tau_pad = []
-    for k2d, vis, mask, tau in zip(k2d_list, vis_list, mask_list, tau_list):
+    for k2d, vis, conf, mask, tau in zip(
+        k2d_list, vis_list, conf_list, mask_list, tau_list
+    ):
         pad = max_len - k2d.shape[0]
         if pad > 0:
             k2d = np.concatenate(
                 [k2d, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0
             )
             vis = np.concatenate([vis, np.zeros((pad, 25), dtype=np.float32)], axis=0)
+            conf = np.concatenate(
+                [conf, np.zeros((pad, 25), dtype=np.float32)], axis=0
+            )
             mask = np.concatenate([mask, np.zeros((pad,), dtype=bool)], axis=0)
             tau = np.concatenate([tau, np.zeros((pad,), dtype=np.float32)], axis=0)
         k2d_pad.append(k2d)
         vis_pad.append(vis)
+        conf_pad.append(conf)
         mask_pad.append(mask)
         tau_pad.append(tau)
 
     k2d_batch = torch.from_numpy(np.stack(k2d_pad, axis=0)).float()
     vis_batch = torch.from_numpy(np.stack(vis_pad, axis=0)).float()
+    conf_batch = torch.from_numpy(np.stack(conf_pad, axis=0)).float()
     mask_batch = torch.from_numpy(np.stack(mask_pad, axis=0))
     tau_batch = torch.from_numpy(np.stack(tau_pad, axis=0)).float()
-    return k2d_batch, vis_batch, tau_batch, mask_batch, idx_list, k2d_list, vis_list
+    return (
+        k2d_batch,
+        vis_batch,
+        conf_batch,
+        tau_batch,
+        mask_batch,
+        idx_list,
+        k2d_list,
+        vis_list,
+    )
 
 
 def _generate_batch(
@@ -543,10 +571,20 @@ def evaluate_dataset(
         if "k2d" in batch:
             k2d_batch = batch["k2d"].to(device)
             vis_batch = batch["vis"].to(device)
+            conf_batch = batch.get("conf", batch["vis"]).to(device)
             tau_cond = batch["tau_cond"].to(device)
             mask_cond = batch["mask_cond"].to(device)
         else:
-            k2d_batch, vis_batch, tau_cond, mask_cond, idx_list, k2d_list, vis_list = _load_cond_batch(
+            (
+                k2d_batch,
+                vis_batch,
+                conf_batch,
+                tau_cond,
+                mask_cond,
+                idx_list,
+                k2d_list,
+                vis_list,
+            ) = _load_cond_batch(
                 metas,
                 openpose_cfg["aist_dir"],
                 openpose_cfg["mvh_root"],
@@ -564,6 +602,7 @@ def evaluate_dataset(
             )
             k2d_batch = k2d_batch.to(device)
             vis_batch = vis_batch.to(device)
+            conf_batch = conf_batch.to(device)
             tau_cond = tau_cond.to(device)
             mask_cond = mask_cond.to(device)
         if skip_empty_cond and k2d_batch.shape[1] == 0:
@@ -608,18 +647,18 @@ def evaluate_dataset(
         joints = joints if isinstance(joints, np.ndarray) else joints
 
         k2d_np = k2d_batch.cpu().numpy()
-        vis_np = vis_batch.cpu().numpy()
+        conf_np = conf_batch.cpu().numpy()
         tau_np = tau_cond.cpu().numpy()
         mask_np = mask_cond.cpu().numpy()
         for i in range(batch_size):
             valid_mask = mask_np[i].astype(bool)
             k2d_i = k2d_np[i][valid_mask]
-            vis_i = vis_np[i][valid_mask]
+            conf_i = conf_np[i][valid_mask]
             tau_i = tau_np[i][valid_mask]
             err = _condition_error(
                 joints[i],
                 k2d_i,
-                vis_i,
+                conf_i,
                 tau_i,
                 cfg.fps,
                 cfg.slack_seconds,

@@ -141,20 +141,23 @@ class AISTDataset(Dataset):
                 raise ValueError("openpose_dir is required when include_cond=True")
             from flowmimic.src.data.openpose import load_aist_openpose
 
-            k2d, vis = load_aist_openpose(
+            k2d, vis, conf = load_aist_openpose(
                 path,
                 self.openpose_dir,
                 src_fps=self.src_fps,
                 target_fps=self.target_fps,
                 cache_root=self.cond_cache_root,
                 camera=camera,
+                return_conf=True,
             )
             if k2d is None:
                 k2d = np.zeros((self.seq_len, 25, 2), dtype=np.float32)
                 vis = np.zeros((self.seq_len, 25), dtype=np.float32)
+                conf = np.zeros((self.seq_len, 25), dtype=np.float32)
             if orig_len >= self.seq_len:
                 k2d = k2d[start : start + self.seq_len]
                 vis = vis[start : start + self.seq_len]
+                conf = conf[start : start + self.seq_len]
             else:
                 pad_len = self.seq_len - orig_len
                 k2d = np.concatenate(
@@ -162,6 +165,9 @@ class AISTDataset(Dataset):
                 )
                 vis = np.concatenate(
                     [vis, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
+                )
+                conf = np.concatenate(
+                    [conf, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
                 )
             t_len = k2d.shape[0]
             k_frames = self.cond_frames_min or 1
@@ -172,10 +178,12 @@ class AISTDataset(Dataset):
                 idxs = np.unique(np.round(idxs).astype(int))
             k2d_sparse = k2d[idxs]
             vis_sparse = vis[idxs]
+            conf_sparse = conf[idxs]
             valid_len = k2d_sparse.shape[0]
             if self.cond_drop_prob > 0:
                 drop = np.random.rand(*vis_sparse.shape) < self.cond_drop_prob
                 vis_sparse = vis_sparse * (~drop)
+                conf_sparse = conf_sparse * (~drop)
                 k2d_sparse = k2d_sparse * vis_sparse[..., None]
             pad = k_frames - valid_len
             if pad > 0:
@@ -184,6 +192,9 @@ class AISTDataset(Dataset):
                 )
                 vis_sparse = np.concatenate(
                     [vis_sparse, np.zeros((pad, 25), dtype=np.float32)], axis=0
+                )
+                conf_sparse = np.concatenate(
+                    [conf_sparse, np.zeros((pad, 25), dtype=np.float32)], axis=0
                 )
                 mask_cond = np.concatenate(
                     [np.ones(valid_len, dtype=bool), np.zeros(pad, dtype=bool)]
@@ -199,6 +210,7 @@ class AISTDataset(Dataset):
                 tau_cond = idxs.astype(np.float32) / max(t_len - 1, 1)
             sample["k2d"] = torch.from_numpy(k2d_sparse).float()
             sample["vis"] = torch.from_numpy(vis_sparse).float()
+            sample["conf"] = torch.from_numpy(conf_sparse).float()
             sample["tau_cond"] = torch.from_numpy(tau_cond).float()
             sample["mask_cond"] = torch.from_numpy(mask_cond)
         return sample

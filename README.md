@@ -90,7 +90,8 @@ main.py
   - Root center by pelvis at t=0 (index 8)
   - FPS unify to `target_fps` (AIST 60→30 via stride, MVH 5→30 via PCHIP)
   - Conf upsample via geometric-mean interpolation
-  - vis_mask = (conf > 0)
+  - vis_mask = (conf >= 0.4)
+  - cache stores both `vis` and `conf` (`*_vth40_conf.npz`)
 - Additional normalization in `flowmimic/src/model/flow/cond_encoder_2d.py`:
   - bbox scale normalization
   - per-joint mean/std (training stats in `data/openpose_stats.npz`)
@@ -221,5 +222,6 @@ Main config: `flowmimic/src/config/config.json`
 
 - MVH has NaNs in raw joints; those sequences are skipped in caching/stats.
 - Flow training/eval now load sparse 2D conditions in the dataset (parallel via DataLoader).
-  - `AISTDataset`/`MVHumanNetDataset` accept `include_cond=True` and return `k2d`, `vis`, `tau_cond`, `mask_cond`.
+  - `AISTDataset`/`MVHumanNetDataset` accept `include_cond=True` and return `k2d`, `vis`, `conf`, `tau_cond`, `mask_cond`.
   - Sparse frames are evenly spaced with `cond_frames_min=cond_frames_max=7` (config).
+  - Non-kinematic flow training includes solver-in-training regularization (confidence-weighted condition matching + SMPL22 smooth losses) with step/frequency/lambda schedules via `train_flow.py` args.

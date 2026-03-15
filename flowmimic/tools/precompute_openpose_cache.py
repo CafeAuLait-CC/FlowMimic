@@ -17,7 +17,12 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from flowmimic.src.config.config import load_config
-from flowmimic.src.data.openpose import load_aist_openpose, load_openpose_npy
+from flowmimic.src.data.openpose import (
+    VIS_CONF_THRESHOLD,
+    _aist_cache_path,
+    _mvh_cache_path,
+    load_openpose_npy,
+)
 
 
 def _init_worker():
@@ -42,7 +47,7 @@ def _cache_aist(args):
     name = os.path.splitext(os.path.basename(pkl_path))[0]
     missing = False
     for cam in ["01", "02", "08", "09"]:
-        out_path = os.path.join(cache_root, "aist", f"{name}_c{cam}.npz")
+        out_path = _aist_cache_path(cache_root, pkl_path, camera=cam)
         if os.path.exists(out_path) and not overwrite:
             continue
         name_cam = name.replace("_cAll_", f"_c{cam}_")
@@ -50,9 +55,20 @@ def _cache_aist(args):
         if not os.path.exists(in_path):
             missing = True
             continue
-        coords, vis = load_openpose_npy(in_path, src_fps=aist_fps, target_fps=target_fps)
+        coords, vis, conf = load_openpose_npy(
+            in_path,
+            src_fps=aist_fps,
+            target_fps=target_fps,
+            conf_threshold=VIS_CONF_THRESHOLD,
+            return_conf=True,
+        )
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        np.savez(out_path, coords=coords.astype(np.float32), vis=vis.astype(np.float32))
+        np.savez(
+            out_path,
+            coords=coords.astype(np.float32),
+            vis=vis.astype(np.float32),
+            conf=conf.astype(np.float32),
+        )
     if missing:
         return ("aist", pkl_path)
 
@@ -66,16 +82,27 @@ def _cache_mvh(args):
         return ("mvh", seq_dir)
     part, motion = parts[0], parts[1]
     for cam in cameras:
-        out_path = os.path.join(cache_root, "mvh", rel, "openpose", f"{cam}.npz")
+        out_path = _mvh_cache_path(cache_root, mv_root, seq_dir, cam)
         if os.path.exists(out_path) and not overwrite:
             continue
         in_path = os.path.join(openpose_root, part, motion, f"{cam}_2d_body25.npy")
         if not os.path.exists(in_path):
             missing = True
             continue
-        coords, vis = load_openpose_npy(in_path, src_fps=mvh_fps, target_fps=target_fps)
+        coords, vis, conf = load_openpose_npy(
+            in_path,
+            src_fps=mvh_fps,
+            target_fps=target_fps,
+            conf_threshold=VIS_CONF_THRESHOLD,
+            return_conf=True,
+        )
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        np.savez(out_path, coords=coords.astype(np.float32), vis=vis.astype(np.float32))
+        np.savez(
+            out_path,
+            coords=coords.astype(np.float32),
+            vis=vis.astype(np.float32),
+            conf=conf.astype(np.float32),
+        )
     if missing:
         return ("mvh", seq_dir)
 

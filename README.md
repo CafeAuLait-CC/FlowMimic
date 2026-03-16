@@ -91,7 +91,7 @@ main.py
   - FPS unify to `target_fps` (AIST 60→30 via stride, MVH 5→30 via PCHIP)
   - Conf upsample via geometric-mean interpolation
   - vis_mask = (conf >= 0.4)
-  - cache stores both `vis` and `conf` (`*_vth40_conf.npz`)
+  - cache stores both `vis` and `conf` (`*_vth40.npz`)
 - Additional normalization in `flowmimic/src/model/flow/cond_encoder_2d.py`:
   - bbox scale normalization
   - per-joint mean/std (training stats in `data/openpose_stats.npz`)

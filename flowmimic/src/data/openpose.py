@@ -6,7 +6,7 @@ import torch
 from flowmimic.src.model.flow.cond_encoder_2d import normalize_keypoints
 
 VIS_CONF_THRESHOLD = 0.4
-_CACHE_TAG = "vth40_conf"
+_CACHE_TAG = "vth40"
 
 
 def _resample_to_fps(values, src_fps, dst_fps, mode="pchip"):

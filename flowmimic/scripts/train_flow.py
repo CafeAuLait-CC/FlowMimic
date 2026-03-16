@@ -74,8 +74,8 @@ def main():
     parser.add_argument("--smooth-ramp-epochs", type=int, default=10)
     parser.add_argument("--smooth-lambda-acc", type=float, default=1e-3)
     parser.add_argument("--smooth-lambda-jerk", type=float, default=1e-5)
-    parser.add_argument("--solver-reg-every", type=int, default=4)
-    parser.add_argument("--solver-reg-solver", type=str, default="heun")
+    parser.add_argument("--solver-reg-every", type=int, default=8)
+    parser.add_argument("--solver-reg-solver", type=str, default="euler")
     parser.add_argument("--solver-reg-start-epoch", type=int, default=30)
     parser.add_argument("--cond-ramp-epochs", type=int, default=10)
     parser.add_argument("--smooth-reg-start-epoch", type=int, default=40)
@@ -83,9 +83,9 @@ def main():
     parser.add_argument("--lambda-cond", type=float, default=0.01)
     parser.add_argument("--lambda-acc", type=float, default=1e-4)
     parser.add_argument("--lambda-jerk", type=float, default=1e-6)
-    parser.add_argument("--solver-steps-early", type=str, default="32")
-    parser.add_argument("--solver-steps-mid", type=str, default="16,32")
-    parser.add_argument("--solver-steps-late", type=str, default="8,16,4")
+    parser.add_argument("--solver-steps-early", type=str, default="16")
+    parser.add_argument("--solver-steps-mid", type=str, default="8,16")
+    parser.add_argument("--solver-steps-late", type=str, default="4,8,2")
     parser.add_argument("--solver-mid-epoch", type=int, default=80)
     parser.add_argument("--solver-late-epoch", type=int, default=160)
     parser.add_argument("--wandb-project", type=str, default="FlowMimic")
@@ -637,7 +637,10 @@ def main():
                     mask_cond = mask_cond.to(device)
                     if not torch.isfinite(k2d_batch).all():
                         if args.debug:
-                            _debug_log("Warning: non-finite keypoints batch; skipping", epoch + 1)
+                            _debug_log(
+                                "Warning: non-finite keypoints batch; skipping",
+                                epoch + 1,
+                            )
                         bad_local = True
             if not bad_local:
                 g2d, mem, _vis = flow_model.cond_encoder(
@@ -650,7 +653,10 @@ def main():
                 )
                 if not torch.isfinite(g2d).all() or not torch.isfinite(mem).all():
                     if args.debug:
-                        _debug_log("Warning: non-finite cond encoder output; skipping", epoch + 1)
+                        _debug_log(
+                            "Warning: non-finite cond encoder output; skipping",
+                            epoch + 1,
+                        )
                     bad_local = True
             if not bad_local:
                 use_teacher = False
@@ -668,7 +674,10 @@ def main():
                         z_data = teacher.generate_x1_hat(x0, cond_batch)
                         if not torch.isfinite(z_data).all():
                             if args.debug:
-                                _debug_log("Warning: non-finite teacher target; skipping", epoch + 1)
+                                _debug_log(
+                                    "Warning: non-finite teacher target; skipping",
+                                    epoch + 1,
+                                )
                             bad_local = True
 
             if not bad_local:
@@ -683,7 +692,9 @@ def main():
                 target = z_data - x0
                 if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
                     if args.debug:
-                        _debug_log("Warning: non-finite v_pred/target; skipping", epoch + 1)
+                        _debug_log(
+                            "Warning: non-finite v_pred/target; skipping", epoch + 1
+                        )
                     bad_local = True
 
             if not bad_local:
@@ -719,6 +730,7 @@ def main():
                         cond_batch,
                         num_steps=solver_steps,
                         method=solver_reg_solver,
+                        use_activation_checkpoint=True,
                     )
                     if latent_mean is not None and latent_std is not None:
                         z_reg = z_reg * (latent_std + 1e-6) + latent_mean
@@ -833,15 +845,32 @@ def main():
                 s.item() for s in stats[5:]
             ]
         if is_main:
+            reg_enabled_epoch = epoch >= solver_reg_start_epoch and (
+                w_cond_epoch > 0.0 or w_smooth_epoch > 0.0
+            )
+            active_count = (
+                max(1, total_count // max(1, solver_reg_every))
+                if reg_enabled_epoch and total_count > 0
+                else 0
+            )
+            smooth_acc_avg = (
+                smooth_acc_sum / active_count if active_count > 0 else 0.0
+            )
+            smooth_jerk_avg = (
+                smooth_jerk_sum / active_count if active_count > 0 else 0.0
+            )
+            cond_match_avg = (
+                cond_match_sum / active_count if active_count > 0 else 0.0
+            )
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )
             print(
                 "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f} cond_match={:.6f}".format(
                     epoch + 1,
-                    smooth_acc_sum / max(total_count, 1),
-                    smooth_jerk_sum / max(total_count, 1),
-                    cond_match_sum / max(total_count, 1),
+                    smooth_acc_avg,
+                    smooth_jerk_avg,
+                    cond_match_avg,
                 )
             )
             do_eval = (
@@ -858,9 +887,9 @@ def main():
                         "timing/cond": t_cond / max(total_count, 1),
                         "timing/forward": t_forward / max(total_count, 1),
                         "timing/backward": t_backward / max(total_count, 1),
-                        "loss/smooth_acc": smooth_acc_sum / max(total_count, 1),
-                        "loss/smooth_jerk": smooth_jerk_sum / max(total_count, 1),
-                        "loss/cond_match": cond_match_sum / max(total_count, 1),
+                        "loss/smooth_acc": smooth_acc_avg,
+                        "loss/smooth_jerk": smooth_jerk_avg,
+                        "loss/cond_match": cond_match_avg,
                         "schedule/w_cond_epoch": w_cond_epoch,
                         "schedule/w_smooth_epoch": w_smooth_epoch,
                     },
@@ -1152,9 +1181,7 @@ def _load_cond_batch(
                 [k2d, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0
             )
             vis = np.concatenate([vis, np.zeros((pad, 25), dtype=np.float32)], axis=0)
-            conf = np.concatenate(
-                [conf, np.zeros((pad, 25), dtype=np.float32)], axis=0
-            )
+            conf = np.concatenate([conf, np.zeros((pad, 25), dtype=np.float32)], axis=0)
             mask = np.concatenate([mask, np.zeros((pad,), dtype=bool)], axis=0)
             tau = np.concatenate([tau, np.zeros((pad,), dtype=np.float32)], axis=0)
         k2d_pad.append(k2d)
@@ -1249,9 +1276,7 @@ def _ik263_to_smpl22_torch(features):
 
     start = 4
     end = start + (22 - 1) * 3
-    positions = features[..., start:end].reshape(
-        features.shape[:-1] + (22 - 1, 3)
-    )
+    positions = features[..., start:end].reshape(features.shape[:-1] + (22 - 1, 3))
     r_rot_rep = r_rot_quat.unsqueeze(-2).expand(
         *r_rot_quat.shape[:-1], positions.shape[-2], 4
     )

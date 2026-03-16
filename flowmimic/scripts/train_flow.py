@@ -76,9 +76,9 @@ def main():
     parser.add_argument("--solver-cond-ramp-epochs", type=int, default=10)
     parser.add_argument("--solver-smooth-start-epoch", type=int, default=40)
     parser.add_argument("--solver-smooth-ramp-epochs", type=int, default=10)
-    parser.add_argument("--lambda-cond", type=float, default=0.01)
-    parser.add_argument("--lambda-acc", type=float, default=1e-4)
-    parser.add_argument("--lambda-jerk", type=float, default=1e-6)
+    parser.add_argument("--lambda-cond", type=float, default=1e-3)
+    parser.add_argument("--lambda-acc", type=float, default=5e-2)
+    parser.add_argument("--lambda-jerk", type=float, default=5e-4)
     parser.add_argument("--solver-steps-early", type=str, default="16")
     parser.add_argument("--solver-steps-mid", type=str, default="8,16")
     parser.add_argument("--solver-steps-late", type=str, default="4,8,2")
@@ -681,9 +681,8 @@ def main():
                 smooth_acc = None
                 smooth_jerk = None
                 cond_match_loss = None
-                do_solver_reg = (
-                    (global_step % solver_every == 0)
-                    and (w_cond_epoch > 0.0 or w_smooth_epoch > 0.0)
+                do_solver_reg = (global_step % solver_every == 0) and (
+                    w_cond_epoch > 0.0 or w_smooth_epoch > 0.0
                 )
                 if do_solver_reg:
                     solver_steps = _pick_solver_steps(
@@ -827,15 +826,11 @@ def main():
                 if reg_enabled_epoch and total_count > 0
                 else 0
             )
-            smooth_acc_avg = (
-                smooth_acc_sum / active_count if active_count > 0 else 0.0
-            )
+            smooth_acc_avg = smooth_acc_sum / active_count if active_count > 0 else 0.0
             smooth_jerk_avg = (
                 smooth_jerk_sum / active_count if active_count > 0 else 0.0
             )
-            cond_match_avg = (
-                cond_match_sum / active_count if active_count > 0 else 0.0
-            )
+            cond_match_avg = cond_match_sum / active_count if active_count > 0 else 0.0
             print(
                 f"Epoch {epoch + 1} avg_velocity_mse={total_loss / max(total_count, 1):.6f}"
             )

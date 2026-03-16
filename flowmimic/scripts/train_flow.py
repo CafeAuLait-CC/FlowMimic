@@ -70,16 +70,12 @@ def main():
     parser.add_argument("--reset-optimizer", action="store_true")
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--smooth-warmup-epochs", type=int, default=0)
-    parser.add_argument("--smooth-ramp-epochs", type=int, default=10)
-    parser.add_argument("--smooth-lambda-acc", type=float, default=1e-3)
-    parser.add_argument("--smooth-lambda-jerk", type=float, default=1e-5)
-    parser.add_argument("--solver-reg-every", type=int, default=8)
-    parser.add_argument("--solver-reg-solver", type=str, default="euler")
-    parser.add_argument("--solver-reg-start-epoch", type=int, default=30)
-    parser.add_argument("--cond-ramp-epochs", type=int, default=10)
-    parser.add_argument("--smooth-reg-start-epoch", type=int, default=40)
-    parser.add_argument("--smooth-reg-ramp-epochs", type=int, default=10)
+    parser.add_argument("--solver-every", type=int, default=8)
+    parser.add_argument("--solver-method", type=str, default="euler")
+    parser.add_argument("--solver-cond-start-epoch", type=int, default=30)
+    parser.add_argument("--solver-cond-ramp-epochs", type=int, default=10)
+    parser.add_argument("--solver-smooth-start-epoch", type=int, default=40)
+    parser.add_argument("--solver-smooth-ramp-epochs", type=int, default=10)
     parser.add_argument("--lambda-cond", type=float, default=0.01)
     parser.add_argument("--lambda-acc", type=float, default=1e-4)
     parser.add_argument("--lambda-jerk", type=float, default=1e-6)
@@ -207,29 +203,18 @@ def main():
     cond_frames_min = flow_cfg.get("cond_frames_min", 2)
     cond_frames_max = flow_cfg.get("cond_frames_max", 10)
     cond_drop_prob = flow_cfg.get("cond_drop_prob", 0.2)
-    smooth_warmup_epochs = args.smooth_warmup_epochs
-    smooth_ramp_epochs = args.smooth_ramp_epochs
-    smooth_lambda_acc = args.smooth_lambda_acc
-    smooth_lambda_jerk = args.smooth_lambda_jerk
-    solver_reg_every = max(1, args.solver_reg_every)
-    solver_reg_solver = args.solver_reg_solver
-    solver_reg_start_epoch = args.solver_reg_start_epoch
-    cond_ramp_epochs = args.cond_ramp_epochs
-    smooth_reg_start_epoch = args.smooth_reg_start_epoch
-    smooth_reg_ramp_epochs = args.smooth_reg_ramp_epochs
+    solver_every = max(1, args.solver_every)
+    solver_method = args.solver_method
+    solver_cond_start_epoch = args.solver_cond_start_epoch
+    solver_cond_ramp_epochs = args.solver_cond_ramp_epochs
+    solver_smooth_start_epoch = args.solver_smooth_start_epoch
+    solver_smooth_ramp_epochs = args.solver_smooth_ramp_epochs
     lambda_cond = args.lambda_cond
     lambda_acc = args.lambda_acc
     lambda_jerk = args.lambda_jerk
     solver_steps_early = _parse_steps(args.solver_steps_early)
     solver_steps_mid = _parse_steps(args.solver_steps_mid)
     solver_steps_late = _parse_steps(args.solver_steps_late)
-    smooth_slices = [
-        ("root_yaw_vel", 0, 1, 0.5),
-        ("root_xz_vel", 1, 3, 0.5),
-        ("root_y", 3, 4, 0.3),
-        ("ric", 4, 67, 1.0),
-        ("local_vel", 193, 259, 1.0),
-    ]
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
     save_every_steps = args.save_every_steps or flow_cfg.get("save_every_steps", 0)
     save_every_epochs = args.save_every_epochs
@@ -532,20 +517,12 @@ def main():
     global_step = 0
     for epoch in range(start_epoch, args.epochs):
         flow.train()
-        if smooth_warmup_epochs > 0 and epoch < smooth_warmup_epochs:
-            w_smooth_legacy = 0.0
-        elif (
-            smooth_ramp_epochs > 0 and epoch < smooth_warmup_epochs + smooth_ramp_epochs
-        ):
-            w_smooth_legacy = (epoch - smooth_warmup_epochs) / float(smooth_ramp_epochs)
-        else:
-            w_smooth_legacy = 1.0
-        w_cond_epoch = _ramp_weight(epoch, solver_reg_start_epoch, cond_ramp_epochs)
-        w_smooth_epoch = _ramp_weight(
-            epoch, smooth_reg_start_epoch, smooth_reg_ramp_epochs
+        w_cond_epoch = _ramp_weight(
+            epoch, solver_cond_start_epoch, solver_cond_ramp_epochs
         )
-        if smooth_lambda_acc > 0.0 or smooth_lambda_jerk > 0.0:
-            w_smooth_epoch = max(w_smooth_epoch, w_smooth_legacy)
+        w_smooth_epoch = _ramp_weight(
+            epoch, solver_smooth_start_epoch, solver_smooth_ramp_epochs
+        )
         total_loss = 0.0
         total_count = 0
         smooth_acc_sum = 0.0
@@ -705,8 +682,7 @@ def main():
                 smooth_jerk = None
                 cond_match_loss = None
                 do_solver_reg = (
-                    epoch >= solver_reg_start_epoch
-                    and (global_step % solver_reg_every == 0)
+                    (global_step % solver_every == 0)
                     and (w_cond_epoch > 0.0 or w_smooth_epoch > 0.0)
                 )
                 if do_solver_reg:
@@ -729,7 +705,7 @@ def main():
                         x0,
                         cond_batch,
                         num_steps=solver_steps,
-                        method=solver_reg_solver,
+                        method=solver_method,
                         use_activation_checkpoint=True,
                     )
                     if latent_mean is not None and latent_std is not None:
@@ -845,11 +821,9 @@ def main():
                 s.item() for s in stats[5:]
             ]
         if is_main:
-            reg_enabled_epoch = epoch >= solver_reg_start_epoch and (
-                w_cond_epoch > 0.0 or w_smooth_epoch > 0.0
-            )
+            reg_enabled_epoch = w_cond_epoch > 0.0 or w_smooth_epoch > 0.0
             active_count = (
-                max(1, total_count // max(1, solver_reg_every))
+                max(1, total_count // max(1, solver_every))
                 if reg_enabled_epoch and total_count > 0
                 else 0
             )

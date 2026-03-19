@@ -470,6 +470,17 @@ def _generate_batch(
     t_start = time.perf_counter()
     t_flow_start = time.perf_counter()
     with torch.inference_mode():
+        if mask_cond is not None:
+            empty = mask_cond.sum(dim=1) == 0
+            if empty.any() and k2d_batch.shape[1] > 0:
+                k2d_batch = k2d_batch.clone()
+                vis_batch = vis_batch.clone()
+                tau_cond = tau_cond.clone()
+                mask_cond = mask_cond.clone()
+                k2d_batch[empty, 0] = 0.0
+                vis_batch[empty, 0] = 0.0
+                tau_cond[empty, 0] = 0.0
+                mask_cond[empty, 0] = True
         seq_len = motion.shape[1]
         tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
         x0 = torch.randn(motion.shape[0], seq_len, d_z, device=device)
@@ -569,11 +580,11 @@ def evaluate_dataset(
             batch_size = keep
 
         if "k2d" in batch:
-            k2d_batch = batch["k2d"].to(device)
-            vis_batch = batch["vis"].to(device)
-            conf_batch = batch.get("conf", batch["vis"]).to(device)
-            tau_cond = batch["tau_cond"].to(device)
-            mask_cond = batch["mask_cond"].to(device)
+            k2d_batch = batch["k2d"][:batch_size].to(device)
+            vis_batch = batch["vis"][:batch_size].to(device)
+            conf_batch = batch.get("conf", batch["vis"])[:batch_size].to(device)
+            tau_cond = batch["tau_cond"][:batch_size].to(device)
+            mask_cond = batch["mask_cond"][:batch_size].to(device)
         else:
             (
                 k2d_batch,

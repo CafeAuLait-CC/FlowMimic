@@ -24,6 +24,10 @@ warnings.filterwarnings(
 
 from flowmimic.src.config.config import load_config
 from flowmimic.src.data.openpose import load_aist_openpose, load_mvh_openpose
+from flowmimic.src.metrics import (
+    T2MMotionFeatureExtractor,
+    summarize_motion_feature_metrics,
+)
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
@@ -269,43 +273,27 @@ def _smoothness(joints, fps):
     }
 
 
-def _feature_from_mu(mu):
-    return mu.mean(dim=1).cpu().numpy()
-
-
-def _fid(feats_gen, feats_ref):
-    mu_g = np.mean(feats_gen, axis=0)
-    mu_r = np.mean(feats_ref, axis=0)
-    cov_g = np.cov(feats_gen, rowvar=False)
-    cov_r = np.cov(feats_ref, rowvar=False)
-    diff = mu_g - mu_r
-    try:
-        from scipy.linalg import sqrtm
-    except ImportError:
-        raise ImportError("scipy is required for FID; install scipy")
-    covmean = sqrtm(cov_g @ cov_r)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    return float(diff.dot(diff) + np.trace(cov_g + cov_r - 2 * covmean))
-
-
-def _mmd_rbf(feats_gen, feats_ref):
-    feats = np.concatenate([feats_gen, feats_ref], axis=0)
-    diffs = feats[:, None, :] - feats[None, :, :]
-    dists = np.sqrt((diffs**2).sum(axis=-1))
-    sigma = np.median(dists)
-    sigma = max(sigma, 1e-6)
-    def _kernel(x, y):
-        return np.exp(-np.sum((x - y) ** 2, axis=-1) / (2 * sigma**2))
-    xx = _kernel(feats_gen[:, None, :], feats_gen[None, :, :])
-    yy = _kernel(feats_ref[:, None, :], feats_ref[None, :, :])
-    xy = _kernel(feats_gen[:, None, :], feats_ref[None, :, :])
-    m = feats_gen.shape[0]
-    n = feats_ref.shape[0]
-    mmd = (xx.sum() - np.trace(xx)) / (m * (m - 1)) + (yy.sum() - np.trace(yy)) / (
-        n * (n - 1)
-    ) - 2 * xy.mean()
-    return float(mmd)
+def _extract_t2m_features(extractor, motion_np, lengths, device, chunk=64):
+    feats = []
+    total = motion_np.shape[0]
+    start = 0
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    while start < total:
+        end = min(total, start + chunk)
+        if isinstance(motion_np, np.ndarray):
+            motion_t = torch.from_numpy(motion_np[start:end]).to(device)
+        else:
+            motion_t = motion_np[start:end].to(device)
+        if isinstance(lengths, np.ndarray):
+            lengths_t = torch.from_numpy(lengths[start:end]).to(device=device, dtype=torch.long)
+        else:
+            lengths_t = lengths[start:end].to(device=device, dtype=torch.long)
+        with torch.inference_mode():
+            feat = extractor.encode(motion_t, lengths_t)
+        feats.append(feat.cpu().numpy())
+        start = end
+    return np.concatenate(feats, axis=0)
 
 
 def _load_cond_batch(
@@ -464,9 +452,7 @@ def _generate_batch(
     k2d_mean,
     k2d_std,
     d_z,
-    compute_feat=False,
 ):
-    feats = None
     t_start = time.perf_counter()
     t_flow_start = time.perf_counter()
     with torch.inference_mode():
@@ -503,28 +489,81 @@ def _generate_batch(
         if latent_mean is not None and latent_std is not None:
             z_hat = z_hat * (latent_std + 1e-6) + latent_mean
         x_hat = vae.decode(z_hat, vae.cond(domain_id, style_id))
-        if compute_feat:
-            _, mu, _ = vae.encode(x_hat, vae.cond(domain_id, style_id), mask=None)
-            feats = _feature_from_mu(mu)
         if isinstance(device, torch.device) and device.type == "cuda":
             torch.cuda.synchronize()
         t_vae = time.perf_counter() - t_vae_start
     if isinstance(device, torch.device) and device.type == "cuda":
         torch.cuda.synchronize()
     net_time = time.perf_counter() - t_start
-    x_hat_np = x_hat.cpu().numpy()
+    x_hat_norm_np = x_hat.cpu().numpy()
+    x_hat_np = x_hat_norm_np.copy()
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     x_hat_np[..., :cont_end] = x_hat_np[..., :cont_end] * std + mean
     contact_logits = x_hat_np[..., LAYOUT_SLICES["feet_contact"][0] : LAYOUT_SLICES["feet_contact"][1]]
     joints = ik263_to_smpl22(x_hat_np)
     full_time = time.perf_counter() - t_start
-    return x_hat_np, joints, contact_logits, feats, net_time, full_time, t_flow, t_vae
+    return (
+        x_hat_norm_np,
+        x_hat_np,
+        joints,
+        contact_logits,
+        net_time,
+        full_time,
+        t_flow,
+        t_vae,
+    )
 
 
-def _collect_features(vae, motion, domain_id, style_id):
-    with torch.inference_mode():
-        _, mu, _ = vae.encode(motion, vae.cond(domain_id, style_id), mask=None)
-    return _feature_from_mu(mu)
+def _infer_motion_lengths(batch, batch_size, seq_len, device):
+    mask = batch.get("mask")
+    if mask is None:
+        return torch.full((batch_size,), int(seq_len), dtype=torch.long, device=device)
+    lengths = mask[:batch_size].to(device=device)
+    if lengths.dtype != torch.bool:
+        lengths = lengths > 0
+    lengths = lengths.sum(dim=1).long()
+    return torch.clamp(lengths, min=1, max=int(seq_len))
+
+
+def _renorm_for_t2m(features_norm, flow_mean, flow_std, t2m_mean, t2m_std):
+    x = np.asarray(features_norm, dtype=np.float32)
+    flow_mean = np.asarray(flow_mean, dtype=np.float32).reshape(-1)
+    flow_std = np.asarray(flow_std, dtype=np.float32).reshape(-1)
+    t2m_mean = np.asarray(t2m_mean, dtype=np.float32).reshape(-1)
+    t2m_std = np.asarray(t2m_std, dtype=np.float32).reshape(-1)
+
+    d_x = x.shape[-1]
+    d_eval = t2m_mean.shape[0]
+    d_flow = flow_mean.shape[0]
+    if flow_std.shape[0] != d_flow:
+        raise ValueError(
+            f"Flow std dim mismatch: mean={d_flow}, std={flow_std.shape[0]}"
+        )
+    if t2m_std.shape[0] != d_eval:
+        raise ValueError(
+            f"T2M std dim mismatch: mean={d_eval}, std={t2m_std.shape[0]}"
+        )
+    d_motion = d_x - 4
+    if d_flow < d_motion:
+        raise ValueError(
+            f"Flow mean/std dims too small for renorm: flow_mean={flow_mean.shape[0]}, "
+            f"flow_std={flow_std.shape[0]}, required_at_least={d_motion}"
+        )
+    if d_eval < d_motion:
+        raise ValueError(
+            f"T2M mean/std dims too small for renorm: t2m_mean={d_eval}, "
+            f"t2m_std={t2m_std.shape[0]}, required_at_least={d_motion}"
+        )
+
+    y = x.copy()
+    # The T2M motion encoder consumes only [..., :-4], so renorm that slice.
+    y_motion = y[..., :d_motion]
+    y[..., :d_motion] = (
+        (y_motion * flow_std[:d_motion] + flow_mean[:d_motion]) - t2m_mean[:d_motion]
+    ) / (
+        t2m_std[:d_motion] + 1e-6
+    )
+    return y
 
 
 def evaluate_dataset(
@@ -545,15 +584,30 @@ def evaluate_dataset(
     device,
     compute_dist,
     save_per_sample,
+    metric_extractor=None,
+    t2m_stats=None,
+    diversity_times=300,
+    multimodality_repeats=1,
+    multimodality_times=20,
     skip_empty_cond=True,
 ):
     print(f"Evaluating {name} (steps={steps})")
     mean, std = stats
     latent_mean, latent_std = latent_stats
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
+    t2m_mean = None
+    t2m_std = None
+    if t2m_stats is not None:
+        t2m_mean = np.asarray(t2m_stats[0], dtype=np.float32)
+        t2m_std = np.asarray(t2m_stats[1], dtype=np.float32)
+    if compute_dist and metric_extractor is not None and (t2m_mean is None or t2m_std is None):
+        raise ValueError("t2m_stats is required for distribution metrics with T2M extractor")
     k2d_mean, k2d_std = openpose_cfg["mean"], openpose_cfg["std"]
     results = []
     feats_gen_list = []
     feats_ref = []
+    feats_mm = []
     total_time_net = 0.0
     total_time_full = 0.0
     total_time_flow = 0.0
@@ -620,10 +674,10 @@ def evaluate_dataset(
             continue
 
         (
+            x_hat_norm_np,
             x_hat_np,
             joints,
             contact_logits,
-            feats_gen,
             net_time,
             full_time,
             flow_time,
@@ -648,7 +702,6 @@ def evaluate_dataset(
             k2d_mean,
             k2d_std,
             cfg.d_z,
-            compute_feat=compute_dist,
         )
         total_time_net += net_time
         total_time_full += full_time
@@ -702,10 +755,66 @@ def evaluate_dataset(
             }
             results.append(record)
 
-        if compute_dist:
-            if feats_gen is not None:
-                feats_gen_list.append(feats_gen)
-            feats_ref.append(_collect_features(vae, motion, domain_id, style_id))
+        if compute_dist and metric_extractor is not None:
+            lengths = _infer_motion_lengths(batch, batch_size, cfg.seq_len, device)
+            motion_eval_np = _renorm_for_t2m(
+                motion.detach().cpu().numpy(), mean, std, t2m_mean, t2m_std
+            )
+            x_hat_eval_np = _renorm_for_t2m(
+                x_hat_norm_np, mean, std, t2m_mean, t2m_std
+            )
+            feats_gen_list.append(
+                _extract_t2m_features(
+                    metric_extractor, x_hat_eval_np, lengths, device
+                )
+            )
+            feats_ref.append(
+                _extract_t2m_features(metric_extractor, motion_eval_np, lengths, device)
+            )
+            if multimodality_repeats > 1:
+                mm_batch = [feats_gen_list[-1]]
+                for _ in range(multimodality_repeats - 1):
+                    (
+                        x_hat_mm_norm_np,
+                        _x_hat_mm_np,
+                        _joints_mm,
+                        _contact_mm,
+                        _net_mm,
+                        _full_mm,
+                        _flow_mm,
+                        _vae_mm,
+                    ) = _generate_batch(
+                        flow,
+                        vae,
+                        mean,
+                        std,
+                        latent_mean,
+                        latent_std,
+                        motion,
+                        domain_id,
+                        style_id,
+                        k2d_batch,
+                        vis_batch,
+                        tau_cond,
+                        mask_cond,
+                        steps,
+                        solver,
+                        device,
+                        k2d_mean,
+                        k2d_std,
+                        cfg.d_z,
+                    )
+                    mm_batch.append(
+                        _extract_t2m_features(
+                            metric_extractor,
+                            _renorm_for_t2m(
+                                x_hat_mm_norm_np, mean, std, t2m_mean, t2m_std
+                            ),
+                            lengths,
+                            device,
+                        )
+                    )
+                feats_mm.append(np.stack(mm_batch, axis=1))
 
         seen += batch_size
 
@@ -719,12 +828,20 @@ def evaluate_dataset(
         summary["aits_net"] = total_time_net / seq_count
         summary["aits_flow"] = total_time_flow / seq_count
         summary["aits_vae"] = total_time_vae / seq_count
-    if compute_dist and feats_gen_list and feats_ref:
+    if compute_dist and metric_extractor is not None and feats_gen_list and feats_ref:
         f_gen = np.concatenate(feats_gen_list, axis=0)
         f_ref = np.concatenate(feats_ref, axis=0)
-        summary["fid"] = _fid(f_gen, f_ref)
-        summary["mmd"] = _mmd_rbf(f_gen, f_ref)
-        summary["fid_n"] = int(f_gen.shape[0])
+        mm_feats = np.concatenate(feats_mm, axis=0) if feats_mm else None
+        metric_summary = summarize_motion_feature_metrics(
+            f_gen,
+            f_ref,
+            diversity_times=diversity_times,
+            multimodality_feats=mm_feats,
+            multimodality_times=multimodality_times,
+        )
+        summary.update(metric_summary)
+        # Keep old key for downstream compatibility.
+        summary["mmd"] = summary["mmdist"]
     return summary, results if save_per_sample else None
 
 
@@ -732,6 +849,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--flow-ckpt", required=True)
     parser.add_argument("--vae-ckpt", default=None)
+    parser.add_argument("--t2m-motion-encoder-ckpt", default=None)
+    parser.add_argument("--t2m-mean-path", default=None)
+    parser.add_argument("--t2m-std-path", default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-samples", type=int, default=200)
@@ -743,6 +863,9 @@ def main():
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-csv", type=str, default=None)
     parser.add_argument("--save-plot", type=str, default=None)
+    parser.add_argument("--diversity-times", type=int, default=300)
+    parser.add_argument("--multimodality-repeats", type=int, default=1)
+    parser.add_argument("--multimodality-times", type=int, default=20)
     parser.add_argument("--no-dist", action="store_true")
     parser.add_argument("--save-per-sample", action="store_true")
     args = parser.parse_args()
@@ -793,16 +916,52 @@ def main():
         cond_heads=flow_cfg.get("cond_heads", 4),
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
     ).to(args.device)
+    print(f"Loading flow model: {args.flow_ckpt}")
     state = torch.load(args.flow_ckpt, map_location=args.device)
     flow.load_state_dict(state["model"])
     flow.eval()
 
     print("Loading VAE")
     vae_ckpt = args.vae_ckpt or cfg.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt")
+    print(f"Loading VAE model: {vae_ckpt}")
     vae = MotionVAE(d_in=cfg["d_in"], d_z=d_z, num_styles=cfg["num_styles"], max_len=seq_len).to(args.device)
     vae_state = torch.load(vae_ckpt, map_location=args.device)
     vae.load_state_dict(vae_state["model"])
     vae.eval()
+
+    t2m_extractor = None
+    t2m_stats = None
+    if not args.no_dist:
+        t2m_ckpt = args.t2m_motion_encoder_ckpt or cfg.get("t2m_motion_encoder_ckpt")
+        t2m_mean_path = args.t2m_mean_path or cfg.get("t2m_eval_mean_path")
+        t2m_std_path = args.t2m_std_path or cfg.get("t2m_eval_std_path")
+        if not t2m_ckpt:
+            raise ValueError(
+                "Distribution metrics requested but no T2M checkpoint provided. "
+                "Use --t2m-motion-encoder-ckpt or set t2m_motion_encoder_ckpt in config."
+            )
+        if not t2m_mean_path or not t2m_std_path:
+            raise ValueError(
+                "Distribution metrics requested but no T2M mean/std provided. "
+                "Use --t2m-mean-path/--t2m-std-path or set t2m_eval_mean_path/t2m_eval_std_path in config."
+            )
+        if not os.path.exists(t2m_mean_path) or not os.path.exists(t2m_std_path):
+            raise FileNotFoundError(
+                f"T2M mean/std not found: mean={t2m_mean_path}, std={t2m_std_path}"
+            )
+        print(f"Loading T2M motion evaluator: {t2m_ckpt}")
+        t2m_extractor = T2MMotionFeatureExtractor(input_size=cfg["d_in"]).to(args.device)
+        t2m_extractor.load_pretrained(t2m_ckpt)
+        t2m_extractor.eval()
+        t2m_mean = np.load(t2m_mean_path).astype(np.float32)
+        t2m_std = np.load(t2m_std_path).astype(np.float32)
+        expected_t2m_dim = cfg["d_in"]
+        if t2m_mean.shape[-1] != expected_t2m_dim or t2m_std.shape[-1] != expected_t2m_dim:
+            raise ValueError(
+                f"T2M mean/std dims must be {expected_t2m_dim} (MLD convention), "
+                f"got {t2m_mean.shape}, {t2m_std.shape}"
+            )
+        t2m_stats = (t2m_mean, t2m_std)
 
     print("Building datasets")
     aist_paths = _aist_split_paths(cfg["aist_motions_dir"], cfg["aist_split_val"])
@@ -906,6 +1065,11 @@ def main():
                 device=args.device,
                 compute_dist=not args.no_dist,
                 save_per_sample=args.save_per_sample,
+                metric_extractor=t2m_extractor,
+                t2m_stats=t2m_stats,
+                diversity_times=args.diversity_times,
+                multimodality_repeats=args.multimodality_repeats,
+                multimodality_times=args.multimodality_times,
             )
             row = {"dataset": dataset_name, "steps": steps}
             row.update(summary)

@@ -34,6 +34,7 @@ from flowmimic.src.data.openpose import (
     load_aist_openpose,
     load_mvh_openpose,
 )
+from flowmimic.src.metrics import T2MMotionFeatureExtractor
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
@@ -102,6 +103,13 @@ def main():
         default="online",
         choices=("online", "offline", "disabled"),
     )
+    parser.add_argument("--eval-t2m-motion-encoder-ckpt", type=str, default=None)
+    parser.add_argument("--eval-t2m-mean-path", type=str, default=None)
+    parser.add_argument("--eval-t2m-std-path", type=str, default=None)
+    parser.add_argument("--eval-diversity-times", type=int, default=300)
+    parser.add_argument("--eval-multimodality-repeats", type=int, default=1)
+    parser.add_argument("--eval-multimodality-times", type=int, default=20)
+    parser.add_argument("--eval-no-dist", action="store_true")
     args = parser.parse_args()
 
     ddp = args.ddp
@@ -430,6 +438,53 @@ def main():
     body25_to_smpl_idx, body25_to_smpl_valid = _build_body25_to_smpl22(
         config["smpl45_to_body25_def"], device
     )
+
+    eval_compute_dist = False
+    eval_t2m_extractor = None
+    eval_t2m_stats = None
+    eval_t2m_ckpt = (
+        args.eval_t2m_motion_encoder_ckpt or config.get("t2m_motion_encoder_ckpt")
+    )
+    eval_t2m_mean_path = args.eval_t2m_mean_path or config.get("t2m_eval_mean_path")
+    eval_t2m_std_path = args.eval_t2m_std_path or config.get("t2m_eval_std_path")
+    if is_main and (not args.eval_no_dist) and eval_t2m_ckpt:
+        if not eval_t2m_mean_path or not eval_t2m_std_path:
+            raise ValueError(
+                "Eval T2M metrics require mean/std paths. "
+                "Set --eval-t2m-mean-path/--eval-t2m-std-path or config keys "
+                "t2m_eval_mean_path/t2m_eval_std_path."
+            )
+        if not os.path.exists(eval_t2m_mean_path) or not os.path.exists(
+            eval_t2m_std_path
+        ):
+            raise FileNotFoundError(
+                "Eval T2M mean/std not found: "
+                f"mean={eval_t2m_mean_path}, std={eval_t2m_std_path}"
+            )
+        print(f"Loading eval T2M motion encoder: {eval_t2m_ckpt}")
+        eval_t2m_extractor = T2MMotionFeatureExtractor(input_size=config["d_in"]).to(
+            device
+        )
+        eval_t2m_extractor.load_pretrained(eval_t2m_ckpt)
+        eval_t2m_extractor.eval()
+        eval_t2m_mean = np.load(eval_t2m_mean_path).astype(np.float32)
+        eval_t2m_std = np.load(eval_t2m_std_path).astype(np.float32)
+        expected_t2m_dim = config["d_in"]
+        if (
+            eval_t2m_mean.shape[-1] != expected_t2m_dim
+            or eval_t2m_std.shape[-1] != expected_t2m_dim
+        ):
+            raise ValueError(
+                f"Eval T2M mean/std dims must be {expected_t2m_dim} (MLD convention), "
+                f"got {eval_t2m_mean.shape}, {eval_t2m_std.shape}"
+            )
+        eval_t2m_stats = (eval_t2m_mean, eval_t2m_std)
+        eval_compute_dist = True
+    elif is_main and (not args.eval_no_dist):
+        print(
+            "Warning: eval distribution metrics disabled "
+            "(no eval T2M checkpoint provided)."
+        )
 
     teacher = None
     if args.reflow_round >= 1:
@@ -968,8 +1023,13 @@ def main():
                     num_samples=0,
                     seed=seed,
                     device=device,
-                    compute_dist=True,
+                    compute_dist=eval_compute_dist,
                     save_per_sample=False,
+                    metric_extractor=eval_t2m_extractor,
+                    t2m_stats=eval_t2m_stats,
+                    diversity_times=args.eval_diversity_times,
+                    multimodality_repeats=args.eval_multimodality_repeats,
+                    multimodality_times=args.eval_multimodality_times,
                 )
                 if eval_summary:
                     wandb_run.log(

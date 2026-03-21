@@ -48,6 +48,7 @@ flowmimic/
     eval_vae.py
     train_flow.py
     sample_flow.py
+    eval_flow.py
   tools/
     split_datasets.py
     compute_stats.py
@@ -175,7 +176,7 @@ Evaluation:
 python flowmimic/scripts/eval_vae.py --checkpoint checkpoints/motion_vae_best.pt
 ```
 
-## Flow training / sampling
+## Flow training / sampling / evaluation
 
 Training (round 0):
 ```
@@ -208,6 +209,32 @@ output/flow/result_smpl22.npy
 output/flow/result_meta.json
 ```
 
+Flow evaluation (AIST + MVH val; geometric + distribution metrics):
+```
+python flowmimic/scripts/eval_flow.py \
+  --flow-ckpt checkpoints/flow/flow_round0_last.pt \
+  --steps 1,2,4,8,16,32,50,100 \
+  --solver heun
+```
+
+Output files (default):
+```
+output/eval/<flow_ckpt_parent>/flow_eval.csv
+output/eval/<flow_ckpt_parent>/flow_eval.json
+output/eval/<flow_ckpt_parent>/flow_eval_steps.png
+```
+
+If T2M evaluator paths are configured in `config.json`, `eval_flow.py` also computes
+distribution metrics (`fid`, `mmdist`/`mmd`, `matching_score`, `diversity`, optional `multimodality`).
+Use `--no-dist` to run only geometric/timing metrics.
+
+Distribution metrics override args:
+```
+--t2m-motion-encoder-ckpt
+--t2m-mean-path
+--t2m-std-path
+```
+
 ## Config highlights
 
 Main config: `flowmimic/src/config/config.json`
@@ -216,6 +243,7 @@ Main config: `flowmimic/src/config/config.json`
 - 263D stats: `stats_path`
 - OpenPose stats: `openpose_stats_path`
 - Latent stats: `latent_stats_path`
+- T2M evaluator assets: `t2m_motion_encoder_ckpt`, `t2m_eval_mean_path`, `t2m_eval_std_path`
 - Flow hyperparams: `flow.*`
 
 ## Notes
@@ -225,3 +253,4 @@ Main config: `flowmimic/src/config/config.json`
   - `AISTDataset`/`MVHumanNetDataset` accept `include_cond=True` and return `k2d`, `vis`, `conf`, `tau_cond`, `mask_cond`.
   - Sparse frames are evenly spaced with `cond_frames_min=cond_frames_max=7` (config).
   - Non-kinematic flow training includes solver-in-training regularization (confidence-weighted condition matching + SMPL22 smooth losses) with step/frequency/lambda schedules via `train_flow.py` args.
+  - In-training eval (AIST val, fixed `steps=4`) reuses the same core evaluator as `eval_flow.py`; extra eval distribution metrics can be enabled via `--eval-t2m-*` args.

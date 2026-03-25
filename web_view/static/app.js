@@ -166,11 +166,14 @@ const els = {
   clipVideo: document.getElementById("clipVideo"),
   noVideoMsg: document.getElementById("noVideoMsg"),
   framesGrid: document.getElementById("framesGrid"),
+  genTitle: document.getElementById("genTitle"),
+  condTitle: document.getElementById("condTitle"),
 };
 
 let genView = new NullViewport();
 let condView = new NullViewport();
 let currentReplicateCommand = "";
+let styleNameById = new Map([[0, "Unknown"]]);
 
 function appendLog(text) {
   if (!text) return;
@@ -324,12 +327,17 @@ async function loadDefaults() {
   els.solver.value = data.default_solver || "heun";
   els.dataset.value = data.default_dataset || "auto";
   if (Array.isArray(data.style_options) && els.styleId) {
+    styleNameById = new Map([[0, "Unknown"]]);
     els.styleId.innerHTML = "";
     for (const item of data.style_options) {
       const opt = document.createElement("option");
       opt.value = item.id == null ? "" : String(item.id);
       opt.textContent = item.label;
       els.styleId.appendChild(opt);
+      if (item.id != null && typeof item.label === "string") {
+        const m = item.label.match(/^(\d+):\s*(.+?)(?:\s*-\s*.+)?$/);
+        if (m) styleNameById.set(Number(item.id), m[2]);
+      }
     }
     els.styleId.value = data.default_style_id == null ? "" : String(data.default_style_id);
   }
@@ -368,6 +376,24 @@ function setVideo(url) {
   els.clipVideo.src = url;
   els.clipVideo.style.display = "block";
   els.noVideoMsg.style.display = "none";
+}
+
+function formatStyle(idValue) {
+  const id = Number(idValue);
+  if (!Number.isFinite(id)) return "0:Unknown";
+  const name = styleNameById.get(id) || "Unknown";
+  return `${id}:${name}`;
+}
+
+function updateViewportTitles(meta) {
+  const genText = formatStyle(meta?.style_id ?? 0);
+  const condText = formatStyle(meta?.cond_style_id ?? 0);
+  if (els.genTitle) {
+    els.genTitle.textContent = `Generated (${genText})`;
+  }
+  if (els.condTitle) {
+    els.condTitle.textContent = `Condition Reference (${condText})`;
+  }
 }
 
 async function onGenerate() {
@@ -426,6 +452,7 @@ async function onGenerate() {
       els.replicateBtn.disabled = false;
       appendLog(`replicate_command: ${currentReplicateCommand}`);
     }
+    updateViewportTitles(data.meta || {});
 
     genView.setMotion(data.generated_motion);
     condView.setMotion(data.condition_motion);

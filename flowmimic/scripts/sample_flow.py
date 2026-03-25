@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--vae-checkpoint", default=None)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--solver", type=str, default="heun")
-    parser.add_argument("--style-id", type=int, default=0)
+    parser.add_argument("--style-id", type=int, default=None)
     parser.add_argument("--domain-id", type=int, default=0)
     parser.add_argument("--k2d-npy", type=str, default=None)
     parser.add_argument("--tau-cond-npy", type=str, default=None)
@@ -148,7 +148,10 @@ def main():
         latent_std = torch.tensor(stats["std"], device=device, dtype=torch.float32)
 
     meta = {}
-    style_id_value = args.style_id
+    style_id_user_set = args.style_id is not None
+    style_id_value = args.style_id if args.style_id is not None else 0
+    cond_style_id_value = 0
+    cond_genre_value = ""
     domain_id_value = args.domain_id
     if args.start is not None and args.start < 0:
         raise ValueError("--start must be >= 0")
@@ -189,7 +192,10 @@ def main():
                 camera=cam,
             )
             genre = get_genre_code(pkl_path)
-            style_id_value = genre_to_id.get(genre, 0)
+            cond_genre_value = genre
+            cond_style_id_value = genre_to_id.get(genre, 0)
+            if not style_id_user_set:
+                style_id_value = cond_style_id_value
             domain_id_value = 1
             meta = {"dataset": "aist", "path": pkl_path, "camera": cam, "genre": genre}
         else:
@@ -212,7 +218,9 @@ def main():
                 cache_root=cond_cache_root,
                 camera=cam,
             )
-            style_id_value = 0
+            if not style_id_user_set:
+                style_id_value = 0
+            cond_style_id_value = 0
             domain_id_value = 0
             meta = {"dataset": "mvh", "path": seq_dir, "camera": cam}
 
@@ -298,6 +306,8 @@ def main():
         "path": meta.get("path", ""),
         "camera": meta.get("camera", ""),
         "style_id": style_id_value,
+        "cond_style_id": cond_style_id_value,
+        "cond_genre": cond_genre_value,
         "domain_id": domain_id_value,
         "flow_checkpoint": args.checkpoint,
         "flow_checkpoint_dir": os.path.dirname(args.checkpoint),
@@ -342,14 +352,14 @@ def main():
         replicate_cmd.extend(["--k2d-npy", args.k2d_npy])
         if args.tau_cond_npy:
             replicate_cmd.extend(["--tau-cond-npy", args.tau_cond_npy])
-        if args.style_id != 0:
-            replicate_cmd.extend(["--style-id", str(args.style_id)])
-        if args.domain_id != 0:
-            replicate_cmd.extend(["--domain-id", str(args.domain_id)])
     elif meta_out["dataset"] in ("aist", "mvh"):
         replicate_cmd.extend(["--dataset", meta_out["dataset"]])
         if meta_out["path"]:
             replicate_cmd.extend(["--sample-path", meta_out["path"]])
+    if style_id_value != 0 or style_id_user_set:
+        replicate_cmd.extend(["--style-id", str(style_id_value)])
+    if domain_id_value != 0 or args.domain_id != 0:
+        replicate_cmd.extend(["--domain-id", str(domain_id_value)])
     if args.camera is not None:
         replicate_cmd.extend(["--camera", args.camera])
     replicate_cmd.extend(["--seed", str(seed_used)])

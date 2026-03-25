@@ -183,6 +183,7 @@ let styleNameById = new Map([[0, "Unknown"]]);
 let currentFrameUrls = [];
 let lightboxOpen = false;
 let lightboxIndex = 0;
+const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
 let defaultsCache = {
   default_steps: 8,
   default_solver: "heun",
@@ -199,6 +200,61 @@ function appendLog(text) {
 
 function clearLog() {
   els.statusLog.textContent = "";
+}
+
+function getFormState() {
+  return {
+    modelName: els.modelName.value,
+    modelFilename: els.modelFilename.value,
+    vaeCheckpoint: els.vaeCheckpoint.value,
+    dataset: els.dataset.value,
+    samplePath: els.samplePath.value,
+    camera: els.camera.value,
+    steps: els.steps.value,
+    solver: els.solver.value,
+    styleId: els.styleId.value,
+    seed: els.seed.value,
+    start: els.start.value,
+    device: els.device.value,
+    outName: els.outName.value,
+    useEma: els.useEma.checked,
+  };
+}
+
+function applyFormState(state) {
+  if (!state || typeof state !== "object") return;
+  if (typeof state.modelName === "string") els.modelName.value = state.modelName;
+  if (typeof state.modelFilename === "string") els.modelFilename.value = state.modelFilename;
+  if (typeof state.vaeCheckpoint === "string") els.vaeCheckpoint.value = state.vaeCheckpoint;
+  if (typeof state.dataset === "string") els.dataset.value = state.dataset;
+  if (typeof state.samplePath === "string") els.samplePath.value = state.samplePath;
+  if (typeof state.camera === "string") els.camera.value = state.camera;
+  if (typeof state.steps === "string") els.steps.value = state.steps;
+  if (typeof state.solver === "string") els.solver.value = state.solver;
+  if (typeof state.styleId === "string") setStyleSelectValue(state.styleId);
+  if (typeof state.seed === "string") els.seed.value = state.seed;
+  if (typeof state.start === "string") els.start.value = state.start;
+  if (typeof state.device === "string") els.device.value = state.device;
+  if (typeof state.outName === "string") els.outName.value = state.outName;
+  if (typeof state.useEma === "boolean") els.useEma.checked = state.useEma;
+}
+
+function saveFormState() {
+  try {
+    window.localStorage.setItem(FORM_STATE_KEY, JSON.stringify(getFormState()));
+  } catch (_err) {
+    // Ignore storage failures (private mode/quota/etc.).
+  }
+}
+
+function loadFormState() {
+  try {
+    const raw = window.localStorage.getItem(FORM_STATE_KEY);
+    if (!raw) return;
+    applyFormState(JSON.parse(raw));
+  } catch (_err) {
+    // Ignore malformed storage payloads.
+  }
 }
 
 function parseOptionalInt(value) {
@@ -404,6 +460,7 @@ function resetArgsKeepCheckpoints() {
     els.condTitle.textContent = "Condition Reference (cond_clip_smpl22.npy)";
   }
   appendLog("Arguments reset to defaults (checkpoints preserved). Outputs cleared.");
+  saveFormState();
 }
 
 function setFrames(urls) {
@@ -556,6 +613,7 @@ function onReplicate() {
   }
   applyReplicateCommand(currentReplicateCommand);
   appendLog("Replicate command loaded into form.");
+  saveFormState();
 }
 
 function onLightboxKeydown(ev) {
@@ -588,6 +646,26 @@ els.lightbox.addEventListener("click", (ev) => {
   closeLightbox();
 });
 window.addEventListener("keydown", onLightboxKeydown);
+[
+  els.modelName,
+  els.modelFilename,
+  els.vaeCheckpoint,
+  els.dataset,
+  els.samplePath,
+  els.camera,
+  els.steps,
+  els.solver,
+  els.styleId,
+  els.seed,
+  els.start,
+  els.device,
+  els.outName,
+  els.useEma,
+].forEach((el) => {
+  if (!el) return;
+  el.addEventListener("input", saveFormState);
+  el.addEventListener("change", saveFormState);
+});
 
 let lastTs = performance.now();
 function animate(ts) {
@@ -599,5 +677,10 @@ function animate(ts) {
 }
 requestAnimationFrame(animate);
 
-loadDefaults();
-initViewports();
+async function boot() {
+  await loadDefaults();
+  loadFormState();
+  initViewports();
+}
+
+boot();

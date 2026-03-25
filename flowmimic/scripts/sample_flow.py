@@ -348,8 +348,8 @@ def main():
         replicate_cmd.extend(["--camera", args.camera])
     if args.seed is not None:
         replicate_cmd.extend(["--seed", str(args.seed)])
-    if args.start is not None:
-        replicate_cmd.extend(["--start", str(args.start)])
+    if meta_out.get("start", None) is not None:
+        replicate_cmd.extend(["--start", str(meta_out["start"])])
     replicate_command = _join_cmd(replicate_cmd)
     meta_out["replicate_command"] = replicate_command
 
@@ -369,6 +369,7 @@ def main():
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
     print(f"Updated latest symlink: {last_link} -> {run_out_dir}")
+    print(f"start: {meta_out.get('start', None)}")
     print(f"replicate_command: {replicate_command}")
     if meta.get("dataset") in ("aist", "mvh"):
         print(

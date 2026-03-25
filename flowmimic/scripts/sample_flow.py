@@ -1,7 +1,10 @@
 import argparse
+import json
 import os
 import random
+import shlex
 import sys
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -28,6 +31,10 @@ from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 
 
+def _join_cmd(parts):
+    return " ".join(shlex.quote(str(p)) for p in parts)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -39,6 +46,7 @@ def main():
     parser.add_argument("--k2d-npy", type=str, default=None)
     parser.add_argument("--tau-cond-npy", type=str, default=None)
     parser.add_argument("--sample-path", type=str, default=None)
+    parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--dataset", type=str, choices=["auto", "aist", "mvh"], default="auto")
     parser.add_argument("--camera", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -60,6 +68,16 @@ def main():
     vae_ckpt_path = args.vae_checkpoint or config.get(
         "vae_ckpt", "checkpoints/motion_vae_best.pt"
     )
+    ckpt_parent = os.path.basename(os.path.dirname(os.path.normpath(args.checkpoint)))
+    model_name = ckpt_parent if ckpt_parent else "model"
+    ts_base = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_tag = ts_base
+    run_out_dir = os.path.join(args.out_dir, model_name, run_tag)
+    suffix = 1
+    while os.path.exists(run_out_dir):
+        run_tag = f"{ts_base}_{suffix:02d}"
+        run_out_dir = os.path.join(args.out_dir, model_name, run_tag)
+        suffix += 1
     stats_path = config.get("stats_path", "data/mean_std_263_train.npz")
     latent_stats_path = config.get("latent_stats_path", "data/latent_stats.npz")
     cond_frames_min = config.get("flow", {}).get("cond_frames_min", 2)
@@ -127,6 +145,8 @@ def main():
     meta = {}
     style_id_value = args.style_id
     domain_id_value = args.domain_id
+    if args.start is not None and args.start < 0:
+        raise ValueError("--start must be >= 0")
     k2d = None
     vis = None
     if args.k2d_npy:
@@ -199,7 +219,11 @@ def main():
         orig_len = k2d.shape[0]
         start = 0
         if orig_len >= seq_len:
-            start = random.randint(0, orig_len - seq_len)
+            max_start = orig_len - seq_len
+            if args.start is None:
+                start = random.randint(0, max_start)
+            else:
+                start = min(args.start, max_start)
             k2d = k2d[start : start + seq_len]
             vis = vis[start : start + seq_len] if vis is not None else None
         else:
@@ -255,11 +279,11 @@ def main():
     joints = yup_to_blender(joints)
     joints = joints - joints[0:1, 0:1, :]
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    out_npy = os.path.join(args.out_dir, args.out)
+    os.makedirs(run_out_dir, exist_ok=True)
+    out_npy = os.path.join(run_out_dir, args.out)
     np.save(out_npy, joints)
 
-    meta_path = os.path.join(args.out_dir, "result_meta.json")
+    meta_path = os.path.join(run_out_dir, "result_meta.json")
     if hasattr(sample_idx, "tolist"):
         sample_idx_out = sample_idx.tolist()
     else:
@@ -272,23 +296,84 @@ def main():
         "domain_id": domain_id_value,
         "flow_checkpoint": args.checkpoint,
         "flow_checkpoint_dir": os.path.dirname(args.checkpoint),
+        "flow_model_name": model_name,
         "vae_checkpoint": vae_ckpt_path,
         "vae_checkpoint_dir": os.path.dirname(vae_ckpt_path),
+        "run_timestamp": run_tag,
+        "output_dir": run_out_dir,
         "orig_len": meta.get("orig_len", ""),
         "start": meta.get("start", ""),
         "seq_len": seq_len,
         "sparse_indices": sample_idx_out,
         "tau_cond": tau_cond.tolist(),
     }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        import json
 
+    replicate_cmd = [
+        "python",
+        "flowmimic/scripts/sample_flow.py",
+        "--checkpoint",
+        args.checkpoint,
+        "--vae-checkpoint",
+        vae_ckpt_path,
+        "--steps",
+        str(args.steps),
+        "--solver",
+        args.solver,
+        "--out",
+        args.out,
+        "--out-dir",
+        args.out_dir,
+        "--device",
+        args.device,
+    ]
+    if args.use_ema:
+        replicate_cmd.append("--use-ema")
+    if args.src_fps is not None:
+        replicate_cmd.extend(["--src-fps", str(args.src_fps)])
+    if args.target_fps is not None:
+        replicate_cmd.extend(["--target-fps", str(args.target_fps)])
+    if args.k2d_npy:
+        replicate_cmd.extend(["--k2d-npy", args.k2d_npy])
+        if args.tau_cond_npy:
+            replicate_cmd.extend(["--tau-cond-npy", args.tau_cond_npy])
+        if args.style_id != 0:
+            replicate_cmd.extend(["--style-id", str(args.style_id)])
+        if args.domain_id != 0:
+            replicate_cmd.extend(["--domain-id", str(args.domain_id)])
+    elif meta_out["dataset"] in ("aist", "mvh"):
+        replicate_cmd.extend(["--dataset", meta_out["dataset"]])
+        if meta_out["path"]:
+            replicate_cmd.extend(["--sample-path", meta_out["path"]])
+    if args.camera is not None:
+        replicate_cmd.extend(["--camera", args.camera])
+    if args.seed is not None:
+        replicate_cmd.extend(["--seed", str(args.seed)])
+    if args.start is not None:
+        replicate_cmd.extend(["--start", str(args.start)])
+    replicate_command = _join_cmd(replicate_cmd)
+    meta_out["replicate_command"] = replicate_command
+
+    last_link = os.path.join(args.out_dir, "last")
+    if os.path.lexists(last_link):
+        if os.path.islink(last_link) or os.path.isfile(last_link):
+            os.unlink(last_link)
+        else:
+            raise RuntimeError(
+                f"Cannot update last symlink because '{last_link}' exists as a directory. "
+                "Please move/remove it first."
+            )
+    rel_target = os.path.relpath(run_out_dir, os.path.dirname(last_link))
+    os.symlink(rel_target, last_link)
+    meta_out["last_symlink"] = last_link
+
+    with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
+    print(f"Updated latest symlink: {last_link} -> {run_out_dir}")
+    print(f"replicate_command: {replicate_command}")
     if meta.get("dataset") in ("aist", "mvh"):
         print(
-            "Run 'python flowmimic/tools/extract_cond_media.py --meta {}' to see original data used as condition".format(
-                meta_path
-            )
+            "Run 'python flowmimic/tools/extract_cond_media.py' to process the latest sample "
+            f"(or pass --meta {meta_path})."
         )
 
 

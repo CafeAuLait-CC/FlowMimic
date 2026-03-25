@@ -1,7 +1,7 @@
 """Extract a cropped AIST++ video clip and sparse frames from flow sample metadata.
 
 Example:
-  python flowmimic/tools/extract_cond_media.py --meta output/flow/gLO_sBM_cAll_d13_mLO3_ch02_c02_meta.txt
+  python flowmimic/tools/extract_cond_media.py
 """
 
 import argparse
@@ -40,10 +40,15 @@ def _parse_list(text):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--meta", required=True)
-    parser.add_argument("--out-dir", default="output/flow/cond_media")
+    parser.add_argument("--meta", default="output/flow/last/result_meta.json")
+    parser.add_argument("--out-dir", default="output/flow/last/cond_media")
     parser.add_argument("--fps", type=float, default=None)
     args = parser.parse_args()
+
+    if not os.path.exists(args.meta):
+        raise FileNotFoundError(
+            f"Meta file not found: {args.meta}. Run sample_flow.py first or pass --meta explicitly."
+        )
 
     config = load_config()
     target_fps = args.fps or config.get("target_fps", 30)

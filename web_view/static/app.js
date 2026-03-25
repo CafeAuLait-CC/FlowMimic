@@ -169,7 +169,6 @@ const els = {
   framesGrid: document.getElementById("framesGrid"),
   lightbox: document.getElementById("lightbox"),
   lightboxImage: document.getElementById("lightboxImage"),
-  lightboxClose: document.getElementById("lightboxClose"),
   lightboxPrev: document.getElementById("lightboxPrev"),
   lightboxNext: document.getElementById("lightboxNext"),
   lightboxIndex: document.getElementById("lightboxIndex"),
@@ -580,11 +579,13 @@ function onLightboxKeydown(ev) {
 els.generateBtn.addEventListener("click", onGenerate);
 els.replicateBtn.addEventListener("click", onReplicate);
 els.clearBtn.addEventListener("click", resetArgsKeepCheckpoints);
-els.lightboxClose.addEventListener("click", closeLightbox);
 els.lightboxPrev.addEventListener("click", () => stepLightbox(-1));
 els.lightboxNext.addEventListener("click", () => stepLightbox(1));
 els.lightbox.addEventListener("click", (ev) => {
-  if (ev.target === els.lightbox) closeLightbox();
+  const t = ev.target;
+  if (t === els.lightboxImage) return;
+  if (t === els.lightboxPrev || t === els.lightboxNext) return;
+  closeLightbox();
 });
 window.addEventListener("keydown", onLightboxKeydown);
 

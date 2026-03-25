@@ -249,7 +249,13 @@ canvas {
   padding: 24px;
 }
 
+.lightbox-stage {
+  position: relative;
+  display: inline-block;
+}
+
 .lightbox-image {
+  display: block;
   max-width: 70vw;
   max-height: 80vh;
   width: auto;
@@ -258,44 +264,47 @@ canvas {
   box-shadow: 0 20px 48px rgba(0, 0, 0, 0.45);
 }
 
-.lightbox-close {
-  position: absolute;
-  top: 14px;
-  right: 18px;
-  width: 36px;
-  height: 36px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  background: rgba(19, 26, 34, 0.7);
-  color: #f7f8fa;
-  font-size: 24px;
-  line-height: 1;
-  padding: 0;
-  cursor: pointer;
-}
-
 .lightbox-nav {
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
-  width: 44px;
-  height: 44px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  background: rgba(19, 26, 34, 0.62);
+  width: 42px;
+  height: 92px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(19, 26, 34, 0.38);
   color: #f7f8fa;
-  font-size: 30px;
+  font-size: 0;
   line-height: 1;
   padding: 0;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#lightboxPrev::before,
+#lightboxNext::before {
+  display: block;
+  font-size: 38px;
+  line-height: 1;
+  transform: translateY(-2px);
+}
+
+#lightboxPrev::before {
+  content: "‹";
+}
+
+#lightboxNext::before {
+  content: "›";
 }
 
 .lightbox-nav.prev {
-  left: 18px;
+  left: 10px;
 }
 
 .lightbox-nav.next {
-  right: 18px;
+  right: 10px;
 }
 
 .lightbox-index {

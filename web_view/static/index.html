@@ -129,10 +129,11 @@
 
   <div id="lightbox" class="lightbox" aria-hidden="true">
     <div class="lightbox-content">
-      <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Close preview">×</button>
-      <button id="lightboxPrev" class="lightbox-nav prev" type="button" aria-label="Previous image">‹</button>
-      <img id="lightboxImage" class="lightbox-image" alt="Condition preview" />
-      <button id="lightboxNext" class="lightbox-nav next" type="button" aria-label="Next image">›</button>
+      <div class="lightbox-stage">
+        <button id="lightboxPrev" class="lightbox-nav prev" type="button" aria-label="Previous image">‹</button>
+        <img id="lightboxImage" class="lightbox-image" alt="Condition preview" />
+        <button id="lightboxNext" class="lightbox-nav next" type="button" aria-label="Next image">›</button>
+      </div>
       <div id="lightboxIndex" class="lightbox-index">1 / 1</div>
     </div>
   </div>

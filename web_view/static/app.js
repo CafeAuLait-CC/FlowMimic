@@ -167,6 +167,12 @@ const els = {
   clipVideo: document.getElementById("clipVideo"),
   noVideoMsg: document.getElementById("noVideoMsg"),
   framesGrid: document.getElementById("framesGrid"),
+  lightbox: document.getElementById("lightbox"),
+  lightboxImage: document.getElementById("lightboxImage"),
+  lightboxClose: document.getElementById("lightboxClose"),
+  lightboxPrev: document.getElementById("lightboxPrev"),
+  lightboxNext: document.getElementById("lightboxNext"),
+  lightboxIndex: document.getElementById("lightboxIndex"),
   genTitle: document.getElementById("genTitle"),
   condTitle: document.getElementById("condTitle"),
 };
@@ -175,6 +181,9 @@ let genView = new NullViewport();
 let condView = new NullViewport();
 let currentReplicateCommand = "";
 let styleNameById = new Map([[0, "Unknown"]]);
+let currentFrameUrls = [];
+let lightboxOpen = false;
+let lightboxIndex = 0;
 let defaultsCache = {
   default_steps: 8,
   default_solver: "heun",
@@ -384,6 +393,7 @@ function resetArgsKeepCheckpoints() {
   els.replicateBtn.disabled = true;
 
   clearLog();
+  closeLightbox();
   setVideo(null);
   setFrames([]);
   genView.setMotion(null);
@@ -398,12 +408,15 @@ function resetArgsKeepCheckpoints() {
 }
 
 function setFrames(urls) {
+  currentFrameUrls = Array.isArray(urls) ? urls.slice() : [];
   els.framesGrid.innerHTML = "";
-  if (!urls || urls.length === 0) return;
-  for (const u of urls) {
+  if (!currentFrameUrls || currentFrameUrls.length === 0) return;
+  for (let i = 0; i < currentFrameUrls.length; i += 1) {
+    const u = currentFrameUrls[i];
     const img = document.createElement("img");
     img.src = u;
     img.loading = "lazy";
+    img.addEventListener("click", () => openLightbox(i));
     els.framesGrid.appendChild(img);
   }
 }
@@ -418,6 +431,35 @@ function setVideo(url) {
   els.clipVideo.src = url;
   els.clipVideo.style.display = "block";
   els.noVideoMsg.style.display = "none";
+}
+
+function updateLightboxView() {
+  if (!currentFrameUrls.length) return;
+  const idx = ((lightboxIndex % currentFrameUrls.length) + currentFrameUrls.length) % currentFrameUrls.length;
+  lightboxIndex = idx;
+  els.lightboxImage.src = currentFrameUrls[idx];
+  els.lightboxIndex.textContent = `${idx + 1} / ${currentFrameUrls.length}`;
+}
+
+function openLightbox(idx) {
+  if (!currentFrameUrls.length) return;
+  lightboxIndex = idx;
+  updateLightboxView();
+  lightboxOpen = true;
+  els.lightbox.classList.add("open");
+  els.lightbox.setAttribute("aria-hidden", "false");
+}
+
+function closeLightbox() {
+  lightboxOpen = false;
+  els.lightbox.classList.remove("open");
+  els.lightbox.setAttribute("aria-hidden", "true");
+}
+
+function stepLightbox(delta) {
+  if (!lightboxOpen || !currentFrameUrls.length) return;
+  lightboxIndex += delta;
+  updateLightboxView();
 }
 
 function formatStyle(idValue) {
@@ -517,9 +559,34 @@ function onReplicate() {
   appendLog("Replicate command loaded into form.");
 }
 
+function onLightboxKeydown(ev) {
+  if (!lightboxOpen) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeLightbox();
+    return;
+  }
+  if (ev.key === "ArrowLeft") {
+    ev.preventDefault();
+    stepLightbox(-1);
+    return;
+  }
+  if (ev.key === "ArrowRight") {
+    ev.preventDefault();
+    stepLightbox(1);
+  }
+}
+
 els.generateBtn.addEventListener("click", onGenerate);
 els.replicateBtn.addEventListener("click", onReplicate);
 els.clearBtn.addEventListener("click", resetArgsKeepCheckpoints);
+els.lightboxClose.addEventListener("click", closeLightbox);
+els.lightboxPrev.addEventListener("click", () => stepLightbox(-1));
+els.lightboxNext.addEventListener("click", () => stepLightbox(1));
+els.lightbox.addEventListener("click", (ev) => {
+  if (ev.target === els.lightbox) closeLightbox();
+});
+window.addEventListener("keydown", onLightboxKeydown);
 
 let lastTs = performance.now();
 function animate(ts) {

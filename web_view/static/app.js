@@ -1,0 +1,340 @@
+const EDGES = [
+  [0, 1], [0, 2], [0, 3],
+  [1, 4], [4, 7], [7, 10],
+  [2, 5], [5, 8], [8, 11],
+  [3, 6], [6, 9], [9, 12], [12, 15],
+  [9, 13], [13, 16], [16, 18], [18, 20],
+  [9, 14], [14, 17], [17, 19], [19, 21],
+];
+
+class NullViewport {
+  setMotion(_motion) {}
+  tick(_dt) {}
+}
+
+function buildSkeletonViewportClass(THREE, OrbitControls) {
+  return class SkeletonViewport {
+    constructor(canvasId) {
+      this.canvas = document.getElementById(canvasId);
+      this.scene = new THREE.Scene();
+      this.scene.background = new THREE.Color(0xf8faf7);
+      this.camera = new THREE.PerspectiveCamera(40, 1.0, 0.01, 1000);
+      {
+        const baseOffset = new THREE.Vector3(2.4, 1.4, 2.8).multiplyScalar(1.0 / 1.5);
+        baseOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 8.0);
+        this.camera.position.copy(baseOffset);
+      }
+
+      this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true });
+      this.renderer.setPixelRatio(window.devicePixelRatio);
+
+      this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+      this.controls.enableDamping = true;
+      this.controls.enableZoom = false;
+      this.controls.target.set(0, 0.9, 0);
+
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x98a1aa, 1.2);
+      this.scene.add(hemi);
+      this.scene.add(new THREE.GridHelper(6, 18, 0xcad1ca, 0xe7ebe7));
+
+      this.joints = [];
+      const sphereGeo = new THREE.SphereGeometry(0.025, 12, 12);
+      const sphereMat = new THREE.MeshStandardMaterial({ color: 0x0f5f94 });
+      for (let i = 0; i < 22; i += 1) {
+        const s = new THREE.Mesh(sphereGeo, sphereMat);
+        this.scene.add(s);
+        this.joints.push(s);
+      }
+
+      this.bonePos = new Float32Array(EDGES.length * 2 * 3);
+      const boneGeo = new THREE.BufferGeometry();
+      boneGeo.setAttribute("position", new THREE.BufferAttribute(this.bonePos, 3));
+      this.bones = new THREE.LineSegments(
+        boneGeo,
+        new THREE.LineBasicMaterial({ color: 0x264653, linewidth: 1 })
+      );
+      this.scene.add(this.bones);
+
+      this.motion = null;
+      this.frame = 0;
+      this.accum = 0.0;
+      this.playing = true;
+      this._resize();
+      window.addEventListener("resize", () => this._resize());
+    }
+
+    _resize() {
+      const w = this.canvas.clientWidth || 640;
+      const h = this.canvas.clientHeight || 360;
+      this.camera.aspect = w / h;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(w, h, false);
+    }
+
+    setMotion(motion) {
+      if (!Array.isArray(motion) || motion.length === 0) {
+        this.motion = null;
+        return;
+      }
+      this.motion = motion;
+      this.frame = 0;
+      this.accum = 0.0;
+      this._fitCamera();
+      this._renderFrame();
+    }
+
+    _fitCamera() {
+      if (!this.motion) return;
+      const f0 = this.motion[0];
+      if (!f0 || !f0.length) return;
+      const box = new THREE.Box3();
+      for (const p of f0) {
+        box.expandByPoint(new THREE.Vector3(p[0], p[1], p[2]));
+      }
+      const center = box.getCenter(new THREE.Vector3());
+      this.controls.target.copy(center);
+      const size = box.getSize(new THREE.Vector3()).length();
+      const baseDist = Math.max(2.0, size * 2.4);
+      const dist = baseDist / 1.5;
+      const viewOffset = new THREE.Vector3(dist * 0.8, dist * 0.55, dist * 0.9);
+      viewOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 8.0);
+      this.camera.position.copy(center.clone().add(viewOffset));
+      this.camera.lookAt(center);
+      this.controls.update();
+    }
+
+    _renderFrame() {
+      if (!this.motion) return;
+      const f = this.motion[this.frame];
+      if (!f) return;
+      for (let i = 0; i < this.joints.length; i += 1) {
+        const p = f[i];
+        if (!p) continue;
+        this.joints[i].position.set(p[0], p[1], p[2]);
+      }
+      for (let e = 0; e < EDGES.length; e += 1) {
+        const [a, b] = EDGES[e];
+        const pa = f[a];
+        const pb = f[b];
+        const base = e * 6;
+        this.bonePos[base + 0] = pa[0];
+        this.bonePos[base + 1] = pa[1];
+        this.bonePos[base + 2] = pa[2];
+        this.bonePos[base + 3] = pb[0];
+        this.bonePos[base + 4] = pb[1];
+        this.bonePos[base + 5] = pb[2];
+      }
+      this.bones.geometry.attributes.position.needsUpdate = true;
+    }
+
+    tick(dt) {
+      if (this.motion && this.playing) {
+        this.accum += dt;
+        const step = 1.0 / 30.0;
+        while (this.accum >= step) {
+          this.accum -= step;
+          this.frame = (this.frame + 1) % this.motion.length;
+        }
+        this._renderFrame();
+      }
+      this.controls.update();
+      this.renderer.render(this.scene, this.camera);
+    }
+  };
+}
+
+const els = {
+  modelName: document.getElementById("modelName"),
+  modelNameList: document.getElementById("model-name-list"),
+  modelFilename: document.getElementById("modelFilename"),
+  vaeCheckpoint: document.getElementById("vaeCheckpoint"),
+  dataset: document.getElementById("dataset"),
+  samplePath: document.getElementById("samplePath"),
+  camera: document.getElementById("camera"),
+  steps: document.getElementById("steps"),
+  solver: document.getElementById("solver"),
+  styleId: document.getElementById("styleId"),
+  seed: document.getElementById("seed"),
+  start: document.getElementById("start"),
+  device: document.getElementById("device"),
+  outName: document.getElementById("outName"),
+  useEma: document.getElementById("useEma"),
+  generateBtn: document.getElementById("generateBtn"),
+  generateSpinner: document.getElementById("generateSpinner"),
+  statusLog: document.getElementById("statusLog"),
+  clipVideo: document.getElementById("clipVideo"),
+  noVideoMsg: document.getElementById("noVideoMsg"),
+  framesGrid: document.getElementById("framesGrid"),
+};
+
+let genView = new NullViewport();
+let condView = new NullViewport();
+
+function appendLog(text) {
+  if (!text) return;
+  els.statusLog.textContent += `${text}\n`;
+  els.statusLog.scrollTop = els.statusLog.scrollHeight;
+}
+
+function clearLog() {
+  els.statusLog.textContent = "";
+}
+
+function parseOptionalInt(value) {
+  if (value === "" || value == null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
+
+async function initViewports() {
+  try {
+    const THREE = await import("three");
+    const { OrbitControls } = await import(
+      "https://unpkg.com/three@0.164.1/examples/jsm/controls/OrbitControls.js"
+    );
+    const SkeletonViewport = buildSkeletonViewportClass(THREE, OrbitControls);
+    genView = new SkeletonViewport("genCanvas");
+    condView = new SkeletonViewport("condCanvas");
+    appendLog("3D viewer ready.");
+  } catch (err) {
+    genView = new NullViewport();
+    condView = new NullViewport();
+    appendLog(`3D viewer disabled (failed to load three.js): ${err}`);
+  }
+}
+
+async function loadDefaults() {
+  const res = await fetch("./api/defaults");
+  if (!res.ok) return;
+  const data = await res.json();
+  els.vaeCheckpoint.value = data.default_vae_checkpoint || "";
+  els.steps.value = data.default_steps || 8;
+  els.solver.value = data.default_solver || "heun";
+  els.dataset.value = data.default_dataset || "auto";
+  if (Array.isArray(data.style_options) && els.styleId) {
+    els.styleId.innerHTML = "";
+    for (const item of data.style_options) {
+      const opt = document.createElement("option");
+      opt.value = item.id == null ? "" : String(item.id);
+      opt.textContent = item.label;
+      els.styleId.appendChild(opt);
+    }
+    els.styleId.value = data.default_style_id == null ? "" : String(data.default_style_id);
+  }
+  if (Array.isArray(data.model_names)) {
+    for (const c of data.model_names || []) {
+      const opt = document.createElement("option");
+      opt.value = c;
+      els.modelNameList.appendChild(opt);
+    }
+    if (Array.isArray(data.model_names) && data.model_names.length > 0) {
+      const preferred = data.model_names.find((x) => x.includes("reflow_0_solver"));
+      els.modelName.value = data.default_model_name || preferred || data.model_names[data.model_names.length - 1];
+    }
+  }
+  els.modelFilename.value = data.default_model_filename || "flow_round0_last.pt";
+}
+
+function setFrames(urls) {
+  els.framesGrid.innerHTML = "";
+  if (!urls || urls.length === 0) return;
+  for (const u of urls) {
+    const img = document.createElement("img");
+    img.src = u;
+    img.loading = "lazy";
+    els.framesGrid.appendChild(img);
+  }
+}
+
+function setVideo(url) {
+  if (!url) {
+    els.clipVideo.style.display = "none";
+    els.clipVideo.removeAttribute("src");
+    els.noVideoMsg.style.display = "block";
+    return;
+  }
+  els.clipVideo.src = url;
+  els.clipVideo.style.display = "block";
+  els.noVideoMsg.style.display = "none";
+}
+
+async function onGenerate() {
+  const payload = {
+    model_name: els.modelName.value.trim() || null,
+    model_filename: els.modelFilename.value.trim() || null,
+    vae_checkpoint: els.vaeCheckpoint.value.trim() || null,
+    dataset: els.dataset.value,
+    sample_path: els.samplePath.value.trim() || null,
+    camera: els.camera.value.trim() || null,
+    steps: parseOptionalInt(els.steps.value) ?? 8,
+    solver: els.solver.value,
+    style_id: parseOptionalInt(els.styleId?.value),
+    seed: parseOptionalInt(els.seed.value),
+    start: parseOptionalInt(els.start.value),
+    device: els.device.value.trim() || null,
+    out: els.outName.value.trim() || "result_smpl22.npy",
+    use_ema: els.useEma.checked,
+    out_dir: "output/flow",
+  };
+  if (payload.style_id == null) {
+    delete payload.style_id;
+  }
+
+  if (!payload.model_name || !payload.model_filename) {
+    appendLog("model name and model filename are required.");
+    return;
+  }
+
+  els.generateBtn.disabled = true;
+  if (els.generateSpinner) els.generateSpinner.style.display = "inline-block";
+  clearLog();
+  appendLog("Running sample_flow.py ...");
+  try {
+    const res = await fetch("./api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      appendLog("Generation failed.");
+      appendLog(JSON.stringify(data, null, 2));
+      return;
+    }
+
+    appendLog("sample_flow.py finished.");
+    appendLog("extract_cond_media.py finished.");
+    if (data.sample_run?.stdout) appendLog(data.sample_run.stdout);
+    if (data.sample_run?.stderr) appendLog(data.sample_run.stderr);
+    if (data.extract_run?.stdout) appendLog(data.extract_run.stdout);
+    if (data.extract_run?.stderr) appendLog(data.extract_run.stderr);
+    appendLog(`result_dir: ${data.result_dir}`);
+    if (data.meta?.replicate_command) appendLog(`replicate_command: ${data.meta.replicate_command}`);
+
+    genView.setMotion(data.generated_motion);
+    condView.setMotion(data.condition_motion);
+    setVideo(data.video_url);
+    setFrames(data.frame_urls || []);
+  } catch (err) {
+    appendLog(`Request failed: ${err}`);
+  } finally {
+    els.generateBtn.disabled = false;
+    if (els.generateSpinner) els.generateSpinner.style.display = "none";
+  }
+}
+
+els.generateBtn.addEventListener("click", onGenerate);
+
+let lastTs = performance.now();
+function animate(ts) {
+  const dt = Math.max(0.0, (ts - lastTs) / 1000.0);
+  lastTs = ts;
+  genView.tick(dt);
+  condView.tick(dt);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+loadDefaults();
+initViewports();

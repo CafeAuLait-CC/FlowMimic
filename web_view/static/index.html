@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlowMimic Web View</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.164.1/build/three.module.js"
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="./static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>FlowMimic Sampler</h1>
+  </header>
+
+  <main>
+    <section class="panel form-panel">
+      <h2>Generate</h2>
+      <div class="form-grid">
+        <label>Model Name
+          <input id="modelName" list="model-name-list" placeholder="reflow_0_solver" />
+          <datalist id="model-name-list"></datalist>
+        </label>
+
+        <label>Model Filename
+          <input id="modelFilename" value="flow_round0_last.pt" placeholder="flow_round0_last.pt" />
+        </label>
+
+        <label>VAE Checkpoint (optional)
+          <input id="vaeCheckpoint" placeholder="checkpoints/vae/.../motion_vae_best.pt" />
+        </label>
+
+        <label>Dataset
+          <select id="dataset">
+            <option value="auto">auto</option>
+            <option value="aist">aist</option>
+            <option value="mvh">mvh</option>
+          </select>
+        </label>
+
+        <label>Sample Path (optional)
+          <input id="samplePath" placeholder="AIST .pkl or MVH sequence dir" />
+        </label>
+
+        <label>Camera (optional)
+          <input id="camera" placeholder="01 / 22327091 ..." />
+        </label>
+
+        <label>Steps
+          <input id="steps" type="number" min="1" value="8" />
+        </label>
+
+        <label>Solver
+          <select id="solver">
+            <option value="heun">heun</option>
+            <option value="euler">euler</option>
+          </select>
+        </label>
+
+        <label>Style ID
+          <select id="styleId">
+            <option value="">Default</option>
+          </select>
+        </label>
+
+        <label>Seed (optional)
+          <input id="seed" type="number" />
+        </label>
+
+        <label>Clip Start (optional)
+          <input id="start" type="number" min="0" />
+        </label>
+
+        <label>Device (optional)
+          <input id="device" placeholder="cpu / cuda:0" />
+        </label>
+
+        <label>Output Name
+          <input id="outName" value="result_smpl22.npy" />
+        </label>
+
+        <label class="checkbox">
+          <input id="useEma" type="checkbox" />
+          use EMA
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="generateBtn">Generate</button>
+        <span id="generateSpinner" class="spinner" aria-hidden="true"></span>
+      </div>
+    </section>
+
+    <section class="panel viewers-panel">
+      <h2>3D Motion</h2>
+      <div class="view-grid">
+        <div class="view-card">
+          <h3>Generated (result_smpl22.npy)</h3>
+          <canvas id="genCanvas"></canvas>
+        </div>
+        <div class="view-card">
+          <h3>Condition Reference (cond_clip_smpl22.npy)</h3>
+          <canvas id="condCanvas"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel media-panel">
+      <h2>Condition Media</h2>
+      <div id="framesGrid" class="frames-grid"></div>
+      <div class="video-wrap">
+        <video id="clipVideo" controls muted loop playsinline></video>
+        <div id="noVideoMsg" class="muted">No video clip available for this sample.</div>
+      </div>
+    </section>
+
+    <section class="panel log-panel">
+      <h2>Logs</h2>
+      <pre id="statusLog"></pre>
+    </section>
+  </main>
+
+  <script type="module" src="./static/app.js"></script>
+</body>
+</html>

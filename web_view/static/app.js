@@ -162,6 +162,7 @@ const els = {
   replicateBtn: document.getElementById("replicateBtn"),
   generateBtn: document.getElementById("generateBtn"),
   generateSpinner: document.getElementById("generateSpinner"),
+  clearBtn: document.getElementById("clearBtn"),
   statusLog: document.getElementById("statusLog"),
   clipVideo: document.getElementById("clipVideo"),
   noVideoMsg: document.getElementById("noVideoMsg"),
@@ -174,6 +175,13 @@ let genView = new NullViewport();
 let condView = new NullViewport();
 let currentReplicateCommand = "";
 let styleNameById = new Map([[0, "Unknown"]]);
+let defaultsCache = {
+  default_steps: 8,
+  default_solver: "heun",
+  default_dataset: "auto",
+  default_style_id: null,
+  default_device: "",
+};
 
 function appendLog(text) {
   if (!text) return;
@@ -322,6 +330,10 @@ async function loadDefaults() {
   const res = await fetch("./api/defaults");
   if (!res.ok) return;
   const data = await res.json();
+  defaultsCache = {
+    ...defaultsCache,
+    ...data,
+  };
   els.vaeCheckpoint.value = data.default_vae_checkpoint || "";
   els.steps.value = data.default_steps || 8;
   els.solver.value = data.default_solver || "heun";
@@ -353,6 +365,36 @@ async function loadDefaults() {
     }
   }
   els.modelFilename.value = data.default_model_filename || "flow_round0_last.pt";
+}
+
+function resetArgsKeepCheckpoints() {
+  els.dataset.value = defaultsCache.default_dataset || "auto";
+  els.samplePath.value = "";
+  els.camera.value = "";
+  els.steps.value = String(defaultsCache.default_steps || 8);
+  els.solver.value = defaultsCache.default_solver || "heun";
+  els.styleId.value = defaultsCache.default_style_id == null ? "" : String(defaultsCache.default_style_id);
+  els.seed.value = "";
+  els.start.value = "";
+  els.device.value = defaultsCache.default_device || "";
+  els.outName.value = "result_smpl22.npy";
+  els.useEma.checked = false;
+
+  currentReplicateCommand = "";
+  els.replicateBtn.disabled = true;
+
+  clearLog();
+  setVideo(null);
+  setFrames([]);
+  genView.setMotion(null);
+  condView.setMotion(null);
+  if (els.genTitle) {
+    els.genTitle.textContent = "Generated (result_smpl22.npy)";
+  }
+  if (els.condTitle) {
+    els.condTitle.textContent = "Condition Reference (cond_clip_smpl22.npy)";
+  }
+  appendLog("Arguments reset to defaults (checkpoints preserved). Outputs cleared.");
 }
 
 function setFrames(urls) {
@@ -477,6 +519,7 @@ function onReplicate() {
 
 els.generateBtn.addEventListener("click", onGenerate);
 els.replicateBtn.addEventListener("click", onReplicate);
+els.clearBtn.addEventListener("click", resetArgsKeepCheckpoints);
 
 let lastTs = performance.now();
 function animate(ts) {

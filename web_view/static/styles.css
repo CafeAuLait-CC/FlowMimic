@@ -88,6 +88,12 @@ select {
   gap: 10px;
 }
 
+#replicateBtn,
+#generateBtn,
+#clearBtn {
+  width: 110px;
+}
+
 button {
   background: var(--accent);
   color: #fff;
@@ -104,6 +110,18 @@ button {
 #replicateBtn:disabled {
   background: #9aa6af;
   opacity: 1;
+}
+
+#clearBtn {
+  margin-left: auto;
+}
+
+.danger-btn {
+  background: #b42318;
+}
+
+.danger-btn:hover {
+  background: #912018;
 }
 
 button:disabled {

@@ -97,6 +97,15 @@ button {
   cursor: pointer;
 }
 
+#replicateBtn {
+  background: #5f6f7d;
+}
+
+#replicateBtn:disabled {
+  background: #9aa6af;
+  opacity: 1;
+}
+
 button:disabled {
   opacity: 0.6;
   cursor: default;

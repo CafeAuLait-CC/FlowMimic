@@ -159,6 +159,7 @@ const els = {
   device: document.getElementById("device"),
   outName: document.getElementById("outName"),
   useEma: document.getElementById("useEma"),
+  replicateBtn: document.getElementById("replicateBtn"),
   generateBtn: document.getElementById("generateBtn"),
   generateSpinner: document.getElementById("generateSpinner"),
   statusLog: document.getElementById("statusLog"),
@@ -169,6 +170,7 @@ const els = {
 
 let genView = new NullViewport();
 let condView = new NullViewport();
+let currentReplicateCommand = "";
 
 function appendLog(text) {
   if (!text) return;
@@ -185,6 +187,115 @@ function parseOptionalInt(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
   return Math.trunc(n);
+}
+
+function splitShellCommand(cmd) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  for (let i = 0; i < cmd.length; i += 1) {
+    const ch = cmd[i];
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (quote === "\"") {
+      if (ch === "\"") {
+        quote = null;
+      } else if (ch === "\\" && i + 1 < cmd.length) {
+        i += 1;
+        cur += cmd[i];
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === "\"") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur) {
+        out.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    if (ch === "\\" && i + 1 < cmd.length) {
+      i += 1;
+      cur += cmd[i];
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function parseReplicateArgs(cmd) {
+  const tokens = splitShellCommand(cmd || "");
+  const args = {};
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (!t.startsWith("--")) continue;
+    const key = t.slice(2);
+    if (key === "use-ema") {
+      args.use_ema = true;
+      continue;
+    }
+    if (i + 1 < tokens.length && !tokens[i + 1].startsWith("--")) {
+      args[key] = tokens[i + 1];
+      i += 1;
+    } else {
+      args[key] = "";
+    }
+  }
+  return args;
+}
+
+function setStyleSelectValue(raw) {
+  if (raw == null || raw === "") {
+    els.styleId.value = "";
+    return;
+  }
+  const value = String(raw);
+  const hasOption = Array.from(els.styleId.options).some((o) => o.value === value);
+  if (!hasOption) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = value;
+    els.styleId.appendChild(opt);
+  }
+  els.styleId.value = value;
+}
+
+function applyReplicateCommand(cmd) {
+  const a = parseReplicateArgs(cmd);
+  const ckpt = a.checkpoint || "";
+  if (ckpt) {
+    const parts = ckpt.split("/").filter(Boolean);
+    const flowIdx = parts.findIndex((p, idx) => p === "flow" && idx > 0 && parts[idx - 1] === "checkpoints");
+    if (flowIdx >= 0 && flowIdx + 2 < parts.length) {
+      els.modelName.value = parts[flowIdx + 1];
+      els.modelFilename.value = parts[parts.length - 1];
+    }
+  }
+  els.vaeCheckpoint.value = a["vae-checkpoint"] || "";
+  els.dataset.value = a.dataset || "auto";
+  els.samplePath.value = a["sample-path"] || "";
+  els.camera.value = a.camera || "";
+  els.steps.value = a.steps || "8";
+  els.solver.value = a.solver || "heun";
+  setStyleSelectValue(a["style-id"] || "");
+  els.seed.value = a.seed || "";
+  els.start.value = a.start || "";
+  els.device.value = a.device || "";
+  els.outName.value = a.out || "result_smpl22.npy";
+  els.useEma.checked = Boolean(a.use_ema);
 }
 
 async function initViewports() {
@@ -310,7 +421,11 @@ async function onGenerate() {
     if (data.extract_run?.stdout) appendLog(data.extract_run.stdout);
     if (data.extract_run?.stderr) appendLog(data.extract_run.stderr);
     appendLog(`result_dir: ${data.result_dir}`);
-    if (data.meta?.replicate_command) appendLog(`replicate_command: ${data.meta.replicate_command}`);
+    if (data.meta?.replicate_command) {
+      currentReplicateCommand = data.meta.replicate_command;
+      els.replicateBtn.disabled = false;
+      appendLog(`replicate_command: ${currentReplicateCommand}`);
+    }
 
     genView.setMotion(data.generated_motion);
     condView.setMotion(data.condition_motion);
@@ -324,7 +439,17 @@ async function onGenerate() {
   }
 }
 
+function onReplicate() {
+  if (!currentReplicateCommand) {
+    appendLog("No replicate command available yet.");
+    return;
+  }
+  applyReplicateCommand(currentReplicateCommand);
+  appendLog("Replicate command loaded into form.");
+}
+
 els.generateBtn.addEventListener("click", onGenerate);
+els.replicateBtn.addEventListener("click", onReplicate);
 
 let lastTs = performance.now();
 function animate(ts) {

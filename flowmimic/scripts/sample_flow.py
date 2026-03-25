@@ -95,9 +95,14 @@ def main():
     mvh_split_val = config.get("mvh_split_val")
     genre_to_id = build_genre_to_id(config.get("aist_genres", []))
 
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
+    seed_used = args.seed
+    if seed_used is None:
+        seed_used = random.SystemRandom().randint(0, 2**31 - 1)
+    random.seed(seed_used)
+    np.random.seed(seed_used)
+    torch.manual_seed(seed_used)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_used)
 
     flow_cfg = config.get("flow", {})
     flow = ConditionalRectFlow(
@@ -303,6 +308,7 @@ def main():
         "output_dir": run_out_dir,
         "orig_len": meta.get("orig_len", ""),
         "start": meta.get("start", ""),
+        "seed": seed_used,
         "seq_len": seq_len,
         "sparse_indices": sample_idx_out,
         "tau_cond": tau_cond.tolist(),
@@ -346,8 +352,7 @@ def main():
             replicate_cmd.extend(["--sample-path", meta_out["path"]])
     if args.camera is not None:
         replicate_cmd.extend(["--camera", args.camera])
-    if args.seed is not None:
-        replicate_cmd.extend(["--seed", str(args.seed)])
+    replicate_cmd.extend(["--seed", str(seed_used)])
     if meta_out.get("start", None) is not None:
         replicate_cmd.extend(["--start", str(meta_out["start"])])
     replicate_command = _join_cmd(replicate_cmd)
@@ -369,6 +374,7 @@ def main():
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
     print(f"Updated latest symlink: {last_link} -> {run_out_dir}")
+    print(f"seed: {seed_used}")
     print(f"start: {meta_out.get('start', None)}")
     print(f"replicate_command: {replicate_command}")
     if meta.get("dataset") in ("aist", "mvh"):

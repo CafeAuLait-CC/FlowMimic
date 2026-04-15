@@ -19,7 +19,10 @@ from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
-from flowmimic.src.motion.process_motion import ik263_to_smpl22
+from flowmimic.src.motion.process_motion import (
+    align_smpl22_with_contact_and_center,
+    ik263_to_smpl22,
+)
 from flowmimic.src.data.openpose import (
     VIS_CONF_THRESHOLD,
     load_aist_openpose,
@@ -289,8 +292,8 @@ def main():
     cont_end = LAYOUT_SLICES["feet_contact"][0]
     ik263[:, :cont_end] = ik263[:, :cont_end] * std + mean
     joints = ik263_to_smpl22(ik263)
+    joints = align_smpl22_with_contact_and_center(ik263, joints)
     joints = yup_to_blender(joints)
-    joints = joints - joints[0:1, 0:1, :]
 
     os.makedirs(run_out_dir, exist_ok=True)
     out_npy = os.path.join(run_out_dir, args.out)

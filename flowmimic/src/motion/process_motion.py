@@ -18,6 +18,8 @@ _L_IDX2 = 8
 _FID_R = [8, 11]
 _FID_L = [7, 10]
 _FACE_JOINT_INDX = [2, 1, 17, 16]  # r_hip, l_hip, sdr_r, sdr_l
+_CONTACT_SLICE = (259, 263)
+_CONTACT_FOOT_JOINTS = [7, 10, 8, 11]  # [l_ankle, l_foot, r_ankle, r_foot]
 
 
 def _foot_detect(positions, thres):
@@ -169,3 +171,95 @@ def ik263_to_smpl22(features):
     if single:
         return positions[0]
     return positions
+
+
+def align_smpl22_floor_and_center(joints):
+    """
+    Basic SMPL22 alignment in Y-up space:
+    - set global floor to y=0
+    - center horizontally by first-frame pelvis x/z
+    """
+    if joints.ndim != 3 or joints.shape[1:] != (22, 3):
+        raise ValueError(f"Expected joints shape (T,22,3), got {joints.shape}")
+    if joints.shape[0] == 0:
+        return joints
+
+    out = joints.astype(np.float32, copy=True)
+    floor_y = float(np.min(out[..., 1]))
+    out[..., 1] -= floor_y
+
+    pelvis_xz0 = out[0, 0, [0, 2]].copy()
+    out[:, :, 0] -= pelvis_xz0[0]
+    out[:, :, 2] -= pelvis_xz0[1]
+    return out
+
+
+def align_smpl22_with_contact_and_center(
+    features,
+    joints,
+    contact_threshold=0.5,
+    smooth_window=5,
+):
+    """
+    Refine decoded SMPL22 joints in Y-up space:
+    1) contact-aware floor alignment around y=0
+    2) horizontal-only centering using pelvis x/z (keep vertical floor alignment)
+
+    Args:
+        features: (T, 263) decoded motion features.
+        joints: (T, 22, 3) SMPL22 joints in Y-up coordinates.
+    """
+    if features.ndim != 2 or features.shape[1] != 263:
+        raise ValueError(f"Expected features shape (T,263), got {features.shape}")
+    if joints.ndim != 3 or joints.shape[1:] != (22, 3):
+        raise ValueError(f"Expected joints shape (T,22,3), got {joints.shape}")
+
+    T = joints.shape[0]
+    if T == 0:
+        return joints
+
+    out = joints.astype(np.float32, copy=True)
+
+    c0, c1 = _CONTACT_SLICE
+    contact_raw = features[:, c0:c1].astype(np.float32, copy=False)
+    if np.any((contact_raw < 0.0) | (contact_raw > 1.0)):
+        contact_prob = 1.0 / (1.0 + np.exp(-contact_raw))
+    else:
+        contact_prob = contact_raw
+    contact_mask = contact_prob >= float(contact_threshold)
+
+    foot_y = out[:, _CONTACT_FOOT_JOINTS, 1]
+    if contact_mask.any():
+        floor_y = float(np.percentile(foot_y[contact_mask], 10.0))
+    else:
+        floor_y = float(np.min(out[..., 1]))
+    out[..., 1] -= floor_y
+
+    frame_shift = np.zeros((T,), dtype=np.float32)
+    for t in range(T):
+        active = np.where(contact_mask[t])[0]
+        if active.size > 0:
+            # Robust target when multiple contacted joints disagree.
+            frame_shift[t] = -float(np.median(foot_y[t, active] - floor_y))
+
+    if smooth_window > 1 and T > 1:
+        k = int(smooth_window)
+        k = k if (k % 2 == 1) else (k + 1)
+        pad = k // 2
+        padded = np.pad(frame_shift, (pad, pad), mode="edge")
+        kernel = np.ones((k,), dtype=np.float32) / float(k)
+        frame_shift = np.convolve(padded, kernel, mode="valid")
+
+    out[..., 1] += frame_shift[:, None]
+
+    min_y = out[..., 1].min(axis=1)
+    for t in range(T):
+        if min_y[t] < 0.0:
+            out[t, :, 1] -= min_y[t]
+
+    # Horizontal-only centering by first-frame pelvis.
+    pelvis_xz0 = out[0, 0, [0, 2]].copy()
+    out[:, :, 0] -= pelvis_xz0[0]
+    out[:, :, 2] -= pelvis_xz0[1]
+
+    return out

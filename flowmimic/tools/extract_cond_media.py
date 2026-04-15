@@ -24,6 +24,7 @@ from flowmimic.src.data.dataloader import (
     load_mvhumannet_sequence_smpl22_30fps,
     yup_to_blender,
 )
+from flowmimic.src.motion.process_motion import align_smpl22_floor_and_center
 
 
 def _parse_meta(path):
@@ -145,6 +146,7 @@ def main():
             joints = np.concatenate(
                 [joints, np.zeros((pad_len, 22, 3), dtype=joints.dtype)], axis=0
             )
+        joints = align_smpl22_floor_and_center(joints)
         joints = yup_to_blender(joints)
         np.save(smpl_out, joints)
 
@@ -204,6 +206,7 @@ def main():
         joints = np.concatenate(
             [joints, np.zeros((pad_len, 22, 3), dtype=joints.dtype)], axis=0
         )
+    joints = align_smpl22_floor_and_center(joints)
     joints = yup_to_blender(joints)
     np.save(smpl_out, joints)
 

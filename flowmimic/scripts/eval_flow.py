@@ -855,6 +855,14 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-samples", type=int, default=200)
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--vae-max-len", type=int, default=None)
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default="AIST,MVH",
+        help="Comma-separated datasets to evaluate: AIST,MVH.",
+    )
     parser.add_argument("--steps", type=str, default="16,8,4,2,1")
     parser.add_argument("--solver", type=str, default="heun")
     parser.add_argument("--cam-mode", type=str, default="fixed", choices=["fixed", "per_frame"])
@@ -876,7 +884,10 @@ def main():
 
     print("Loading config")
     cfg = load_config()
-    seq_len = cfg["seq_len"]
+    seq_len = args.seq_len or cfg["seq_len"]
+    vae_max_len = args.vae_max_len or cfg["seq_len"]
+    if seq_len > vae_max_len:
+        raise ValueError(f"--seq-len ({seq_len}) cannot exceed --vae-max-len ({vae_max_len})")
     d_z = cfg["d_z"]
     stats_path = cfg["stats_path"]
     print("Loading 263D stats")
@@ -924,7 +935,7 @@ def main():
     print("Loading VAE")
     vae_ckpt = args.vae_ckpt or cfg.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt")
     print(f"Loading VAE model: {vae_ckpt}")
-    vae = MotionVAE(d_in=cfg["d_in"], d_z=d_z, num_styles=cfg["num_styles"], max_len=seq_len).to(args.device)
+    vae = MotionVAE(d_in=cfg["d_in"], d_z=d_z, num_styles=cfg["num_styles"], max_len=vae_max_len).to(args.device)
     vae_state = torch.load(vae_ckpt, map_location=args.device)
     vae.load_state_dict(vae_state["model"])
     vae.eval()
@@ -964,52 +975,66 @@ def main():
         t2m_stats = (t2m_mean, t2m_std)
 
     print("Building datasets")
-    aist_paths = _aist_split_paths(cfg["aist_motions_dir"], cfg["aist_split_val"])
-    mvh_dirs = _read_lines(cfg["mvh_split_val"])
+    requested_datasets = {name.strip().upper() for name in args.datasets.split(",") if name.strip()}
+    allowed_datasets = {"AIST", "MVH"}
+    unknown_datasets = requested_datasets - allowed_datasets
+    if unknown_datasets:
+        raise ValueError(f"Unknown --datasets entries: {sorted(unknown_datasets)}")
+    aist_paths = _aist_split_paths(cfg["aist_motions_dir"], cfg["aist_split_val"]) if "AIST" in requested_datasets else []
+    mvh_dirs = _read_lines(cfg["mvh_split_val"]) if "MVH" in requested_datasets else []
     genre_to_id = build_genre_to_id(cfg.get("aist_genres", []))
-    aist_ds = AISTDataset(
-        cfg["aist_motions_dir"],
-        genre_to_id,
-        seq_len,
-        mean=mean,
-        std=std,
-        files=aist_paths,
-        cache_root=cfg["cache_root"],
-        target_fps=cfg.get("target_fps", 30),
-        src_fps=cfg.get("aist_fps", 60),
-        camera_ids=cfg.get("aist_cameras", ["01", "02", "08", "09"]),
-        expand_cameras=True,
-        include_cond=True,
-        openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
-        cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
-        cond_frames_min=flow_cfg.get("cond_frames_min", 7),
-        cond_frames_max=flow_cfg.get("cond_frames_max", 7),
-        cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
-    )
-    mvh_ds = MVHumanNetDataset(
-        cfg["mvhumannet_root"],
-        seq_len,
-        mean=mean,
-        std=std,
-        sequence_dirs=mvh_dirs,
-        cache_root=cfg["cache_root"],
-        target_fps=cfg.get("target_fps", 30),
-        src_fps=cfg.get("mvh_fps", 5),
-        camera_ids=cfg.get("mvh_cameras", ["22327091", "22327113", "22327084"]),
-        expand_cameras=True,
-        include_cond=True,
-        openpose_root=cfg.get("mvh_openpose_root", "data/MVHumanNet"),
-        cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
-        cond_frames_min=flow_cfg.get("cond_frames_min", 7),
-        cond_frames_max=flow_cfg.get("cond_frames_max", 7),
-        cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
-    )
-    aist_loader = torch.utils.data.DataLoader(
-        aist_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
-    )
-    mvh_loader = torch.utils.data.DataLoader(
-        mvh_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
-    )
+    loaders = []
+    if "AIST" in requested_datasets:
+        aist_ds = AISTDataset(
+            cfg["aist_motions_dir"],
+            genre_to_id,
+            seq_len,
+            mean=mean,
+            std=std,
+            files=aist_paths,
+            cache_root=cfg["cache_root"],
+            target_fps=cfg.get("target_fps", 30),
+            src_fps=cfg.get("aist_fps", 60),
+            camera_ids=cfg.get("aist_cameras", ["01", "02", "08", "09"]),
+            expand_cameras=True,
+            include_cond=True,
+            openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
+            cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
+            cond_frames_min=flow_cfg.get("cond_frames_min", 7),
+            cond_frames_max=flow_cfg.get("cond_frames_max", 7),
+            cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
+        )
+        loaders.append((
+            "AIST",
+            torch.utils.data.DataLoader(
+                aist_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
+            ),
+        ))
+    if "MVH" in requested_datasets:
+        mvh_ds = MVHumanNetDataset(
+            cfg["mvhumannet_root"],
+            seq_len,
+            mean=mean,
+            std=std,
+            sequence_dirs=mvh_dirs,
+            cache_root=cfg["cache_root"],
+            target_fps=cfg.get("target_fps", 30),
+            src_fps=cfg.get("mvh_fps", 5),
+            camera_ids=cfg.get("mvh_cameras", ["22327091", "22327113", "22327084"]),
+            expand_cameras=True,
+            include_cond=True,
+            openpose_root=cfg.get("mvh_openpose_root", "data/MVHumanNet"),
+            cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
+            cond_frames_min=flow_cfg.get("cond_frames_min", 7),
+            cond_frames_max=flow_cfg.get("cond_frames_max", 7),
+            cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
+        )
+        loaders.append((
+            "MVH",
+            torch.utils.data.DataLoader(
+                mvh_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
+            ),
+        ))
 
     eval_cfg = EvalConfig(
         seq_len=seq_len,
@@ -1046,7 +1071,7 @@ def main():
     per_sample = []
     for steps in steps_list:
         print(f"Evaluating steps={steps}")
-        for dataset_name, loader in (("AIST", aist_loader), ("MVH", mvh_loader)):
+        for dataset_name, loader in loaders:
             summary, samples = evaluate_dataset(
                 dataset_name,
                 loader,

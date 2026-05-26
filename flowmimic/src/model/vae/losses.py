@@ -37,6 +37,8 @@ def masked_bce_with_logits(logits, target, mask=None):
 
 def masked_kl(mu, logvar, mask=None):
     kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    if mask is not None and mask.shape != kl.shape[:-1]:
+        mask = None
     return _masked_mean(kl, mask)
 
 

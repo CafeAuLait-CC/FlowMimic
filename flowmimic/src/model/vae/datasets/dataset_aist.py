@@ -12,14 +12,26 @@ from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
 
 
-def _pad_or_crop(sequence, target_len):
+def _pad_or_crop(sequence, target_len, crop_mode="random", crop_index=0, crop_count=1):
     length = sequence.shape[0]
     if length == target_len:
         mask = np.ones(target_len, dtype=bool)
         return sequence, mask, 0, length
 
     if length > target_len:
-        start = random.randint(0, length - target_len)
+        if crop_mode == "first":
+            start = 0
+        elif crop_mode == "random":
+            start = random.randint(0, length - target_len)
+        elif crop_mode == "uniform":
+            max_start = length - target_len
+            if crop_count <= 1:
+                start = max_start // 2
+            else:
+                crop_index = max(0, min(int(crop_index), int(crop_count) - 1))
+                start = int(round(max_start * crop_index / (int(crop_count) - 1)))
+        else:
+            raise ValueError(f"Unsupported crop_mode: {crop_mode}")
         clip = sequence[start : start + target_len]
         mask = np.ones(target_len, dtype=bool)
         return clip, mask, start, length
@@ -53,6 +65,8 @@ class AISTDataset(Dataset):
         cond_frames_min=None,
         cond_frames_max=None,
         cond_drop_prob=0.0,
+        crop_mode="random",
+        clip_repeat=1,
     ):
         if files is None:
             self.files = sorted(glob.glob(os.path.join(aist_dir, "*.pkl")))
@@ -76,9 +90,20 @@ class AISTDataset(Dataset):
         self.cond_frames_min = cond_frames_min
         self.cond_frames_max = cond_frames_max
         self.cond_drop_prob = cond_drop_prob
+        self.crop_mode = crop_mode
+        self.clip_repeat = max(1, int(clip_repeat))
         self._clip_counts = None
         self._index_map = None
         self._build_index_map()
+
+    def _condition_frame_counts(self):
+        min_frames = int(self.cond_frames_min or 1)
+        max_frames = int(self.cond_frames_max or min_frames)
+        min_frames = max(1, min(min_frames, self.seq_len))
+        max_frames = max(min_frames, min(max_frames, self.seq_len))
+        if max_frames > min_frames:
+            return random.randint(min_frames, max_frames), max_frames
+        return min_frames, max_frames
 
     def __len__(self):
         return len(self._index_map)
@@ -86,9 +111,16 @@ class AISTDataset(Dataset):
     def __getitem__(self, idx):
         entry = self._index_map[idx]
         if isinstance(entry, tuple):
-            file_idx, camera = entry
+            if len(entry) == 2:
+                file_idx, camera = entry
+                crop_index, crop_count = 0, 1
+            elif len(entry) == 4:
+                file_idx, camera, crop_index, crop_count = entry
+            else:
+                raise ValueError(f"Unsupported AIST index entry: {entry}")
         else:
             file_idx, camera = entry, None
+            crop_index, crop_count = 0, 1
         path = self.files[file_idx]
         motion = None
         if self.cache_root:
@@ -106,7 +138,13 @@ class AISTDataset(Dataset):
             if self.cache_root:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                 np.save(cache_path, motion)
-        motion, mask, start, orig_len = _pad_or_crop(motion, self.seq_len)
+        motion, mask, start, orig_len = _pad_or_crop(
+            motion,
+            self.seq_len,
+            crop_mode=self.crop_mode,
+            crop_index=crop_index,
+            crop_count=crop_count,
+        )
         if not np.isfinite(motion).all():
             return self.__getitem__((idx + 1) % len(self.files))
         if motion.shape[-1] != 263:
@@ -126,7 +164,14 @@ class AISTDataset(Dataset):
 
         genre = get_genre_code(path)
         style_id = self.genre_to_id.get(genre, 0)
-        meta = {"path": path, "genre": genre, "start": start, "orig_len": orig_len}
+        meta = {
+            "path": path,
+            "genre": genre,
+            "start": start,
+            "orig_len": orig_len,
+            "crop_index": crop_index,
+            "crop_count": crop_count,
+        }
         if camera is not None:
             meta["camera"] = camera
         sample = {
@@ -170,7 +215,7 @@ class AISTDataset(Dataset):
                     [conf, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
                 )
             t_len = k2d.shape[0]
-            k_frames = self.cond_frames_min or 1
+            k_frames, frame_budget = self._condition_frame_counts()
             if t_len <= k_frames:
                 idxs = np.arange(t_len)
             else:
@@ -185,7 +230,7 @@ class AISTDataset(Dataset):
                 vis_sparse = vis_sparse * (~drop)
                 conf_sparse = conf_sparse * (~drop)
                 k2d_sparse = k2d_sparse * vis_sparse[..., None]
-            pad = k_frames - valid_len
+            pad = frame_budget - valid_len
             if pad > 0:
                 k2d_sparse = np.concatenate(
                     [k2d_sparse, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0
@@ -221,14 +266,27 @@ class AISTDataset(Dataset):
         cams = self.camera_ids if self.expand_cameras and self.camera_ids else None
         for i, path in enumerate(self.files):
             length = self._sequence_length(path)
-            clips = max(1, length // self.seq_len)
+            if self.crop_mode == "first":
+                clips = 1
+            elif self.crop_mode == "uniform":
+                clips = max(1, length // self.seq_len) * self.clip_repeat
+            else:
+                clips = max(1, length // self.seq_len) * self.clip_repeat
             clip_counts.append(clips)
             if cams is None:
-                index_map.extend([i] * clips)
+                if self.crop_mode == "uniform":
+                    index_map.extend(
+                        (i, None, crop_idx, clips) for crop_idx in range(clips)
+                    )
+                else:
+                    index_map.extend([i] * clips)
             else:
-                for _ in range(clips):
+                for crop_idx in range(clips):
                     for cam in cams:
-                        index_map.append((i, cam))
+                        if self.crop_mode == "uniform":
+                            index_map.append((i, cam, crop_idx, clips))
+                        else:
+                            index_map.append((i, cam))
         self._clip_counts = clip_counts
         self._index_map = index_map
 

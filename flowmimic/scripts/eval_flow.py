@@ -44,6 +44,7 @@ from flowmimic.src.motion.ik.utils.paramUtil import t2m_kinematic_chain
 class EvalConfig:
     seq_len: int
     d_z: int
+    latent_len: int
     fps: int
     slack_seconds: float
     cam_mode: str
@@ -57,6 +58,26 @@ def _read_lines(path):
 def _aist_split_paths(aist_dir, split_path):
     names = _read_lines(split_path)
     return [os.path.join(aist_dir, f"{name}.pkl") for name in names]
+
+
+def _aist_paths_for_splits(cfg, split_names):
+    paths = []
+    for split in split_names:
+        split = split.strip().lower()
+        if not split:
+            continue
+        split_path = cfg.get(f"aist_split_{split}")
+        if split_path is None:
+            split_path = f"data/AIST++/Annotations/splits/pose_{split}.txt"
+        paths.extend(_aist_split_paths(cfg["aist_motions_dir"], split_path))
+    seen = set()
+    unique = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
 
 
 def _normalize_meta(metas_raw):
@@ -452,6 +473,8 @@ def _generate_batch(
     k2d_mean,
     k2d_std,
     d_z,
+    latent_len,
+    guidance_scale=1.0,
 ):
     t_start = time.perf_counter()
     t_flow_start = time.perf_counter()
@@ -467,9 +490,8 @@ def _generate_batch(
                 vis_batch[empty, 0] = 0.0
                 tau_cond[empty, 0] = 0.0
                 mask_cond[empty, 0] = True
-        seq_len = motion.shape[1]
-        tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
-        x0 = torch.randn(motion.shape[0], seq_len, d_z, device=device)
+        tau_out = torch.linspace(0.0, 1.0, steps=latent_len, device=device)
+        x0 = torch.randn(motion.shape[0], latent_len, d_z, device=device)
         g2d, mem, _vis = flow.cond_encoder(
             k2d_batch,
             tau_cond,
@@ -481,6 +503,29 @@ def _generate_batch(
         style = flow.style_emb(style_id, domain_id, apply_dropout=False)
         g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
         cond_batch = {"tau_out": tau_out, "mem": mem, "g": g}
+        if guidance_scale != 1.0:
+            k2d_uncond = torch.zeros_like(k2d_batch)
+            vis_uncond = torch.zeros_like(vis_batch)
+            g2d_uncond, mem_uncond, _ = flow.cond_encoder(
+                k2d_uncond,
+                tau_cond,
+                vis_mask=vis_uncond,
+                mask_cond=mask_cond,
+                mean=k2d_mean,
+                std=k2d_std,
+            )
+            style_uncond = flow.style_emb(
+                torch.zeros_like(style_id), domain_id, apply_dropout=False
+            )
+            g_uncond = flow.cond_mlp(torch.cat([g2d_uncond, style_uncond], dim=-1))
+            cond_batch.update(
+                {
+                    "mem_uncond": mem_uncond,
+                    "g_uncond": g_uncond,
+                    "mem_mask_uncond": ~mask_cond,
+                    "guidance_scale": guidance_scale,
+                }
+            )
         z_hat = solve_flow(flow.flow, x0, cond_batch, num_steps=steps, method=solver)
         if isinstance(device, torch.device) and device.type == "cuda":
             torch.cuda.synchronize()
@@ -590,6 +635,7 @@ def evaluate_dataset(
     multimodality_repeats=1,
     multimodality_times=20,
     skip_empty_cond=True,
+    guidance_scale=1.0,
 ):
     print(f"Evaluating {name} (steps={steps})")
     mean, std = stats
@@ -702,6 +748,8 @@ def evaluate_dataset(
             k2d_mean,
             k2d_std,
             cfg.d_z,
+            cfg.latent_len,
+            guidance_scale=guidance_scale,
         )
         total_time_net += net_time
         total_time_full += full_time
@@ -803,6 +851,8 @@ def evaluate_dataset(
                         k2d_mean,
                         k2d_std,
                         cfg.d_z,
+                        cfg.latent_len,
+                        guidance_scale=guidance_scale,
                     )
                     mm_batch.append(
                         _extract_t2m_features(
@@ -852,11 +902,27 @@ def main():
     parser.add_argument("--t2m-motion-encoder-ckpt", default=None)
     parser.add_argument("--t2m-mean-path", default=None)
     parser.add_argument("--t2m-std-path", default=None)
+    parser.add_argument("--stats-path", default=None)
+    parser.add_argument("--openpose-stats-path", default=None)
+    parser.add_argument("--latent-stats-path", default=None)
+    parser.add_argument(
+        "--aist-crop-mode", choices=("first", "random", "uniform"), default="first"
+    )
+    parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-samples", type=int, default=200)
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--vae-max-len", type=int, default=None)
+    parser.add_argument("--vae-latent-len", type=int, default=None)
+    parser.add_argument(
+        "--vae-latent-token-mode",
+        choices=("pool", "query"),
+        default=None,
+    )
+    parser.add_argument("--cond-frames", type=int, default=None)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument("--aist-splits", type=str, default="val")
     parser.add_argument(
         "--datasets",
         type=str,
@@ -867,6 +933,12 @@ def main():
     parser.add_argument("--solver", type=str, default="heun")
     parser.add_argument("--cam-mode", type=str, default="fixed", choices=["fixed", "per_frame"])
     parser.add_argument("--slack-seconds", type=float, default=0.1)
+    parser.add_argument(
+        "--cond-drop-prob",
+        type=float,
+        default=0.0,
+        help="Drop probability for sparse conditioning keypoints during eval. Defaults to 0; training augmentation should not be applied to validation.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-csv", type=str, default=None)
@@ -889,10 +961,12 @@ def main():
     if seq_len > vae_max_len:
         raise ValueError(f"--seq-len ({seq_len}) cannot exceed --vae-max-len ({vae_max_len})")
     d_z = cfg["d_z"]
-    stats_path = cfg["stats_path"]
+    stats_path = args.stats_path or cfg["stats_path"]
     print("Loading 263D stats")
     mean, std = load_mean_std(stats_path)
-    openpose_stats_path = cfg.get("openpose_stats_path", "data/openpose_stats.npz")
+    openpose_stats_path = args.openpose_stats_path or cfg.get(
+        "openpose_stats_path", "data/openpose_stats.npz"
+    )
     print("Loading OpenPose stats")
     if os.path.exists(openpose_stats_path):
         op_stats = np.load(openpose_stats_path)
@@ -900,7 +974,9 @@ def main():
         k2d_std = op_stats["std"]
     else:
         raise FileNotFoundError(f"OpenPose stats not found: {openpose_stats_path}")
-    latent_stats_path = cfg.get("latent_stats_path", "data/latent_stats.npz")
+    latent_stats_path = args.latent_stats_path or cfg.get(
+        "latent_stats_path", "data/latent_stats.npz"
+    )
     latent_mean = None
     latent_std = None
     print("Loading latent stats")
@@ -929,14 +1005,31 @@ def main():
     ).to(args.device)
     print(f"Loading flow model: {args.flow_ckpt}")
     state = torch.load(args.flow_ckpt, map_location=args.device)
-    flow.load_state_dict(state["model"])
+    flow_state = state.get("ema") if args.use_ema and "ema" in state else state["model"]
+    if args.use_ema and "ema" not in state:
+        print("Warning: --use-ema requested but checkpoint has no EMA state; using model.")
+    flow.load_state_dict(flow_state)
     flow.eval()
 
     print("Loading VAE")
     vae_ckpt = args.vae_ckpt or cfg.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt")
     print(f"Loading VAE model: {vae_ckpt}")
-    vae = MotionVAE(d_in=cfg["d_in"], d_z=d_z, num_styles=cfg["num_styles"], max_len=vae_max_len).to(args.device)
     vae_state = torch.load(vae_ckpt, map_location=args.device)
+    vae_config = vae_state.get("config", {})
+    vae_latent_len = args.vae_latent_len
+    if vae_latent_len is None:
+        vae_latent_len = vae_config.get("latent_len")
+    vae_latent_token_mode = (
+        args.vae_latent_token_mode or vae_config.get("latent_token_mode", "pool")
+    )
+    vae = MotionVAE(
+        d_in=cfg["d_in"],
+        d_z=d_z,
+        num_styles=cfg["num_styles"],
+        max_len=vae_max_len,
+        latent_len=vae_latent_len,
+        latent_token_mode=vae_latent_token_mode,
+    ).to(args.device)
     vae.load_state_dict(vae_state["model"])
     vae.eval()
 
@@ -980,7 +1073,11 @@ def main():
     unknown_datasets = requested_datasets - allowed_datasets
     if unknown_datasets:
         raise ValueError(f"Unknown --datasets entries: {sorted(unknown_datasets)}")
-    aist_paths = _aist_split_paths(cfg["aist_motions_dir"], cfg["aist_split_val"]) if "AIST" in requested_datasets else []
+    aist_paths = (
+        _aist_paths_for_splits(cfg, args.aist_splits.split(","))
+        if "AIST" in requested_datasets
+        else []
+    )
     mvh_dirs = _read_lines(cfg["mvh_split_val"]) if "MVH" in requested_datasets else []
     genre_to_id = build_genre_to_id(cfg.get("aist_genres", []))
     loaders = []
@@ -1000,9 +1097,10 @@ def main():
             include_cond=True,
             openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
-            cond_frames_min=flow_cfg.get("cond_frames_min", 7),
-            cond_frames_max=flow_cfg.get("cond_frames_max", 7),
-            cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
+            cond_frames_min=args.cond_frames or flow_cfg.get("cond_frames_min", 7),
+            cond_frames_max=args.cond_frames or flow_cfg.get("cond_frames_max", 7),
+            cond_drop_prob=args.cond_drop_prob,
+            crop_mode=args.aist_crop_mode,
         )
         loaders.append((
             "AIST",
@@ -1025,9 +1123,9 @@ def main():
             include_cond=True,
             openpose_root=cfg.get("mvh_openpose_root", "data/MVHumanNet"),
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
-            cond_frames_min=flow_cfg.get("cond_frames_min", 7),
-            cond_frames_max=flow_cfg.get("cond_frames_max", 7),
-            cond_drop_prob=flow_cfg.get("cond_drop_prob", 0.0),
+            cond_frames_min=args.cond_frames or flow_cfg.get("cond_frames_min", 7),
+            cond_frames_max=args.cond_frames or flow_cfg.get("cond_frames_max", 7),
+            cond_drop_prob=args.cond_drop_prob,
         )
         loaders.append((
             "MVH",
@@ -1039,6 +1137,7 @@ def main():
     eval_cfg = EvalConfig(
         seq_len=seq_len,
         d_z=d_z,
+        latent_len=args.vae_latent_len or seq_len,
         fps=cfg.get("target_fps", 30),
         slack_seconds=args.slack_seconds,
         cam_mode=args.cam_mode,
@@ -1049,9 +1148,9 @@ def main():
         "mvh_root": cfg.get("mvh_openpose_root", "data/MVHumanNet"),
         "mv_root": cfg["mvhumannet_root"],
         "mvh_cameras": cfg.get("mvh_cameras", ["22327091", "22327113", "22327084"]),
-        "cond_frames_min": flow_cfg.get("cond_frames_min", 2),
-        "cond_frames_max": flow_cfg.get("cond_frames_max", 10),
-        "cond_drop_prob": flow_cfg.get("cond_drop_prob", 0.0),
+        "cond_frames_min": args.cond_frames or flow_cfg.get("cond_frames_min", 2),
+        "cond_frames_max": args.cond_frames or flow_cfg.get("cond_frames_max", 10),
+        "cond_drop_prob": args.cond_drop_prob,
         "aist_fps": cfg.get("aist_fps", 60),
         "mvh_fps": cfg.get("mvh_fps", 5),
         "target_fps": cfg.get("target_fps", 30),
@@ -1095,6 +1194,7 @@ def main():
                 diversity_times=args.diversity_times,
                 multimodality_repeats=args.multimodality_repeats,
                 multimodality_times=args.multimodality_times,
+                guidance_scale=args.guidance_scale,
             )
             row = {"dataset": dataset_name, "steps": steps}
             row.update(summary)

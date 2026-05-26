@@ -17,7 +17,7 @@ class ConditionalRectFlow(nn.Module):
         dropout=0.1,
         num_styles=1,
         style_dim=32,
-        cond_dim=256,
+        cond_dim=512,
         num_joints_2d=25,
         cond_layers=4,
         cond_heads=4,

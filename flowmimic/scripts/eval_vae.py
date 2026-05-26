@@ -72,8 +72,22 @@ def run_eval(loader, model, device, mean, std, w_contact, w_root):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--datasets", type=str, default="AIST")
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--stats-path", type=str, default=None)
+    parser.add_argument("--latent-len", type=int, default=None)
+    parser.add_argument(
+        "--latent-token-mode",
+        choices=("pool", "query"),
+        default=None,
+    )
+    parser.add_argument(
+        "--aist-crop-mode", choices=("first", "random", "uniform"), default="first"
+    )
+    parser.add_argument("--aist-clip-repeat", type=int, default=1)
+    parser.add_argument("--w-contact", type=float, default=None)
+    parser.add_argument("--w-root", type=float, default=None)
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -84,6 +98,12 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
+    datasets = {name.strip().upper() for name in args.datasets.split(",") if name.strip()}
+    unknown = datasets - {"AIST", "MVH"}
+    if unknown:
+        raise ValueError(f"Unsupported datasets: {sorted(unknown)}")
+    use_aist = "AIST" in datasets
+    use_mvh = "MVH" in datasets
     aist_dir = config["aist_motions_dir"]
     mv_root = config["mvhumannet_root"]
     seq_len = args.seq_len or config["seq_len"]
@@ -92,7 +112,7 @@ def main():
     pin_memory = config["pin_memory"]
     persistent_workers = config["persistent_workers"]
     prefetch_factor = config["prefetch_factor"]
-    stats_path = config["stats_path"]
+    stats_path = args.stats_path or config["stats_path"]
     target_fps = config.get("target_fps", 30)
     aist_fps = config.get("aist_fps", 60)
     mvh_fps = config.get("mvh_fps", 5)
@@ -100,12 +120,12 @@ def main():
     aist_split_val = config["aist_split_val"]
     mvh_split_val = config["mvh_split_val"]
 
-    if not os.path.exists(aist_split_val):
+    if use_aist and not os.path.exists(aist_split_val):
         raise FileNotFoundError(f"AIST split file not found: {aist_split_val}")
-    if not os.path.exists(mvh_split_val):
+    if use_mvh and not os.path.exists(mvh_split_val):
         raise FileNotFoundError(f"MVHumanNet split file not found: {mvh_split_val}")
-    w_contact = config["w_contact"]
-    w_root = config.get("w_root", 1.0)
+    w_contact = args.w_contact if args.w_contact is not None else config["w_contact"]
+    w_root = args.w_root if args.w_root is not None else config.get("w_root", 1.0)
 
     if args.genre_map and os.path.exists(args.genre_map):
         with open(args.genre_map, "r", encoding="utf-8") as f:
@@ -126,60 +146,83 @@ def main():
         names = read_lines(split_path)
         return [os.path.join(aist_dir, f"{name}.pkl") for name in names]
 
-    aist_val_paths = aist_split_paths(aist_split_val)
-    mvh_val_dirs = read_lines(mvh_split_val)
+    loaders = []
+    if use_aist:
+        aist_val_paths = aist_split_paths(aist_split_val)
+        dataset_a = AISTDataset(
+            aist_dir,
+            genre_to_id,
+            seq_len,
+            mean=mean,
+            std=std,
+            files=aist_val_paths,
+            cache_root=cache_root,
+            target_fps=target_fps,
+            src_fps=aist_fps,
+            crop_mode=args.aist_crop_mode,
+            clip_repeat=args.aist_clip_repeat,
+        )
+        loaders.append(
+            (
+                "AIST++",
+                DataLoader(
+                    dataset_a,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=persistent_workers,
+                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                ),
+            )
+        )
+    if use_mvh:
+        mvh_val_dirs = read_lines(mvh_split_val)
+        dataset_b = MVHumanNetDataset(
+            mv_root,
+            seq_len,
+            mean=mean,
+            std=std,
+            sequence_dirs=mvh_val_dirs,
+            cache_root=cache_root,
+            target_fps=target_fps,
+            src_fps=mvh_fps,
+        )
+        loaders.append(
+            (
+                "MVHumanNet",
+                DataLoader(
+                    dataset_b,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=persistent_workers,
+                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                ),
+            )
+        )
 
-    dataset_a = AISTDataset(
-        aist_dir,
-        genre_to_id,
-        seq_len,
-        mean=mean,
-        std=std,
-        files=aist_val_paths,
-        cache_root=cache_root,
-        target_fps=target_fps,
-        src_fps=aist_fps,
-    )
-    dataset_b = MVHumanNetDataset(
-        mv_root,
-        seq_len,
-        mean=mean,
-        std=std,
-        sequence_dirs=mvh_val_dirs,
-        cache_root=cache_root,
-        target_fps=target_fps,
-        src_fps=mvh_fps,
-    )
-
-    loader_a = DataLoader(
-        dataset_a,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-    )
-    loader_b = DataLoader(
-        dataset_b,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-    )
-
-    model = MotionVAE(d_in=d_in, d_z=d_z, num_styles=num_styles, max_len=seq_len)
     state = torch.load(args.checkpoint, map_location=args.device)
+    ckpt_config = state.get("config", {})
+    latent_len = args.latent_len
+    if latent_len is None:
+        latent_len = ckpt_config.get("latent_len")
+    latent_token_mode = args.latent_token_mode or ckpt_config.get("latent_token_mode", "pool")
+    model = MotionVAE(
+        d_in=d_in,
+        d_z=d_z,
+        num_styles=num_styles,
+        max_len=seq_len,
+        latent_len=latent_len,
+        latent_token_mode=latent_token_mode,
+    )
     model.load_state_dict(state["model"])
     model.to(args.device)
 
-    aist_metrics = run_eval(loader_a, model, args.device, mean, std, w_contact, w_root)
-    mvh_metrics = run_eval(loader_b, model, args.device, mean, std, w_contact, w_root)
-
-    print("AIST++ metrics", aist_metrics)
-    print("MVHumanNet metrics", mvh_metrics)
+    for name, loader in loaders:
+        metrics = run_eval(loader, model, args.device, mean, std, w_contact, w_root)
+        print(f"{name} metrics", metrics)
 
 
 if __name__ == "__main__":

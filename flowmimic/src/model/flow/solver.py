@@ -3,7 +3,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 def _flow_eval(flow_fn, x, t, cond_batch):
-    return flow_fn(
+    v_cond = flow_fn(
         x,
         t,
         cond_batch["tau_out"],
@@ -11,6 +11,23 @@ def _flow_eval(flow_fn, x, t, cond_batch):
         cond_batch["g"],
         cond_batch.get("mem_mask"),
     )
+    guidance_scale = cond_batch.get("guidance_scale")
+    if (
+        guidance_scale is None
+        or float(guidance_scale) == 1.0
+        or "mem_uncond" not in cond_batch
+        or "g_uncond" not in cond_batch
+    ):
+        return v_cond
+    v_uncond = flow_fn(
+        x,
+        t,
+        cond_batch["tau_out"],
+        cond_batch["mem_uncond"],
+        cond_batch["g_uncond"],
+        cond_batch.get("mem_mask_uncond"),
+    )
+    return v_uncond + float(guidance_scale) * (v_cond - v_uncond)
 
 
 def solve_flow(

@@ -1,0 +1,33 @@
+FOLDER: '/mnt/data3_hdd/alex/FlowMimic/runs/mld'
+
+TEST:
+  FOLDER: '/mnt/data3_hdd/alex/FlowMimic/runs/mld_results'
+
+DATASET:
+  SMPL_PATH: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/smpl'
+  TRANSFORM_PATH: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/transforms/'
+  WORD_VERTILIZER_PATH: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/glove/'
+  KIT:
+    ROOT: '/mnt/data2_ssd/alex/motion-latent-diffusion/datasets/kit-ml'
+    SPLIT_ROOT: '/mnt/data2_ssd/alex/motion-latent-diffusion/datasets/kit-ml'
+  HUMANML3D:
+    ROOT: '/mnt/data3_hdd/alex/FlowMimic/prepared/aist_mld_humanml3d'
+    SPLIT_ROOT: '/mnt/data3_hdd/alex/FlowMimic/prepared/aist_mld_humanml3d'
+  HUMANACT12:
+    ROOT: '/mnt/data2_ssd/alex/motion-latent-diffusion/datasets/HumanAct12Poses'
+    SPLIT_ROOT: '/mnt/data2_ssd/alex/motion-latent-diffusion/datasets/HumanAct12Poses'
+  UESTC:
+    ROOT: '/mnt/data2_ssd/alex/motion-latent-diffusion/datasets/uestc'
+    SPLIT_ROOT: '/mnt/data2_ssd/alex/motion-latent-diffusion/datasets/uestc'
+
+model:
+  bert_path: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/distilbert-base-uncased'
+  clip_path: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/clip-vit-large-patch14'
+  t2m_path: '/mnt/data3_hdd/alex/FlowMimic/runs/aist_t2m_evaluator_deps'
+  humanact12_rec_path: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/actionrecognition'
+  uestc_rec_path: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/actionrecognition'
+
+RENDER:
+  BLENDER_PATH: 'blender'
+  FACES_PATH: '/mnt/data2_ssd/alex/motion-latent-diffusion/deps/smplh/smplh.faces'
+  FOLDER: '/mnt/data3_hdd/alex/FlowMimic/runs/mld_animations'

@@ -66,6 +66,16 @@ def _recover_smpl22(raw_features: torch.Tensor) -> np.ndarray:
     return joints
 
 
+def _convert_output_space(joints: np.ndarray, output_space: str) -> np.ndarray:
+    if output_space == "yup":
+        return joints
+    if output_space == "blender":
+        from flowmimic.src.data.dataloader import yup_to_blender
+
+        return yup_to_blender(joints).astype(np.float32)
+    raise ValueError(f"Unsupported output space: {output_space}")
+
+
 def _load_flowmimic_model(ckpt_path: str, device: torch.device):
     from flowmimic.src.model.vae.motion_vae import MotionVAE
 
@@ -81,6 +91,38 @@ def _load_flowmimic_model(ckpt_path: str, device: torch.device):
         num_styles=num_styles,
         latent_len=latent_len,
         latent_token_mode=latent_token_mode,
+    ).to(device)
+    model.load_state_dict(state)
+    model.eval()
+    return model, ckpt
+
+
+def _load_vqvae_model(ckpt_path: str, device: torch.device):
+    from flowmimic.src.model.vae.motion_vqvae import MotionVQVAE
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state = ckpt["model"]
+    config = ckpt.get("config", {})
+    latent_token_mode = config.get(
+        "latent_token_mode", "query" if "latent_queries" in state else "pool"
+    )
+    if "latent_queries" in state:
+        latent_len = state["latent_queries"].shape[1]
+    elif "latent_pos" in state:
+        latent_len = state["latent_pos"].shape[1]
+    else:
+        latent_len = config.get("latent_len")
+    model = MotionVQVAE(
+        d_in=state["enc_in.weight"].shape[1],
+        d_z=state["to_latent.weight"].shape[0],
+        d_model=state["enc_in.weight"].shape[0],
+        max_len=state["enc_pos"].shape[1],
+        num_styles=state["cond.style_emb.weight"].shape[0],
+        latent_len=latent_len,
+        latent_token_mode=latent_token_mode,
+        codebook_size=state["quantizer.embed"].shape[0],
+        commitment_weight=config.get("commitment_weight", 0.25),
+        codebook_decay=config.get("codebook_decay", 0.99),
     ).to(device)
     model.load_state_dict(state)
     model.eval()
@@ -117,6 +159,38 @@ def _flowmimic_reconstruct(
         _enc_h, mu, _logvar = model.encode(norm, cond, mask=mask)
         pred_norm = model.decode(mu, cond, mask=mask, out_len=raw.shape[1])
     pred = pred_norm.clone()
+    pred[..., :CONT_END] = pred[..., :CONT_END] * std + mean
+    pred[..., CONT_END:] = torch.sigmoid(pred[..., CONT_END:])
+    return pred
+
+
+def _vqvae_reconstruct(
+    model,
+    raw: torch.Tensor,
+    stats_path: str,
+    names: list[str],
+    genre_to_id: dict[str, int],
+    device: torch.device,
+):
+    from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
+
+    mean, std = _load_stats_npz(stats_path, device)
+    norm = raw.clone()
+    norm[..., :CONT_END] = (norm[..., :CONT_END] - mean) / std
+    domain_id = torch.ones(raw.shape[0], dtype=torch.long, device=device)
+    style_id = torch.zeros(raw.shape[0], dtype=torch.long, device=device)
+    for i, name in enumerate(names):
+        style_id[i] = int(genre_to_id.get(get_genre_code(name), 0))
+    mask = torch.ones(raw.shape[:2], dtype=torch.bool, device=device)
+    with torch.no_grad():
+        outputs = model(
+            norm,
+            domain_id,
+            style_id,
+            mask=mask,
+            update_codebook=False,
+        )
+    pred = outputs["x_hat"].clone()
     pred[..., :CONT_END] = pred[..., :CONT_END] * std + mean
     pred[..., CONT_END:] = torch.sigmoid(pred[..., CONT_END:])
     return pred
@@ -188,11 +262,30 @@ def main() -> None:
         "--mld-ckpt",
         default="runs/mld/mld/aist_ik263_vae_196/checkpoints/epoch=5999.ckpt",
     )
+    parser.add_argument(
+        "--vqvae-latest-ckpt",
+        default="checkpoints/vqvae/aist_mvh_len196_latent16_code1024_ddp_260609-134633/motion_vqvae_latest.pt",
+    )
+    parser.add_argument(
+        "--vqvae-best-ckpt",
+        default="checkpoints/vqvae/aist_mvh_len196_latent16_code1024_ddp_260609-134633/motion_vqvae_best.pt",
+    )
+    parser.add_argument(
+        "--vqvae-stats",
+        default=None,
+        help="Optional stats path override for VQ-VAE checkpoints.",
+    )
     parser.add_argument("--genre-map", default="flowmimic/src/config/genre_to_id.json")
     parser.add_argument(
         "--models",
         default="input,old,compact,mld",
-        help="Comma-separated subset: input,old,compact,mld.",
+        help="Comma-separated subset: input,old,compact,mld,vqvae_latest,vqvae_best.",
+    )
+    parser.add_argument(
+        "--output-space",
+        choices=("blender", "yup"),
+        default="blender",
+        help="Coordinate space for saved SMPL22 npy clips. blender is Z-up; yup preserves the model/eval space.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -217,7 +310,14 @@ def main() -> None:
         genre_to_id = json.load(f)
 
     requested_models = {item.strip().lower() for item in args.models.split(",") if item.strip()}
-    unknown_models = requested_models - {"input", "old", "compact", "mld"}
+    unknown_models = requested_models - {
+        "input",
+        "old",
+        "compact",
+        "mld",
+        "vqvae_latest",
+        "vqvae_best",
+    }
     if unknown_models:
         raise ValueError(f"Unknown --models entries: {sorted(unknown_models)}")
 
@@ -244,6 +344,18 @@ def main() -> None:
     if "mld" in requested_models:
         mld = _load_mld_model(args.mld_ckpt, device)
         recon["mld"] = _mld_reconstruct(mld, raw, data_root, device)
+    if "vqvae_latest" in requested_models:
+        vqvae_latest, vqvae_latest_ckpt = _load_vqvae_model(args.vqvae_latest_ckpt, device)
+        vqvae_latest_stats = args.vqvae_stats or vqvae_latest_ckpt.get("stats_path") or old_stats
+        recon["vqvae_latest"] = _vqvae_reconstruct(
+            vqvae_latest, raw, vqvae_latest_stats, names, genre_to_id, device
+        )
+    if "vqvae_best" in requested_models:
+        vqvae_best, vqvae_best_ckpt = _load_vqvae_model(args.vqvae_best_ckpt, device)
+        vqvae_best_stats = args.vqvae_stats or vqvae_best_ckpt.get("stats_path") or old_stats
+        recon["vqvae_best_val"] = _vqvae_reconstruct(
+            vqvae_best, raw, vqvae_best_stats, names, genre_to_id, device
+        )
     joints = {key: _recover_smpl22(value) for key, value in recon.items()}
 
     manifest_rows = []
@@ -251,7 +363,7 @@ def main() -> None:
         safe = _safe_name(name)
         for key, value in joints.items():
             out_path = output_dir / f"{i:03d}_{safe}_{key}.npy"
-            clip = value[i]
+            clip = _convert_output_space(value[i], args.output_space)
             if clip.shape != (196, 22, 3):
                 raise ValueError(f"{out_path} has bad shape {clip.shape}")
             if not np.isfinite(clip).all():
@@ -264,12 +376,23 @@ def main() -> None:
                     "kind": key,
                     "path": str(out_path),
                     "shape": "196,22,3",
+                    "coordinate_space": args.output_space,
                 }
             )
 
     manifest_path = output_dir / "manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["index", "sample", "kind", "path", "shape"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "index",
+                "sample",
+                "kind",
+                "path",
+                "shape",
+                "coordinate_space",
+            ],
+        )
         writer.writeheader()
         writer.writerows(manifest_rows)
 
@@ -283,9 +406,13 @@ def main() -> None:
                 "compact_flowmimic_ckpt": args.compact_flowmimic_ckpt,
                 "compact_flowmimic_stats": compact_stats,
                 "mld_ckpt": args.mld_ckpt,
+                "vqvae_latest_ckpt": args.vqvae_latest_ckpt,
+                "vqvae_best_ckpt": args.vqvae_best_ckpt,
+                "vqvae_stats": args.vqvae_stats,
                 "split": args.split,
                 "manifest": args.manifest,
                 "models": sorted(requested_models),
+                "output_space": args.output_space,
             },
             indent=2,
         ),

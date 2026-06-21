@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
@@ -25,6 +26,7 @@ from flowmimic.src.model.vae.datasets.label_map_builder import (
     save_genre_to_id,
 )
 from flowmimic.src.model.vae.losses import (
+    LAYOUT_SLICES,
     continuous_smoothness_loss,
     grouped_recon_loss,
     masked_kl,
@@ -32,6 +34,7 @@ from flowmimic.src.model.vae.losses import (
 )
 from flowmimic.src.model.vae.motion_vae import MotionVAE
 from flowmimic.src.model.vae.stats import compute_mean_std_from_splits, load_mean_std
+from flowmimic.src.motion.process_motion import ik263_to_smpl22
 
 
 def merge_batches(batches):
@@ -85,6 +88,78 @@ def read_lines(path):
 def aist_split_paths(aist_dir, split_path):
     names = read_lines(split_path)
     return [os.path.join(aist_dir, f"{name}.pkl") for name in names]
+
+
+def _denormalize_ik263(motion, mean, std):
+    motion_np = motion.detach().cpu().numpy().astype(np.float32)
+    motion_np = motion_np.copy()
+    cont_end = LAYOUT_SLICES["feet_contact"][0]
+    motion_np[..., :cont_end] = motion_np[..., :cont_end] * std + mean
+    return motion_np
+
+
+def fixed_aist_joint_recon_metrics(model, loader, device, mean, std, max_samples):
+    if loader is None or max_samples <= 0:
+        return {}
+
+    joint_mse_sum = 0.0
+    joint_l2_sum = 0.0
+    root_l2_sum = 0.0
+    coord_count = 0
+    joint_count = 0
+    root_count = 0
+    used = 0
+    mean = mean.astype(np.float32)
+    std = std.astype(np.float32)
+
+    with torch.no_grad():
+        for batch in loader:
+            motion = batch["motion"].to(device)
+            domain_id = batch["domain_id"].to(device)
+            style_id = batch["style_id"].to(device)
+            mask = batch["mask"].to(device)
+            if used + motion.shape[0] > max_samples:
+                keep = max_samples - used
+                motion = motion[:keep]
+                domain_id = domain_id[:keep]
+                style_id = style_id[:keep]
+                mask = mask[:keep]
+
+            cond = model.cond(domain_id, style_id)
+            _, mu, _ = model.encode(motion, cond, mask=mask)
+            x_hat = model.decode(mu, cond, mask=mask, out_len=motion.shape[1])
+
+            pred = _denormalize_ik263(x_hat, mean, std)
+            target = _denormalize_ik263(motion, mean, std)
+            pred_joints = ik263_to_smpl22(pred)
+            target_joints = ik263_to_smpl22(target)
+            mask_np = mask.detach().cpu().numpy().astype(bool)
+
+            diff = pred_joints - target_joints
+            valid_diff = diff[mask_np]
+            if valid_diff.size == 0:
+                continue
+            joint_l2 = np.linalg.norm(valid_diff, axis=-1)
+            root_l2 = np.linalg.norm(diff[:, :, 0][mask_np], axis=-1)
+
+            joint_mse_sum += float(np.square(valid_diff).sum())
+            coord_count += int(valid_diff.size)
+            joint_l2_sum += float(joint_l2.sum())
+            joint_count += int(joint_l2.size)
+            root_l2_sum += float(root_l2.sum())
+            root_count += int(root_l2.size)
+            used += int(motion.shape[0])
+            if used >= max_samples:
+                break
+
+    if used == 0:
+        return {}
+    return {
+        "val_fixed/aist_joint_mse": joint_mse_sum / max(coord_count, 1),
+        "val_fixed/aist_joint_l2": joint_l2_sum / max(joint_count, 1),
+        "val_fixed/aist_root_l2": root_l2_sum / max(root_count, 1),
+        "val_fixed/aist_joint_samples": used,
+    }
 
 
 def main_legacy():
@@ -667,6 +742,15 @@ def main():
     )
     parser.add_argument("--stats-path", type=str, default=None)
     parser.add_argument("--val-every-epochs", type=int, default=None)
+    parser.add_argument(
+        "--val-joint-metric-samples",
+        type=int,
+        default=0,
+        help=(
+            "If positive, log deterministic SMPL22 joint reconstruction metrics "
+            "on this many fixed AIST validation samples."
+        ),
+    )
     parser.add_argument("--kl-warmup", type=int, default=None)
     parser.add_argument("--kl-weight", type=float, default=None)
     parser.add_argument("--w-vel", type=float, default=None)
@@ -1192,6 +1276,7 @@ def main():
                 print("Running validation")
                 model_for_state.eval()
                 val_loaders = []
+                fixed_aist_loader = None
                 if val_use_aist:
                     aist_val_paths = aist_split_paths(aist_dir, config["aist_split_val"])
                     val_a = AISTDataset(
@@ -1207,19 +1292,28 @@ def main():
                         crop_mode=args.aist_val_crop_mode,
                         clip_repeat=args.aist_val_clip_repeat,
                     )
-                    val_loaders.append(
-                        DataLoader(
-                            val_a,
-                            batch_size=eval_batch_size,
-                            shuffle=False,
-                            num_workers=num_workers,
-                            pin_memory=pin_memory,
-                            persistent_workers=persistent_workers,
-                            prefetch_factor=prefetch_factor
-                            if num_workers > 0
-                            else None,
-                        )
+                    val_loader_a = DataLoader(
+                        val_a,
+                        batch_size=eval_batch_size,
+                        shuffle=False,
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                        persistent_workers=persistent_workers,
+                        prefetch_factor=prefetch_factor
+                        if num_workers > 0
+                        else None,
                     )
+                    val_loaders.append(val_loader_a)
+                    if args.val_joint_metric_samples > 0:
+                        fixed_aist_loader = DataLoader(
+                            val_a,
+                            batch_size=min(
+                                eval_batch_size, args.val_joint_metric_samples
+                            ),
+                            shuffle=False,
+                            num_workers=0,
+                            pin_memory=False,
+                        )
                 if val_use_mvh:
                     mvh_val_dirs = read_lines(config["mvh_split_val"])
                     val_b = MVHumanNetDataset(
@@ -1268,8 +1362,29 @@ def main():
                             val_count += 1
                 val_recon = val_recon_sum / max(val_count, 1)
                 print(f"Validation recon={val_recon:.6f}")
+                joint_metrics = fixed_aist_joint_recon_metrics(
+                    model_for_state,
+                    fixed_aist_loader,
+                    device,
+                    mean,
+                    std,
+                    args.val_joint_metric_samples,
+                )
+                if joint_metrics:
+                    print(
+                        "Fixed AIST joint recon "
+                        + " ".join(
+                            f"{key}={value:.6f}"
+                            if isinstance(value, float)
+                            else f"{key}={value}"
+                            for key, value in joint_metrics.items()
+                        )
+                    )
                 if wandb_run is not None:
-                    wandb_run.log({"val/recon": val_recon}, step=epoch + 1)
+                    wandb_run.log(
+                        {"val/recon": val_recon, **joint_metrics},
+                        step=epoch + 1,
+                    )
                 latest_path = os.path.join(
                     args.checkpoint_dir, "motion_vae_latest.pt"
                 )

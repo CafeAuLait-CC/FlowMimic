@@ -11,6 +11,7 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
@@ -25,7 +26,11 @@ from flowmimic.src.model.flow.teacher import EMA, Teacher
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
 from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
-from flowmimic.src.model.vae.motion_vae import MotionVAE
+from flowmimic.src.model.vae.backend import (
+    decode_motion_latent,
+    encode_motion_latent,
+    load_vae_backend,
+)
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.model.vae.datasets.balanced_batch_sampler import balanced_batch_iter
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
@@ -40,6 +45,17 @@ from flowmimic.src.metrics import T2MMotionFeatureExtractor
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
+WANDB_EVAL_METRIC_KEYS = (
+    "fid",
+    "mmdist",
+    "diversity",
+    "accel_p90",
+    "jerk_p90",
+    "e2d_slack",
+    "skate_mean",
+)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=500)
@@ -50,6 +66,11 @@ def main():
     parser.add_argument("--latent-stats-path", type=str, default=None)
     parser.add_argument("--openpose-stats-path", type=str, default=None)
     parser.add_argument("--vae-ckpt", type=str, default=None)
+    parser.add_argument(
+        "--vae-type",
+        choices=("auto", "motion_vae", "motion_vqvae"),
+        default="auto",
+    )
     parser.add_argument("--vae-latent-len", type=int, default=None)
     parser.add_argument(
         "--vae-latent-token-mode",
@@ -63,7 +84,20 @@ def main():
     parser.add_argument("--cond-frames-min", type=int, default=None)
     parser.add_argument("--cond-frames-max", type=int, default=None)
     parser.add_argument("--cond-drop-prob", type=float, default=None)
+    parser.add_argument("--cond-frame-drop-prob", type=float, default=None)
+    parser.add_argument(
+        "--cond-frame-drop-start-epoch",
+        type=int,
+        default=0,
+        help="1-based epoch to enable sequence-frame condition masking. 0 enables it from the start.",
+    )
     parser.add_argument("--cfg-drop-prob", type=float, default=0.0)
+    parser.add_argument(
+        "--cfg-start-epoch",
+        type=int,
+        default=0,
+        help="1-based epoch to enable sample-level full-condition CFG dropout. 0 enables it from the start.",
+    )
     parser.add_argument("--ema-decay", type=float, default=None)
     parser.add_argument(
         "--eval-cond-frames",
@@ -96,6 +130,12 @@ def main():
     parser.add_argument(
         "--lr-scale-mode", type=str, choices=["none", "linear"], default="none"
     )
+    parser.add_argument(
+        "--lr-decay-epoch",
+        type=int,
+        default=None,
+        help="Epoch at which to apply the one-time 0.5 LR decay; defaults to epochs//2.",
+    )
     parser.add_argument("--max-bad-steps", type=int, default=50)
     parser.add_argument("--cond-lr-scale", type=float, default=0.1)
     parser.add_argument("--reset-optimizer", action="store_true")
@@ -116,6 +156,30 @@ def main():
         default="joints",
     )
     parser.add_argument("--smooth-subbatch-size", type=int, default=32)
+    parser.add_argument(
+        "--solver-reg-subbatch-size",
+        type=int,
+        default=0,
+        help=(
+            "If >0, run differentiable solver/decode regularizers on a random "
+            "subbatch of each full training batch. The base CFM loss still uses "
+            "the full batch."
+        ),
+    )
+    parser.add_argument("--reg-decode-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--no-reg-decode-checkpoint",
+        dest="reg_decode_checkpoint",
+        action="store_false",
+    )
+    parser.set_defaults(reg_decode_checkpoint=True)
+    parser.add_argument(
+        "--no-solver-checkpoint",
+        dest="solver_checkpoint",
+        action="store_false",
+        help="Disable activation checkpointing inside differentiable solver regularization.",
+    )
+    parser.set_defaults(solver_checkpoint=True)
     parser.add_argument("--cond-every", type=int, default=None)
     parser.add_argument("--smooth-every", type=int, default=None)
     parser.add_argument("--solver-steps-early", type=str, default="16")
@@ -144,9 +208,17 @@ def main():
     parser.add_argument("--eval-t2m-motion-encoder-ckpt", type=str, default=None)
     parser.add_argument("--eval-t2m-mean-path", type=str, default=None)
     parser.add_argument("--eval-t2m-std-path", type=str, default=None)
-    parser.add_argument("--eval-steps", type=int, default=16)
+    parser.add_argument("--eval-steps", type=str, default="16,50")
     parser.add_argument("--eval-every-epochs", type=int, default=None)
     parser.add_argument("--eval-num-samples", type=int, default=0)
+    parser.add_argument("--eval-aist-splits", type=str, default="test")
+    parser.add_argument("--eval-aist-cameras", type=str, default="01")
+    parser.add_argument(
+        "--eval-aist-crop-mode",
+        choices=("first", "random", "uniform"),
+        default="first",
+    )
+    parser.add_argument("--eval-replications", type=int, default=3)
     parser.add_argument("--eval-diversity-times", type=int, default=300)
     parser.add_argument("--eval-multimodality-repeats", type=int, default=1)
     parser.add_argument("--eval-multimodality-times", type=int, default=20)
@@ -158,7 +230,8 @@ def main():
     parser.add_argument("--async-eval-log-dir", type=str, default=None)
     args = parser.parse_args()
 
-    ddp = args.ddp
+    env_world_size = int(os.environ.get("WORLD_SIZE") or "1")
+    ddp = args.ddp or env_world_size > 1
     if ddp:
         local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
         torch.cuda.set_device(local_rank)
@@ -215,6 +288,7 @@ def main():
                     "batch_size": args.batch_size,
                     "seq_len": args.seq_len or config.get("seq_len"),
                     "lr": args.lr,
+                    "lr_decay_epoch": args.lr_decay_epoch,
                     "datasets": sorted(datasets),
                     "stats_path": args.stats_path or config.get("stats_path"),
                     "latent_stats_path": (
@@ -224,6 +298,7 @@ def main():
                         args.openpose_stats_path or config.get("openpose_stats_path")
                     ),
                     "vae_ckpt": args.vae_ckpt or config.get("vae_ckpt"),
+                    "vae_type": args.vae_type,
                     "eval_steps": args.eval_steps,
                     "eval_guidance_scale": args.eval_guidance_scale,
                     "cond_lr_scale": args.cond_lr_scale,
@@ -239,12 +314,18 @@ def main():
                     "cond_drop_prob": args.cond_drop_prob
                     if args.cond_drop_prob is not None
                     else config.get("flow", {}).get("cond_drop_prob"),
+                    "cond_frame_drop_prob": args.cond_frame_drop_prob
+                    if args.cond_frame_drop_prob is not None
+                    else config.get("flow", {}).get("cond_frame_drop_prob", 0.0),
+                    "cond_frame_drop_start_epoch": args.cond_frame_drop_start_epoch,
                     "cfg_drop_prob": args.cfg_drop_prob,
+                    "cfg_start_epoch": args.cfg_start_epoch,
                     "ema_decay": args.ema_decay
                     if args.ema_decay is not None
                     else config.get("flow", {}).get("ema_decay"),
                     "vae_latent_len": args.vae_latent_len,
                     "aist_clip_repeat": args.aist_clip_repeat,
+                    "solver_reg_subbatch_size": args.solver_reg_subbatch_size,
                 },
             )
     aist_dir = config["aist_motions_dir"]
@@ -303,6 +384,11 @@ def main():
         if args.cond_drop_prob is not None
         else flow_cfg.get("cond_drop_prob", 0.2)
     )
+    cond_frame_drop_prob = (
+        args.cond_frame_drop_prob
+        if args.cond_frame_drop_prob is not None
+        else flow_cfg.get("cond_frame_drop_prob", 0.0)
+    )
     solver_every = max(1, args.solver_every)
     solver_method = args.solver_method
     solver_cond_start_epoch = args.solver_cond_start_epoch
@@ -312,6 +398,7 @@ def main():
     lambda_cond = args.lambda_cond
     lambda_acc = args.lambda_acc
     lambda_jerk = args.lambda_jerk
+    solver_reg_subbatch_size = max(0, int(args.solver_reg_subbatch_size or 0))
     cond_every = max(1, args.cond_every or solver_every)
     smooth_every = max(
         1,
@@ -365,6 +452,7 @@ def main():
             cond_frames_min=cond_frames_min,
             cond_frames_max=cond_frames_max,
             cond_drop_prob=cond_drop_prob,
+            cond_frame_drop_prob=cond_frame_drop_prob,
             crop_mode=args.aist_crop_mode,
             clip_repeat=args.aist_clip_repeat,
         )
@@ -388,6 +476,7 @@ def main():
             cond_frames_min=cond_frames_min,
             cond_frames_max=cond_frames_max,
             cond_drop_prob=cond_drop_prob,
+            cond_frame_drop_prob=cond_frame_drop_prob,
         )
 
     if is_main:
@@ -434,36 +523,30 @@ def main():
     vae_ckpt_path = args.vae_ckpt or config.get(
         "vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt"
     )
-    vae_ckpt = torch.load(
+    vae_backend = load_vae_backend(
         vae_ckpt_path,
-        map_location=device,
+        config,
+        device,
+        seq_len=seq_len,
+        vae_type=args.vae_type,
+        latent_len=args.vae_latent_len,
+        latent_token_mode=args.vae_latent_token_mode,
     )
-    vae_config = vae_ckpt.get("config", {})
-    vae_latent_len = args.vae_latent_len
-    if vae_latent_len is None:
-        vae_latent_len = vae_config.get("latent_len")
-    vae_latent_token_mode = (
-        args.vae_latent_token_mode or vae_config.get("latent_token_mode", "pool")
-    )
-    vae = MotionVAE(
-        d_in=config["d_in"],
-        d_z=config["d_z"],
-        num_styles=config["num_styles"],
-        max_len=seq_len,
-        latent_len=vae_latent_len,
-        latent_token_mode=vae_latent_token_mode,
-    )
-    vae.load_state_dict(vae_ckpt["model"])
-    vae.to(device)
-    vae.eval()
+    vae = vae_backend.model
     for p in vae.parameters():
         p.requires_grad = False
-    latent_len = vae.latent_len or seq_len
+    latent_len = vae_backend.latent_len
+    flow_d_z = vae_backend.d_z
+    if is_main:
+        print(
+            f"Loaded {vae_backend.vae_type}: latent_len={latent_len}, "
+            f"d_z={flow_d_z}, max_len={vae_backend.max_len}"
+        )
 
     if is_main:
         print("Building flow model")
     flow = ConditionalRectFlow(
-        d_z=config["d_z"],
+        d_z=flow_d_z,
         d_model=flow_cfg.get("d_model", 512),
         n_layers=flow_cfg.get("n_layers", 8),
         n_heads=flow_cfg.get("n_heads", 8),
@@ -495,6 +578,7 @@ def main():
 
     if ddp and args.lr_scale_mode == "linear":
         lr = lr * world_size
+    lr_decay_epoch = max(1, args.lr_decay_epoch or (args.epochs // 2))
     if is_main:
         print(f"LR={lr} (mode={args.lr_scale_mode}, world_size={world_size})")
         print(
@@ -502,8 +586,12 @@ def main():
         )
         print(
             f"Cond LR scale={cond_lr_scale}; cond_frames={cond_frames_min}-{cond_frames_max}; "
-            f"eval_cond_frames={eval_cond_frames}; "
-            f"cfg_drop_prob={args.cfg_drop_prob}; ema_decay={ema_decay}"
+            f"eval_cond_frames={eval_cond_frames}; cond_frame_drop_prob={cond_frame_drop_prob}; "
+            f"cond_frame_drop_start_epoch={args.cond_frame_drop_start_epoch}; "
+            f"cfg_drop_prob={args.cfg_drop_prob}; cfg_start_epoch={args.cfg_start_epoch}; "
+            f"ema_decay={ema_decay}; "
+            f"lr_decay_epoch={lr_decay_epoch}; "
+            f"solver_reg_subbatch_size={solver_reg_subbatch_size or 'full'}"
         )
 
     cond_params = list(flow_model.cond_encoder.parameters()) + list(
@@ -511,6 +599,7 @@ def main():
     )
     cond_param_ids = {id(p) for p in cond_params}
     other_params = [p for p in flow_model.parameters() if id(p) not in cond_param_ids]
+    base_group_lrs = [lr, lr * cond_lr_scale]
     param_groups = [
         {"params": other_params, "lr": lr},
         {"params": cond_params, "lr": lr * cond_lr_scale},
@@ -519,6 +608,7 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     start_epoch = 0
     ema_state = None
+    lr_halved = False
     if resume_state is not None:
         if not args.reset_optimizer and "optimizer" in resume_state:
             optimizer.load_state_dict(resume_state["optimizer"])
@@ -527,6 +617,15 @@ def main():
         if args.use_ema_teacher and "ema" in resume_state:
             ema_state = resume_state["ema"]
         start_epoch = int(resume_state.get("epoch", 0))
+        lr_halved = bool(resume_state.get("lr_halved", start_epoch >= lr_decay_epoch))
+        scheduled_lrs = [
+            group_lr * (0.5 if lr_halved else 1.0) for group_lr in base_group_lrs
+        ]
+        old_lrs = [group["lr"] for group in optimizer.param_groups]
+        _set_optimizer_group_lrs(optimizer, scheduled_lrs)
+        new_lrs = [group["lr"] for group in optimizer.param_groups]
+        if is_main and any(abs(a - b) > 1e-12 for a, b in zip(old_lrs, new_lrs)):
+            print(f"Adjusted resume LR to scheduled values: {new_lrs}")
 
     if is_main:
         print("Loading OpenPose stats")
@@ -639,7 +738,7 @@ def main():
         if not args.teacher_ckpt:
             raise ValueError("teacher_ckpt is required for reflow_round >= 1")
         teacher_flow = ConditionalRectFlow(
-            d_z=config["d_z"],
+            d_z=flow_d_z,
             d_model=flow_cfg.get("d_model", 512),
             n_layers=flow_cfg.get("n_layers", 8),
             n_heads=flow_cfg.get("n_heads", 8),
@@ -716,12 +815,36 @@ def main():
 
     if is_main:
         print("Starting training loop")
-    lr_halved = False
     global_step = 0
     async_eval_job = None
     cond_match_log_ema = None
     for epoch in range(start_epoch, args.epochs):
         flow.train()
+        epoch_num = epoch + 1
+        effective_cond_frame_drop_prob = (
+            cond_frame_drop_prob
+            if args.cond_frame_drop_start_epoch <= 0
+            or epoch_num >= args.cond_frame_drop_start_epoch
+            else 0.0
+        )
+        effective_cfg_drop_prob = (
+            args.cfg_drop_prob
+            if args.cfg_start_epoch <= 0 or epoch_num >= args.cfg_start_epoch
+            else 0.0
+        )
+        for dataset in (dataset_a, dataset_b):
+            if dataset is not None and hasattr(dataset, "cond_frame_drop_prob"):
+                dataset.cond_frame_drop_prob = effective_cond_frame_drop_prob
+        if is_main and (
+            epoch == start_epoch
+            or epoch_num == args.cond_frame_drop_start_epoch
+            or epoch_num == args.cfg_start_epoch
+        ):
+            print(
+                f"Epoch {epoch_num}: effective_cond_frame_drop_prob="
+                f"{effective_cond_frame_drop_prob}; "
+                f"effective_cfg_drop_prob={effective_cfg_drop_prob}"
+            )
         w_cond_epoch = _ramp_weight(
             epoch, solver_cond_start_epoch, solver_cond_ramp_epochs
         )
@@ -760,7 +883,7 @@ def main():
             steps_per_epoch = len(loader_b)
         else:
             raise ValueError("No train loaders were created")
-        if not lr_halved and (epoch + 1) >= max(1, args.epochs // 2):
+        if not lr_halved and (epoch + 1) >= lr_decay_epoch:
             for group in optimizer.param_groups:
                 group["lr"] *= 0.5
             lr_halved = True
@@ -806,10 +929,13 @@ def main():
                 t_load += t1 - t0
 
                 with torch.no_grad():
-                    enc_h, mu, _logvar = vae.encode(
-                        motion, vae.cond(domain_id, style_id), mask=mask.to(device)
+                    z_data = encode_motion_latent(
+                        vae,
+                        motion,
+                        domain_id,
+                        style_id,
+                        mask=mask.to(device),
                     )
-                z_data = mu
                 if latent_mean is not None and latent_std is not None:
                     z_data = (z_data - latent_mean) / (latent_std + 1e-6)
                 if not torch.isfinite(z_data).all():
@@ -842,10 +968,10 @@ def main():
                                 epoch + 1,
                             )
                         bad_local = True
-                    elif args.cfg_drop_prob > 0:
+                    elif effective_cfg_drop_prob > 0:
                         drop_cond = (
                             torch.rand(k2d_batch.shape[0], device=device)
-                            < args.cfg_drop_prob
+                            < effective_cfg_drop_prob
                         )
                         if drop_cond.any():
                             k2d_batch = k2d_batch.clone()
@@ -964,8 +1090,12 @@ def main():
                         z_decode = z_smooth
                         if latent_mean is not None and latent_std is not None:
                             z_decode = z_decode * (latent_std + 1e-6) + latent_mean
-                        x_smooth = vae.decode(
-                            z_decode, vae.cond(domain_smooth, style_smooth)
+                        x_smooth = decode_motion_latent(
+                            vae,
+                            z_decode,
+                            domain_smooth,
+                            style_smooth,
+                            out_len=seq_len,
                         )
                         cont_end = LAYOUT_SLICES["feet_contact"][0]
                         mean_t = torch.as_tensor(
@@ -995,19 +1125,42 @@ def main():
                         args.solver_mid_epoch,
                         args.solver_late_epoch,
                     )
+                    solver_reg_idx = None
+                    if (
+                        solver_reg_subbatch_size > 0
+                        and x0.shape[0] > solver_reg_subbatch_size
+                    ):
+                        solver_reg_idx = torch.randperm(
+                            x0.shape[0], device=x0.device
+                        )[:solver_reg_subbatch_size]
+
+                    def _reg_select(tensor):
+                        if solver_reg_idx is None:
+                            return tensor
+                        return tensor.index_select(0, solver_reg_idx)
+
+                    x0_reg = _reg_select(x0)
+                    mem_reg = _reg_select(mem)
+                    g_reg = _reg_select(g)
+                    mask_cond_reg = _reg_select(mask_cond)
+                    domain_reg = _reg_select(domain_id)
+                    style_reg = _reg_select(style_id)
+                    k2d_reg = _reg_select(k2d_batch)
+                    conf_reg = _reg_select(conf_batch)
+                    tau_cond_reg = _reg_select(tau_cond)
                     cond_batch = {
                         "tau_out": tau_out,
-                        "mem": mem,
-                        "g": g,
-                        "mem_mask": ~mask_cond,
+                        "mem": mem_reg,
+                        "g": g_reg,
+                        "mem_mask": ~mask_cond_reg,
                     }
                     z_reg = solve_flow(
                         flow_model.flow,
-                        x0,
+                        x0_reg,
                         cond_batch,
                         num_steps=solver_steps,
                         method=solver_method,
-                        use_activation_checkpoint=True,
+                        use_activation_checkpoint=args.solver_checkpoint,
                     )
                     joints_reg = None
                     if do_smooth_reg and args.smooth_loss_domain == "latent_solver":
@@ -1024,37 +1177,92 @@ def main():
                         z_decode = z_reg
                         if latent_mean is not None and latent_std is not None:
                             z_decode = z_decode * (latent_std + 1e-6) + latent_mean
-                        x_reg = vae.decode(z_decode, vae.cond(domain_id, style_id))
                         cont_end = LAYOUT_SLICES["feet_contact"][0]
-                        mean_t = torch.as_tensor(mean, device=device, dtype=x_reg.dtype)
-                        std_t = torch.as_tensor(std, device=device, dtype=x_reg.dtype)
-                        x_reg = x_reg.clone()
-                        x_reg[..., :cont_end] = x_reg[..., :cont_end] * std_t + mean_t
-                        joints_reg = _ik263_to_smpl22_torch(x_reg)
+                        mean_t = torch.as_tensor(mean, device=device)
+                        std_t = torch.as_tensor(std, device=device)
+                        reg_decode_batch = int(args.reg_decode_batch_size or 0)
+                        if reg_decode_batch <= 0:
+                            reg_decode_batch = z_decode.shape[0]
+                        reg_decode_batch = max(1, min(reg_decode_batch, z_decode.shape[0]))
+                        cond_loss_sum = z_decode.new_zeros(())
+                        smooth_acc_sum_chunk = z_decode.new_zeros(())
+                        smooth_jerk_sum_chunk = z_decode.new_zeros(())
+                        cond_loss_weight = 0
+                        smooth_loss_weight = 0
+                        for reg_start in range(0, z_decode.shape[0], reg_decode_batch):
+                            reg_end = min(reg_start + reg_decode_batch, z_decode.shape[0])
+                            reg_slice = slice(reg_start, reg_end)
+                            z_chunk = z_decode[reg_slice]
+                            domain_chunk = domain_reg[reg_slice]
+                            style_chunk = style_reg[reg_slice]
+                            if args.reg_decode_checkpoint and z_chunk.requires_grad:
 
-                    if do_cond_reg and joints_reg is not None:
-                        cond_match_loss = _condition_match_loss(
-                            joints_reg,
-                            k2d_batch,
-                            conf_batch,
-                            tau_cond,
-                            mask_cond,
-                            body25_to_smpl_idx,
-                            body25_to_smpl_valid,
-                        )
-                        cond_weighted_loss = (
-                            lambda_cond * w_cond_epoch
-                        ) * cond_match_loss
-                        loss = loss + cond_weighted_loss
+                                def _decode_chunk(z_in):
+                                    return decode_motion_latent(
+                                        vae,
+                                        z_in,
+                                        domain_chunk,
+                                        style_chunk,
+                                        out_len=seq_len,
+                                    )
 
-                    if (
-                        do_smooth_reg
-                        and args.smooth_loss_domain == "joints"
-                        and joints_reg is not None
-                    ):
-                        smooth_acc, smooth_jerk = _temporal_smoothness_loss(
-                            joints_reg, compute_jerk=lambda_jerk > 0.0
-                        )
+                                x_reg = checkpoint(
+                                    _decode_chunk, z_chunk, use_reentrant=False
+                                )
+                            else:
+                                x_reg = decode_motion_latent(
+                                    vae,
+                                    z_chunk,
+                                    domain_chunk,
+                                    style_chunk,
+                                    out_len=seq_len,
+                                )
+                            mean_t = mean_t.to(dtype=x_reg.dtype)
+                            std_t = std_t.to(dtype=x_reg.dtype)
+                            x_reg = x_reg.clone()
+                            x_reg[..., :cont_end] = (
+                                x_reg[..., :cont_end] * std_t + mean_t
+                            )
+                            joints_chunk = _ik263_to_smpl22_torch(x_reg)
+                            chunk_size = reg_end - reg_start
+                            if do_cond_reg:
+                                cond_chunk = _condition_match_loss(
+                                    joints_chunk,
+                                    k2d_reg[reg_slice],
+                                    conf_reg[reg_slice],
+                                    tau_cond_reg[reg_slice],
+                                    mask_cond_reg[reg_slice],
+                                    body25_to_smpl_idx,
+                                    body25_to_smpl_valid,
+                                )
+                                cond_loss_sum = cond_loss_sum + cond_chunk * chunk_size
+                                cond_loss_weight += chunk_size
+                            if do_smooth_reg and args.smooth_loss_domain == "joints":
+                                smooth_acc_chunk, smooth_jerk_chunk = (
+                                    _temporal_smoothness_loss(
+                                        joints_chunk, compute_jerk=lambda_jerk > 0.0
+                                    )
+                                )
+                                smooth_acc_sum_chunk = (
+                                    smooth_acc_sum_chunk
+                                    + smooth_acc_chunk * chunk_size
+                                )
+                                smooth_jerk_sum_chunk = (
+                                    smooth_jerk_sum_chunk
+                                    + smooth_jerk_chunk * chunk_size
+                                )
+                                smooth_loss_weight += chunk_size
+
+                        if do_cond_reg and cond_loss_weight > 0:
+                            cond_match_loss = cond_loss_sum / cond_loss_weight
+                            cond_weighted_loss = (
+                                lambda_cond * w_cond_epoch
+                            ) * cond_match_loss
+                            loss = loss + cond_weighted_loss
+
+                    if do_smooth_reg and args.smooth_loss_domain == "joints":
+                        smooth_acc = smooth_acc_sum_chunk / max(smooth_loss_weight, 1)
+                        smooth_jerk = smooth_jerk_sum_chunk / max(smooth_loss_weight, 1)
                         smooth_weighted_loss = w_smooth_epoch * (
                             lambda_acc * smooth_acc + lambda_jerk * smooth_jerk
                         )
@@ -1113,6 +1321,7 @@ def main():
                     "model": flow_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch + 1,
+                    "lr_halved": lr_halved,
                 }
                 if ema is not None:
                     state["ema"] = ema.state_dict()
@@ -1243,6 +1452,8 @@ def main():
                         "schedule/cond_updates": cond_updates,
                         "schedule/w_cond_epoch": w_cond_epoch,
                         "schedule/w_smooth_epoch": w_smooth_epoch,
+                        "schedule/effective_cond_frame_drop_prob": effective_cond_frame_drop_prob,
+                        "schedule/effective_cfg_drop_prob": effective_cfg_drop_prob,
                     },
                     step=epoch + 1,
                     commit=not do_eval,
@@ -1268,6 +1479,7 @@ def main():
                     "model": flow_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch + 1,
+                    "lr_halved": lr_halved,
                 }
                 if ema is not None:
                     state["ema"] = ema.state_dict()
@@ -1303,7 +1515,12 @@ def main():
                             f"for epoch {async_eval_job['epoch']} is still running."
                         )
                 else:
-                    print(f"Running AIST eval (steps={args.eval_steps})")
+                    print(
+                        f"Running AIST eval (steps={args.eval_steps}, "
+                        f"splits={args.eval_aist_splits}, "
+                        f"cameras={args.eval_aist_cameras}, "
+                        f"replications={args.eval_replications})"
+                    )
                     flow_model.eval()
                     eval_state = flow_model.state_dict()
                     if args.eval_use_ema and ema is not None:
@@ -1312,7 +1529,9 @@ def main():
                     mapping, computed = _build_smpl22_to_body25(
                         config["smpl45_to_body25_def"]
                     )
-                    aist_val_paths = _aist_split_paths(aist_dir, config["aist_split_val"])
+                    aist_val_paths = _aist_paths_for_splits(
+                        config, aist_dir, args.eval_aist_splits
+                    )
                     aist_val = AISTDataset(
                         aist_dir,
                         genre_to_id,
@@ -1323,9 +1542,13 @@ def main():
                         cache_root=config["cache_root"],
                         target_fps=target_fps,
                         src_fps=aist_fps,
-                        camera_ids=aist_cameras,
+                        camera_ids=[
+                            cam.strip()
+                            for cam in str(args.eval_aist_cameras).split(",")
+                            if cam.strip()
+                        ],
                         expand_cameras=True,
-                        crop_mode=args.aist_crop_mode,
+                        crop_mode=args.eval_aist_crop_mode,
                     )
                     aist_loader = DataLoader(
                         aist_val,
@@ -1338,7 +1561,7 @@ def main():
                         (),
                         {
                             "seq_len": seq_len,
-                            "d_z": config["d_z"],
+                            "d_z": flow_d_z,
                             "latent_len": latent_len,
                             "fps": target_fps,
                             "slack_seconds": 0.1,
@@ -1360,45 +1583,55 @@ def main():
                         "mean": k2d_mean,
                         "std": k2d_std,
                     }
-                    eval_summary, _ = evaluate_dataset(
-                        "AIST",
-                        aist_loader,
-                        flow_model,
-                        vae,
-                        eval_cfg,
-                        mapping,
-                        computed,
-                        openpose_cfg,
-                        (mean, std),
-                        (latent_mean, latent_std),
-                        steps=args.eval_steps,
-                        solver="heun",
-                        num_samples=args.eval_num_samples,
-                        seed=seed,
-                        device=device,
-                        compute_dist=eval_compute_dist,
-                        save_per_sample=False,
-                        metric_extractor=eval_t2m_extractor,
-                        t2m_stats=eval_t2m_stats,
-                        diversity_times=args.eval_diversity_times,
-                        multimodality_repeats=args.eval_multimodality_repeats,
-                        multimodality_times=args.eval_multimodality_times,
-                        guidance_scale=args.eval_guidance_scale,
-                    )
-                    if eval_summary:
-                        print(
-                            "AIST eval summary "
-                            + json.dumps(eval_summary, sort_keys=True)
-                        )
-                        if wandb_run is not None:
-                            wandb_run.log(
-                                {
-                                    f"eval/aist/{k}": v
-                                    for k, v in eval_summary.items()
-                                },
-                                step=epoch + 1,
-                                commit=True,
+                    for eval_steps in _parse_steps(args.eval_steps):
+                        rep_summaries = []
+                        for rep_idx in range(max(1, int(args.eval_replications))):
+                            rep_seed = seed + rep_idx
+                            random.seed(rep_seed)
+                            np.random.seed(rep_seed)
+                            torch.manual_seed(rep_seed)
+                            torch.cuda.manual_seed_all(rep_seed)
+                            eval_summary, _ = evaluate_dataset(
+                                "AIST",
+                                aist_loader,
+                                flow_model,
+                                vae,
+                                eval_cfg,
+                                mapping,
+                                computed,
+                                openpose_cfg,
+                                (mean, std),
+                                (latent_mean, latent_std),
+                                steps=eval_steps,
+                                solver="heun",
+                                num_samples=0,
+                                seed=rep_seed,
+                                device=device,
+                                compute_dist=eval_compute_dist,
+                                save_per_sample=False,
+                                metric_extractor=eval_t2m_extractor,
+                                t2m_stats=eval_t2m_stats,
+                                diversity_times=args.eval_diversity_times,
+                                multimodality_repeats=args.eval_multimodality_repeats,
+                                multimodality_times=args.eval_multimodality_times,
+                                guidance_scale=args.eval_guidance_scale,
                             )
+                            if eval_summary:
+                                rep_summaries.append(eval_summary)
+                        eval_summary = _aggregate_eval_summaries(rep_summaries)
+                        if eval_summary:
+                            print(
+                                f"AIST eval summary steps={eval_steps} "
+                                + json.dumps(eval_summary, sort_keys=True)
+                            )
+                            if wandb_run is not None:
+                                wandb_run.log(
+                                    _select_wandb_eval_metrics(
+                                        eval_summary, f"eval/aist/steps{eval_steps}"
+                                    ),
+                                    step=epoch + 1,
+                                    commit=True,
+                                )
                     flow_model.load_state_dict(eval_state)
                     flow_model.train()
         if ddp:
@@ -1426,21 +1659,22 @@ def _poll_async_eval_job(job, wandb_run, log_step=None):
         try:
             with open(job["json_path"], "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            metrics = {}
             for row in payload.get("summary", []):
                 dataset = str(row.get("dataset", "dataset")).lower()
-                metrics = {
-                    f"eval_async/{dataset}/{k}": v
-                    for k, v in row.items()
-                    if k not in ("dataset", "steps") and isinstance(v, (int, float))
-                }
-                if metrics:
-                    metrics[f"eval_async/{dataset}/steps"] = row.get("steps", 0)
-                    metrics[f"eval_async/{dataset}/source_epoch"] = job["epoch"]
-                    wandb_run.log(
-                        metrics,
-                        step=log_step if log_step is not None else job["epoch"],
-                        commit=True,
-                    )
+                steps = row.get("steps", "unknown")
+                try:
+                    steps_label = f"steps{int(steps)}"
+                except (TypeError, ValueError):
+                    steps_label = f"steps{steps}"
+                prefix = f"eval_async/{dataset}/{steps_label}"
+                metrics.update(_select_wandb_eval_metrics(row, prefix))
+                metrics[f"{prefix}/source_epoch"] = job["epoch"]
+            if metrics:
+                if log_step is None:
+                    wandb_run.log(metrics, commit=True)
+                else:
+                    wandb_run.log(metrics, step=log_step, commit=False)
         except Exception as exc:
             print(f"Warning: failed to log async eval metrics to wandb: {exc}")
     return None
@@ -1463,7 +1697,8 @@ def _launch_async_cpu_eval(
 ):
     log_dir = args.async_eval_log_dir or os.path.join(args.checkpoint_dir, "async_eval")
     os.makedirs(log_dir, exist_ok=True)
-    base = f"epoch{epoch:04d}_steps{args.eval_steps}"
+    steps_tag = str(args.eval_steps).replace(",", "-")
+    base = f"epoch{epoch:04d}_steps{steps_tag}_rep{args.eval_replications}"
     json_path = os.path.join(log_dir, f"{base}.json")
     csv_path = os.path.join(log_dir, f"{base}.csv")
     plot_path = os.path.join(log_dir, f"{base}.png")
@@ -1475,18 +1710,24 @@ def _launch_async_cpu_eval(
         flow_ckpt,
         "--vae-ckpt",
         vae_ckpt,
+        "--vae-type",
+        args.vae_type,
         "--device",
         "cpu",
         "--batch-size",
         str(args.eval_batch_size),
         "--num-samples",
-        str(args.eval_num_samples),
+        "0",
         "--seq-len",
         str(seq_len),
         "--vae-max-len",
         str(seq_len),
         "--datasets",
         "AIST",
+        "--aist-splits",
+        args.eval_aist_splits,
+        "--aist-cameras",
+        args.eval_aist_cameras,
         "--cond-frames",
         str(
             args.eval_cond_frames
@@ -1506,7 +1747,9 @@ def _launch_async_cpu_eval(
         "--latent-stats-path",
         latent_stats_path,
         "--aist-crop-mode",
-        args.aist_crop_mode,
+        args.eval_aist_crop_mode,
+        "--replications",
+        str(args.eval_replications),
         "--save-json",
         json_path,
         "--save-csv",
@@ -1662,6 +1905,26 @@ def _aist_split_paths(aist_dir, split_path):
     return [os.path.join(aist_dir, f"{name}.pkl") for name in names]
 
 
+def _aist_paths_for_splits(config, aist_dir, split_names):
+    paths = []
+    for split in str(split_names).split(","):
+        split = split.strip().lower()
+        if not split:
+            continue
+        split_path = config.get(f"aist_split_{split}")
+        if split_path is None:
+            split_path = f"data/AIST++/Annotations/splits/pose_{split}.txt"
+        paths.extend(_aist_split_paths(aist_dir, split_path))
+    seen = set()
+    unique = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
 def _load_cond_batch(
     metas,
     aist_openpose_dir,
@@ -1798,6 +2061,32 @@ def _parse_steps(raw):
     if not vals:
         return [8]
     return vals
+
+
+def _select_wandb_eval_metrics(row, prefix):
+    metrics = {}
+    for key in WANDB_EVAL_METRIC_KEYS:
+        value = row.get(key)
+        if isinstance(value, (int, float)):
+            metrics[f"{prefix}/{key}"] = value
+    return metrics
+
+
+def _aggregate_eval_summaries(rows):
+    if not rows:
+        return {}
+    keys = sorted(
+        {
+            key
+            for row in rows
+            for key, value in row.items()
+            if isinstance(value, (int, float))
+        }
+    )
+    return {
+        key: float(np.mean([row[key] for row in rows if isinstance(row.get(key), (int, float))]))
+        for key in keys
+    }
 
 
 def _ramp_weight(epoch, start_epoch, ramp_epochs):
@@ -1977,6 +2266,13 @@ def _restore_checkpoint(path, flow, optimizer, ema, device):
         optimizer.load_state_dict(state["optimizer"])
     if ema is not None and "ema" in state:
         ema.load_state_dict(state["ema"])
+
+
+def _set_optimizer_group_lrs(optimizer, lrs):
+    if not lrs:
+        return
+    for idx, group in enumerate(optimizer.param_groups):
+        group["lr"] = lrs[min(idx, len(lrs) - 1)]
 
 
 if __name__ == "__main__":

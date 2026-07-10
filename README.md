@@ -258,7 +258,6 @@ CUDA_VISIBLE_DEVICES=0 python flowmimic/scripts/train_flow.py \
   --latent-stats-path data/vqvae_latent_stats_aist_train_latent16_epoch800.npz \
   --cond-frames-min 196 \
   --cond-frames-max 196 \
-  --eval-cond-frames 196 \
   --cond-drop-prob 0.05 \
   --cfg-drop-prob 0.10 \
   --cfg-start-epoch 150 \
@@ -274,6 +273,8 @@ CUDA_VISIBLE_DEVICES=0 python flowmimic/scripts/train_flow.py \
   --async-cpu-eval
 ```
 
+Less commonly changed defaults live in `flowmimic/src/config/config.json`, grouped under `flow.architecture`, `flow.optimization`, `flow.conditioning`, `flow.regularization`, `flow.eval`, `flow.checkpointing`, and `flow.wandb`. `train_flow.py` still exposes the high-impact experiment knobs on the CLI, then fills internal defaults from config.
+
 Important training controls:
 
 - `--vae-type auto|motion_vae|motion_vqvae` selects or verifies the autoencoder backend.
@@ -284,8 +285,11 @@ Important training controls:
 - `--cfg-drop-prob` drops the full condition for classifier-free guidance training.
 - `--cfg-start-epoch` and `--cond-frame-drop-start-epoch` can delay those augmentations.
 - `--solver-cond-start-epoch` and `--solver-smooth-start-epoch` schedule solver-side condition and smoothness losses.
-- `--solver-reg-subbatch-size`, `--reg-decode-batch-size`, `--no-solver-checkpoint`, and `--no-reg-decode-checkpoint` control the expensive differentiable solver/decode regularizers.
+- `--solver-reg-subbatch-size` controls how much of each batch runs through the expensive differentiable solver/decode regularizers.
 - `--lr-decay-epoch` applies a one-time 0.5 LR decay. Resume checkpoints persist whether this decay has already happened, so resuming no longer halves LR repeatedly.
+- `flow.regularization` in config controls the solver method, ramp lengths, solver-step schedule, smoothness domain, decode chunk size, and checkpointing internals.
+- `flow.eval` and `evaluator` in config control train-time eval defaults and AIST-trained T2M evaluator asset paths.
+- New flow checkpoints include `metadata` plus top-level aliases for `vae_ckpt`, `vae_type`, `latent_stats_path`, `stats_path`, and `openpose_stats_path`.
 
 DDP is supported with `torchrun`:
 
@@ -346,7 +350,6 @@ python flowmimic/scripts/eval_flow.py \
   --flow-ckpt checkpoints/flow/<run>/flow_round0_last.pt \
   --vae-ckpt checkpoints/vqvae/<run>/motion_vqvae_latest.pt \
   --vae-type motion_vqvae \
-  --latent-stats-path data/vqvae_latent_stats_aist_train_latent16_epoch800.npz \
   --datasets AIST \
   --aist-splits test \
   --aist-cameras 01 \
@@ -365,7 +368,7 @@ Notes:
 - `--num-samples 0` means use the full selected split/camera set.
 - For the AIST test split with camera `01`, this gives one video per unique test motion, matching the 470-motion baseline setup.
 - FlowMimic evaluation repeats stochastic generation with `--replications`; summaries include mean/std/confidence fields in JSON/CSV.
-- During flow eval, generated latents are denormalized with `--latent-stats-path` before VAE decoding.
+- During flow eval, generated latents are denormalized with the latent stats path recorded in the flow checkpoint metadata, or the config fallback. For older checkpoints without metadata, pass `--latent-stats-path` if the config default does not match that run.
 
 Default output files:
 
@@ -375,7 +378,7 @@ output/eval/<flow_ckpt_parent>/flow_eval.json
 output/eval/<flow_ckpt_parent>/flow_eval_steps.png
 ```
 
-If T2M evaluator paths are configured in `config.json` or passed explicitly, `eval_flow.py` computes:
+If T2M evaluator paths are configured in `config.json`, `eval_flow.py` computes:
 
 ```text
 fid
@@ -383,14 +386,6 @@ mmdist
 matching_score
 diversity
 multimodality, when requested
-```
-
-Override evaluator assets with:
-
-```text
---t2m-motion-encoder-ckpt
---t2m-mean-path
---t2m-std-path
 ```
 
 Use `--no-dist` to skip T2M distribution metrics.
@@ -435,13 +430,12 @@ Main config: `flowmimic/src/config/config.json`
 
 Important keys:
 
-- `seq_len`: default sequence length, currently 200 in config; many AIST VQ-flow experiments override this to 196.
-- `stats_path`: 263D mean/std path.
-- `latent_stats_path`: default latent stats path. Override for VQ-VAE flow runs.
-- `openpose_stats_path`: 2D BODY-25 stats path.
-- `vae_ckpt`: default continuous MotionVAE checkpoint.
-- `t2m_motion_encoder_ckpt`, `t2m_eval_mean_path`, `t2m_eval_std_path`: evaluator assets.
-- `flow.*`: flow model and conditioning defaults.
+- `data.motion.seq_len`: default sequence length, currently 200 in config; many AIST VQ-flow experiments override this to 196.
+- `paths.stats_path`, `paths.latent_stats_path`, `paths.openpose_stats_path`: default 263D, latent, and BODY-25 stats paths. New flow checkpoints also record these paths in metadata.
+- `vae.ckpt`: default continuous MotionVAE checkpoint.
+- `evaluator.*`: AIST-trained T2M evaluator assets.
+- `flow.*`: flow architecture, optimization, conditioning, regularization, eval, checkpointing, and W&B defaults.
+- `sample.*`: default sample solver/output settings and rare VAE backend overrides.
 
 ## Current Caveats
 

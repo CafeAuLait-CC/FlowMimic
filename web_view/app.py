@@ -15,6 +15,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from flowmimic.src.data.dataloader import blender_to_yup
+from flowmimic.src.config.config import load_config
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -97,7 +98,9 @@ def _file_url(path: Path) -> str:
     try:
         rel = resolved.relative_to(OUTPUT_ROOT)
     except ValueError as exc:
-        raise HTTPException(status_code=500, detail=f"File outside output root: {resolved}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"File outside output root: {resolved}"
+        ) from exc
     return _prefix("/files/" + quote(rel.as_posix()))
 
 
@@ -121,7 +124,9 @@ def _load_motion(path: Path) -> list | None:
         return None
     arr = np.load(path)
     if arr.ndim != 3 or arr.shape[-1] != 3:
-        raise HTTPException(status_code=500, detail=f"Unexpected motion shape in {path}: {arr.shape}")
+        raise HTTPException(
+            status_code=500, detail=f"Unexpected motion shape in {path}: {arr.shape}"
+        )
     arr = blender_to_yup(arr.astype(np.float32))
     return arr.tolist()
 
@@ -193,6 +198,7 @@ def index() -> FileResponse:
 
 
 if BASE_PATH:
+
     @app.get(BASE_PATH, include_in_schema=False)
     def index_redirect() -> RedirectResponse:
         return RedirectResponse(url=_prefix("/"))
@@ -203,8 +209,7 @@ def defaults() -> dict:
     config_path = ROOT_DIR / "flowmimic" / "src" / "config" / "config.json"
     cfg = {}
     if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = load_config(str(config_path))
     return {
         "checkpoints": _list_checkpoints(),
         "model_names": _list_model_names(),
@@ -302,14 +307,22 @@ def generate(req: GenerateRequest) -> dict:
     if not last_link.exists():
         raise HTTPException(
             status_code=500,
-            detail={"stage": "sample_flow", "error": "output/flow/last not found", "run": sample_run},
+            detail={
+                "stage": "sample_flow",
+                "error": "output/flow/last not found",
+                "run": sample_run,
+            },
         )
     run_dir = last_link.resolve()
     meta_path = run_dir / "result_meta.json"
     if not meta_path.exists():
         raise HTTPException(
             status_code=500,
-            detail={"stage": "sample_flow", "error": "result_meta.json not found", "run_dir": str(run_dir)},
+            detail={
+                "stage": "sample_flow",
+                "error": "result_meta.json not found",
+                "run_dir": str(run_dir),
+            },
         )
 
     extract_out_dir = run_dir / "cond_media"
@@ -361,8 +374,12 @@ def generate(req: GenerateRequest) -> dict:
         "meta": meta,
         "generated_motion": _load_motion(gen_motion_path),
         "condition_motion": _load_motion(cond_motion_path),
-        "generated_motion_url": _file_url(gen_motion_path) if gen_motion_path.exists() else None,
-        "condition_motion_url": _file_url(cond_motion_path) if cond_motion_path.exists() else None,
+        "generated_motion_url": _file_url(gen_motion_path)
+        if gen_motion_path.exists()
+        else None,
+        "condition_motion_url": _file_url(cond_motion_path)
+        if cond_motion_path.exists()
+        else None,
         "video_url": _file_url(video_path) if video_path.exists() else None,
         "frame_urls": frame_urls,
         "meta_url": _file_url(meta_path),

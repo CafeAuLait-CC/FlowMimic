@@ -20,7 +20,6 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from flowmimic.src.config.config import load_config
-from flowmimic.src.model.flow.cond_api import build_dummy_cond
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.teacher import EMA, Teacher
 from flowmimic.src.model.flow.solver import solve_flow
@@ -56,26 +55,130 @@ WANDB_EVAL_METRIC_KEYS = (
 )
 
 
+def _apply_train_flow_config_defaults(args, config):
+    flow_cfg = config.get("flow", {})
+    flow_eval_cfg = flow_cfg.get("eval", {})
+    flow_reg_cfg = flow_cfg.get("regularization", {})
+    flow_ckpt_cfg = flow_cfg.get("checkpointing", {})
+
+    args.stats_path = config.get("stats_path")
+    args.openpose_stats_path = config.get(
+        "openpose_stats_path", "data/openpose_stats.npz"
+    )
+    if args.latent_stats_path is None:
+        args.latent_stats_path = config.get(
+            "latent_stats_path", "data/latent_stats.npz"
+        )
+
+    args.vae_latent_len = flow_cfg.get("vae_latent_len")
+    args.vae_latent_token_mode = flow_cfg.get("vae_latent_token_mode")
+    args.eval_cond_frames = flow_eval_cfg.get("cond_frames")
+
+    if args.cond_frames_min is None:
+        args.cond_frames_min = flow_cfg.get("cond_frames_min")
+    if args.cond_frames_max is None:
+        args.cond_frames_max = flow_cfg.get("cond_frames_max")
+    if args.cond_drop_prob is None:
+        args.cond_drop_prob = flow_cfg.get("cond_drop_prob")
+    if args.cond_frame_drop_prob is None:
+        args.cond_frame_drop_prob = flow_cfg.get("cond_frame_drop_prob", 0.0)
+    if args.ema_decay is None:
+        args.ema_decay = flow_cfg.get("ema_decay")
+    if args.lr is None:
+        args.lr = flow_cfg.get("lr")
+    if args.num_workers is None:
+        args.num_workers = int(config.get("num_workers", 10))
+    if args.eval_guidance_scale is None:
+        args.eval_guidance_scale = float(flow_eval_cfg.get("guidance_scale", 1.0))
+    if args.cfg_drop_prob is None:
+        args.cfg_drop_prob = float(flow_cfg.get("cfg_drop_prob", 0.0))
+    if args.cfg_start_epoch is None:
+        args.cfg_start_epoch = int(flow_cfg.get("cfg_start_epoch", 0))
+    if args.cond_frame_drop_start_epoch is None:
+        args.cond_frame_drop_start_epoch = int(
+            flow_cfg.get("cond_frame_drop_start_epoch", 0)
+        )
+    if args.lr_decay_epoch is None:
+        args.lr_decay_epoch = flow_cfg.get("lr_decay_epoch")
+    if args.solver_cond_start_epoch is None:
+        args.solver_cond_start_epoch = int(flow_cfg.get("solver_cond_start_epoch", 30))
+    if args.solver_smooth_start_epoch is None:
+        args.solver_smooth_start_epoch = int(
+            flow_cfg.get("solver_smooth_start_epoch", 40)
+        )
+    if args.lambda_cond is None:
+        args.lambda_cond = float(flow_cfg.get("lambda_cond", 1e-3))
+    if args.lambda_acc is None:
+        args.lambda_acc = float(flow_cfg.get("lambda_acc", 5e-2))
+    if args.lambda_jerk is None:
+        args.lambda_jerk = float(flow_cfg.get("lambda_jerk", 5e-4))
+    if args.solver_reg_subbatch_size is None:
+        args.solver_reg_subbatch_size = int(
+            flow_cfg.get("solver_reg_subbatch_size", 0) or 0
+        )
+    if args.smooth_every is None:
+        args.smooth_every = flow_reg_cfg.get(
+            "smooth_every", flow_cfg.get("smooth_every")
+        )
+
+    args.teacher_steps = int(flow_cfg.get("teacher_steps", 16))
+    args.teacher_solver = flow_cfg.get("teacher_solver", "heun")
+    args.teacher_mode = flow_cfg.get("teacher_mode", "strict")
+    args.p_teacher = float(flow_cfg.get("p_teacher", 1.0))
+    args.eval_use_ema = bool(flow_eval_cfg.get("use_ema", True))
+    args.save_every_steps = int(flow_ckpt_cfg.get("save_every_steps", 100) or 0)
+    args.lr_scale_mode = flow_cfg.get("lr_scale_mode", "none")
+    args.max_bad_steps = int(flow_cfg.get("max_bad_steps", 50) or 0)
+    args.cond_lr_scale = float(flow_cfg.get("cond_lr_scale", 0.1))
+    args.save_every_epochs = int(flow_ckpt_cfg.get("save_every_epochs", 1) or 0)
+
+    args.solver_every = int(flow_cfg.get("solver_every", 8))
+    args.solver_method = flow_cfg.get("solver_method", "euler")
+    args.solver_cond_ramp_epochs = int(flow_cfg.get("solver_cond_ramp_epochs", 10))
+    args.solver_smooth_ramp_epochs = int(flow_cfg.get("solver_smooth_ramp_epochs", 10))
+    args.smooth_loss_domain = flow_cfg.get("smooth_loss_domain", "joints")
+    args.smooth_subbatch_size = int(flow_cfg.get("smooth_subbatch_size", 32))
+    args.reg_decode_batch_size = int(flow_cfg.get("reg_decode_batch_size", 128))
+    args.reg_decode_checkpoint = bool(flow_cfg.get("reg_decode_checkpoint", True))
+    args.solver_checkpoint = bool(flow_cfg.get("solver_checkpoint", True))
+    args.cond_every = flow_reg_cfg.get("cond_every", flow_cfg.get("cond_every"))
+    args.solver_steps_early = flow_cfg.get("solver_steps_early", "16")
+    args.solver_steps_mid = flow_cfg.get("solver_steps_mid", "8,16")
+    args.solver_steps_late = flow_cfg.get("solver_steps_late", "4,8,2")
+    args.solver_mid_epoch = int(flow_cfg.get("solver_mid_epoch", 80))
+    args.solver_late_epoch = int(flow_cfg.get("solver_late_epoch", 160))
+
+    args.eval_t2m_motion_encoder_ckpt = config.get("t2m_motion_encoder_ckpt")
+    args.eval_t2m_mean_path = config.get("t2m_eval_mean_path")
+    args.eval_t2m_std_path = config.get("t2m_eval_std_path")
+    args.eval_num_samples = 0
+    args.eval_batch_size = int(
+        flow_eval_cfg.get("batch_size", config.get("eval_batch_size", 32))
+    )
+    args.eval_diversity_times = int(flow_eval_cfg.get("diversity_times", 300))
+    args.eval_multimodality_repeats = int(flow_eval_cfg.get("multimodality_repeats", 1))
+    args.eval_multimodality_times = int(flow_eval_cfg.get("multimodality_times", 20))
+    args.async_eval_cpu_threads = int(flow_eval_cfg.get("async_eval_cpu_threads", 8))
+    args.async_eval_nice = int(flow_eval_cfg.get("async_eval_nice", 10))
+
+
 def main():
+    config = load_config()
+    flow_cfg = config.get("flow", {})
+    flow_eval_cfg = flow_cfg.get("eval", {})
+    flow_wandb_cfg = flow_cfg.get("wandb", {})
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--datasets", type=str, default="AIST")
     parser.add_argument("--seq-len", type=int, default=None)
-    parser.add_argument("--stats-path", type=str, default=None)
     parser.add_argument("--latent-stats-path", type=str, default=None)
-    parser.add_argument("--openpose-stats-path", type=str, default=None)
     parser.add_argument("--vae-ckpt", type=str, default=None)
     parser.add_argument(
         "--vae-type",
         choices=("auto", "motion_vae", "motion_vqvae"),
         default="auto",
-    )
-    parser.add_argument("--vae-latent-len", type=int, default=None)
-    parser.add_argument(
-        "--vae-latent-token-mode",
-        choices=("pool", "query"),
-        default=None,
     )
     parser.add_argument(
         "--aist-crop-mode", choices=("first", "random", "uniform"), default="first"
@@ -88,26 +191,20 @@ def main():
     parser.add_argument(
         "--cond-frame-drop-start-epoch",
         type=int,
-        default=0,
+        default=None,
         help="1-based epoch to enable sequence-frame condition masking. 0 enables it from the start.",
     )
-    parser.add_argument("--cfg-drop-prob", type=float, default=0.0)
+    parser.add_argument("--cfg-drop-prob", type=float, default=None)
     parser.add_argument(
         "--cfg-start-epoch",
         type=int,
-        default=0,
+        default=None,
         help="1-based epoch to enable sample-level full-condition CFG dropout. 0 enables it from the start.",
     )
     parser.add_argument("--ema-decay", type=float, default=None)
-    parser.add_argument(
-        "--eval-cond-frames",
-        type=int,
-        default=None,
-        help="Condition frame count for validation; defaults to cond-frames-min.",
-    )
-    parser.add_argument("--eval-guidance-scale", type=float, default=1.0)
+    parser.add_argument("--eval-guidance-scale", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -115,120 +212,92 @@ def main():
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--reflow-round", type=int, default=0)
     parser.add_argument("--teacher-ckpt", type=str, default=None)
-    parser.add_argument("--teacher-steps", type=int, default=None)
-    parser.add_argument("--teacher-solver", type=str, default=None)
     parser.add_argument("--use-ema-teacher", action="store_true")
-    parser.add_argument("--eval-use-ema", action="store_true", default=True)
-    parser.add_argument("--no-eval-use-ema", dest="eval_use_ema", action="store_false")
-    parser.add_argument(
-        "--teacher-mode", type=str, choices=["strict", "mixed"], default=None
-    )
-    parser.add_argument("--p-teacher", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/flow")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--save-every-steps", type=int, default=100)
-    parser.add_argument(
-        "--lr-scale-mode", type=str, choices=["none", "linear"], default="none"
-    )
     parser.add_argument(
         "--lr-decay-epoch",
         type=int,
         default=None,
         help="Epoch at which to apply the one-time 0.5 LR decay; defaults to epochs//2.",
     )
-    parser.add_argument("--max-bad-steps", type=int, default=50)
-    parser.add_argument("--cond-lr-scale", type=float, default=0.1)
     parser.add_argument("--reset-optimizer", action="store_true")
-    parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--solver-every", type=int, default=8)
-    parser.add_argument("--solver-method", type=str, default="euler")
-    parser.add_argument("--solver-cond-start-epoch", type=int, default=30)
-    parser.add_argument("--solver-cond-ramp-epochs", type=int, default=10)
-    parser.add_argument("--solver-smooth-start-epoch", type=int, default=40)
-    parser.add_argument("--solver-smooth-ramp-epochs", type=int, default=10)
-    parser.add_argument("--lambda-cond", type=float, default=1e-3)
-    parser.add_argument("--lambda-acc", type=float, default=5e-2)
-    parser.add_argument("--lambda-jerk", type=float, default=5e-4)
-    parser.add_argument(
-        "--smooth-loss-domain",
-        choices=("joints", "latent_solver", "latent_est", "joints_est"),
-        default="joints",
-    )
-    parser.add_argument("--smooth-subbatch-size", type=int, default=32)
+    parser.add_argument("--solver-cond-start-epoch", type=int, default=None)
+    parser.add_argument("--solver-smooth-start-epoch", type=int, default=None)
+    parser.add_argument("--lambda-cond", type=float, default=None)
+    parser.add_argument("--lambda-acc", type=float, default=None)
+    parser.add_argument("--lambda-jerk", type=float, default=None)
     parser.add_argument(
         "--solver-reg-subbatch-size",
         type=int,
-        default=0,
+        default=None,
         help=(
             "If >0, run differentiable solver/decode regularizers on a random "
             "subbatch of each full training batch. The base CFM loss still uses "
             "the full batch."
         ),
     )
-    parser.add_argument("--reg-decode-batch-size", type=int, default=128)
-    parser.add_argument(
-        "--no-reg-decode-checkpoint",
-        dest="reg_decode_checkpoint",
-        action="store_false",
-    )
-    parser.set_defaults(reg_decode_checkpoint=True)
-    parser.add_argument(
-        "--no-solver-checkpoint",
-        dest="solver_checkpoint",
-        action="store_false",
-        help="Disable activation checkpointing inside differentiable solver regularization.",
-    )
-    parser.set_defaults(solver_checkpoint=True)
-    parser.add_argument("--cond-every", type=int, default=None)
     parser.add_argument("--smooth-every", type=int, default=None)
-    parser.add_argument("--solver-steps-early", type=str, default="16")
-    parser.add_argument("--solver-steps-mid", type=str, default="8,16")
-    parser.add_argument("--solver-steps-late", type=str, default="4,8,2")
-    parser.add_argument("--solver-mid-epoch", type=int, default=80)
-    parser.add_argument("--solver-late-epoch", type=int, default=160)
-    parser.add_argument("--wandb-project", type=str, default="FlowMimic")
-    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=flow_wandb_cfg.get("project", "FlowMimic"),
+    )
+    parser.add_argument(
+        "--wandb-entity", type=str, default=flow_wandb_cfg.get("entity")
+    )
     parser.add_argument("--wandb-name", type=str, default=None)
-    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=flow_wandb_cfg.get("group"))
     parser.add_argument("--wandb-tags", type=str, default=None)
     parser.add_argument("--wandb-id", type=str, default=None)
     parser.add_argument(
         "--wandb-resume",
         type=str,
-        default="allow",
+        default=flow_wandb_cfg.get("resume", "allow"),
         choices=("allow", "must", "never"),
     )
     parser.add_argument(
         "--wandb-mode",
         type=str,
-        default="online",
+        default=flow_wandb_cfg.get("mode", "online"),
         choices=("online", "offline", "disabled"),
     )
-    parser.add_argument("--eval-t2m-motion-encoder-ckpt", type=str, default=None)
-    parser.add_argument("--eval-t2m-mean-path", type=str, default=None)
-    parser.add_argument("--eval-t2m-std-path", type=str, default=None)
-    parser.add_argument("--eval-steps", type=str, default="16,50")
-    parser.add_argument("--eval-every-epochs", type=int, default=None)
-    parser.add_argument("--eval-num-samples", type=int, default=0)
-    parser.add_argument("--eval-aist-splits", type=str, default="test")
-    parser.add_argument("--eval-aist-cameras", type=str, default="01")
+    parser.add_argument(
+        "--eval-steps", type=str, default=flow_eval_cfg.get("steps", "16,50")
+    )
+    parser.add_argument(
+        "--eval-every-epochs", type=int, default=flow_eval_cfg.get("every_epochs")
+    )
+    parser.add_argument(
+        "--eval-aist-splits",
+        type=str,
+        default=flow_eval_cfg.get("aist_splits", "test"),
+    )
+    parser.add_argument(
+        "--eval-aist-cameras",
+        type=str,
+        default=flow_eval_cfg.get("aist_cameras", "01"),
+    )
     parser.add_argument(
         "--eval-aist-crop-mode",
         choices=("first", "random", "uniform"),
-        default="first",
+        default=flow_eval_cfg.get("aist_crop_mode", "first"),
     )
-    parser.add_argument("--eval-replications", type=int, default=3)
-    parser.add_argument("--eval-diversity-times", type=int, default=300)
-    parser.add_argument("--eval-multimodality-repeats", type=int, default=1)
-    parser.add_argument("--eval-multimodality-times", type=int, default=20)
+    parser.add_argument(
+        "--eval-replications",
+        type=int,
+        default=flow_eval_cfg.get("replications", 3),
+    )
     parser.add_argument("--eval-no-dist", action="store_true")
-    parser.add_argument("--async-cpu-eval", action="store_true")
-    parser.add_argument("--eval-batch-size", type=int, default=32)
-    parser.add_argument("--async-eval-cpu-threads", type=int, default=8)
-    parser.add_argument("--async-eval-nice", type=int, default=10)
+    parser.add_argument(
+        "--async-cpu-eval",
+        action="store_true",
+        default=flow_eval_cfg.get("async_cpu_eval", False),
+    )
     parser.add_argument("--async-eval-log-dir", type=str, default=None)
     args = parser.parse_args()
+    _apply_train_flow_config_defaults(args, config)
 
     env_world_size = int(os.environ.get("WORLD_SIZE") or "1")
     ddp = args.ddp or env_world_size > 1
@@ -255,8 +324,7 @@ def main():
             f.write(f"[{stamp}] [epoch {epoch_val}] {msg}\n")
 
     if is_main:
-        print("Loading config")
-    config = load_config()
+        print("Loaded config")
     datasets = _parse_dataset_names(args.datasets)
     use_aist = "AIST" in datasets
     use_mvh = "MVH" in datasets
@@ -366,7 +434,9 @@ def main():
         args.p_teacher if args.p_teacher is not None else flow_cfg.get("p_teacher", 1.0)
     )
     ema_decay = (
-        args.ema_decay if args.ema_decay is not None else flow_cfg.get("ema_decay", 0.999)
+        args.ema_decay
+        if args.ema_decay is not None
+        else flow_cfg.get("ema_decay", 0.999)
     )
     cond_frames_min = (
         args.cond_frames_min
@@ -431,9 +501,7 @@ def main():
     dataset_b = None
     if use_aist:
         if is_main:
-            print(
-                f"Building datasets -- AIST++ (train split: {len(aist_train_paths)})"
-            )
+            print(f"Building datasets -- AIST++ (train split: {len(aist_train_paths)})")
         dataset_a = AISTDataset(
             aist_dir,
             genre_to_id=genre_to_id,
@@ -671,8 +739,8 @@ def main():
     eval_compute_dist = False
     eval_t2m_extractor = None
     eval_t2m_stats = None
-    eval_t2m_ckpt = (
-        args.eval_t2m_motion_encoder_ckpt or config.get("t2m_motion_encoder_ckpt")
+    eval_t2m_ckpt = args.eval_t2m_motion_encoder_ckpt or config.get(
+        "t2m_motion_encoder_ckpt"
     )
     eval_t2m_mean_path = args.eval_t2m_mean_path or config.get("t2m_eval_mean_path")
     eval_t2m_std_path = args.eval_t2m_std_path or config.get("t2m_eval_std_path")
@@ -680,8 +748,8 @@ def main():
         if not eval_t2m_mean_path or not eval_t2m_std_path:
             raise ValueError(
                 "Async eval T2M metrics require mean/std paths. "
-                "Set --eval-t2m-mean-path/--eval-t2m-std-path or config keys "
-                "t2m_eval_mean_path/t2m_eval_std_path."
+                "Set evaluator.t2m_eval_mean_path and evaluator.t2m_eval_std_path "
+                "in config.json."
             )
         if not os.path.exists(eval_t2m_mean_path) or not os.path.exists(
             eval_t2m_std_path
@@ -691,15 +759,13 @@ def main():
                 f"mean={eval_t2m_mean_path}, std={eval_t2m_std_path}"
             )
         eval_compute_dist = True
-        print(
-            "Async CPU eval enabled; T2M evaluator will be loaded in child process."
-        )
+        print("Async CPU eval enabled; T2M evaluator will be loaded in child process.")
     elif is_main and (not args.eval_no_dist) and eval_t2m_ckpt:
         if not eval_t2m_mean_path or not eval_t2m_std_path:
             raise ValueError(
                 "Eval T2M metrics require mean/std paths. "
-                "Set --eval-t2m-mean-path/--eval-t2m-std-path or config keys "
-                "t2m_eval_mean_path/t2m_eval_std_path."
+                "Set evaluator.t2m_eval_mean_path and evaluator.t2m_eval_std_path "
+                "in config.json."
             )
         if not os.path.exists(eval_t2m_mean_path) or not os.path.exists(
             eval_t2m_std_path
@@ -765,6 +831,23 @@ def main():
     ema = EMA(flow_model, decay=ema_decay) if args.use_ema_teacher else None
     if ema is not None and args.resume and ema_state is not None:
         ema.load_state_dict(ema_state)
+    checkpoint_metadata = _make_checkpoint_metadata(
+        args=args,
+        config=config,
+        datasets=datasets,
+        vae_backend=vae_backend,
+        vae_ckpt_path=vae_ckpt_path,
+        stats_path=stats_path,
+        openpose_stats_path=openpose_stats_path,
+        latent_stats_path=latent_stats_path,
+        latent_stats_available=latent_mean is not None and latent_std is not None,
+        seq_len=seq_len,
+        flow_d_z=flow_d_z,
+        latent_len=latent_len,
+        cond_frames_min=cond_frames_min,
+        cond_frames_max=cond_frames_max,
+        eval_cond_frames=eval_cond_frames,
+    )
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     last_path = os.path.join(
@@ -774,13 +857,14 @@ def main():
         args.checkpoint_dir, f"flow_round{args.reflow_round}_last_good.pt"
     )
     if not args.resume and is_main:
-        init_state = {
-            "model": flow_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": 0,
-        }
-        if ema is not None:
-            init_state["ema"] = ema.state_dict()
+        init_state = _flow_checkpoint_state(
+            flow_model,
+            optimizer,
+            epoch=0,
+            lr_halved=lr_halved,
+            ema=ema,
+            metadata=checkpoint_metadata,
+        )
         torch.save(init_state, last_path)
         torch.save(init_state, last_good_path)
     if ddp:
@@ -1130,9 +1214,9 @@ def main():
                         solver_reg_subbatch_size > 0
                         and x0.shape[0] > solver_reg_subbatch_size
                     ):
-                        solver_reg_idx = torch.randperm(
-                            x0.shape[0], device=x0.device
-                        )[:solver_reg_subbatch_size]
+                        solver_reg_idx = torch.randperm(x0.shape[0], device=x0.device)[
+                            :solver_reg_subbatch_size
+                        ]
 
                     def _reg_select(tensor):
                         if solver_reg_idx is None:
@@ -1183,14 +1267,18 @@ def main():
                         reg_decode_batch = int(args.reg_decode_batch_size or 0)
                         if reg_decode_batch <= 0:
                             reg_decode_batch = z_decode.shape[0]
-                        reg_decode_batch = max(1, min(reg_decode_batch, z_decode.shape[0]))
+                        reg_decode_batch = max(
+                            1, min(reg_decode_batch, z_decode.shape[0])
+                        )
                         cond_loss_sum = z_decode.new_zeros(())
                         smooth_acc_sum_chunk = z_decode.new_zeros(())
                         smooth_jerk_sum_chunk = z_decode.new_zeros(())
                         cond_loss_weight = 0
                         smooth_loss_weight = 0
                         for reg_start in range(0, z_decode.shape[0], reg_decode_batch):
-                            reg_end = min(reg_start + reg_decode_batch, z_decode.shape[0])
+                            reg_end = min(
+                                reg_start + reg_decode_batch, z_decode.shape[0]
+                            )
                             reg_slice = slice(reg_start, reg_end)
                             z_chunk = z_decode[reg_slice]
                             domain_chunk = domain_reg[reg_slice]
@@ -1244,8 +1332,7 @@ def main():
                                     )
                                 )
                                 smooth_acc_sum_chunk = (
-                                    smooth_acc_sum_chunk
-                                    + smooth_acc_chunk * chunk_size
+                                    smooth_acc_sum_chunk + smooth_acc_chunk * chunk_size
                                 )
                                 smooth_jerk_sum_chunk = (
                                     smooth_jerk_sum_chunk
@@ -1317,14 +1404,14 @@ def main():
                 cond_match_sum += cond_match_loss.detach().item()
                 cond_count += 1
             if save_every_steps and (step_idx + 1) % save_every_steps == 0:
-                state = {
-                    "model": flow_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": epoch + 1,
-                    "lr_halved": lr_halved,
-                }
-                if ema is not None:
-                    state["ema"] = ema.state_dict()
+                state = _flow_checkpoint_state(
+                    flow_model,
+                    optimizer,
+                    epoch=epoch + 1,
+                    lr_halved=lr_halved,
+                    ema=ema,
+                    metadata=checkpoint_metadata,
+                )
                 if is_main:
                     torch.save(state, last_path)
                     torch.save(state, last_good_path)
@@ -1369,15 +1456,11 @@ def main():
             base_loss_avg = base_loss_sum / max(total_count, 1)
             smooth_weighted_avg = smooth_weighted_sum / max(total_count, 1)
             cond_weighted_avg = cond_weighted_sum / max(total_count, 1)
-            smooth_acc_avg = (
-                smooth_acc_sum / smooth_count if smooth_count > 0 else 0.0
-            )
+            smooth_acc_avg = smooth_acc_sum / smooth_count if smooth_count > 0 else 0.0
             smooth_jerk_avg = (
                 smooth_jerk_sum / smooth_count if smooth_count > 0 else 0.0
             )
-            cond_match_avg = (
-                cond_match_sum / cond_count if cond_count > 0 else 0.0
-            )
+            cond_match_avg = cond_match_sum / cond_count if cond_count > 0 else 0.0
             cond_match_effective = cond_match_sum / max(total_count, 1)
             cond_frequency = cond_count / max(total_count, 1)
             if cond_count > 0:
@@ -1425,9 +1508,7 @@ def main():
                 else save_every_epochs
             )
             do_eval = (
-                eval_every_epochs
-                and (epoch + 1) % eval_every_epochs == 0
-                and use_aist
+                eval_every_epochs and (epoch + 1) % eval_every_epochs == 0 and use_aist
             )
             if wandb_run is not None:
                 wandb_run.log(
@@ -1475,14 +1556,14 @@ def main():
 
             eval_ckpt_path = last_path
             if total_count > 0:
-                state = {
-                    "model": flow_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": epoch + 1,
-                    "lr_halved": lr_halved,
-                }
-                if ema is not None:
-                    state["ema"] = ema.state_dict()
+                state = _flow_checkpoint_state(
+                    flow_model,
+                    optimizer,
+                    epoch=epoch + 1,
+                    lr_halved=lr_halved,
+                    ema=ema,
+                    metadata=checkpoint_metadata,
+                )
                 torch.save(state, last_path)
                 torch.save(state, last_good_path)
                 if save_every_epochs and (epoch + 1) % save_every_epochs == 0:
@@ -1501,12 +1582,6 @@ def main():
                             epoch=epoch + 1,
                             flow_ckpt=eval_ckpt_path,
                             vae_ckpt=vae_ckpt_path,
-                            stats_path=stats_path,
-                            openpose_stats_path=openpose_stats_path,
-                            latent_stats_path=latent_stats_path,
-                            eval_t2m_ckpt=eval_t2m_ckpt,
-                            eval_t2m_mean_path=eval_t2m_mean_path,
-                            eval_t2m_std_path=eval_t2m_std_path,
                             seq_len=seq_len,
                         )
                     else:
@@ -1643,6 +1718,91 @@ def main():
         dist.destroy_process_group()
 
 
+def _make_checkpoint_metadata(
+    *,
+    args,
+    config,
+    datasets,
+    vae_backend,
+    vae_ckpt_path,
+    stats_path,
+    openpose_stats_path,
+    latent_stats_path,
+    latent_stats_available,
+    seq_len,
+    flow_d_z,
+    latent_len,
+    cond_frames_min,
+    cond_frames_max,
+    eval_cond_frames,
+):
+    return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "vae_ckpt": vae_ckpt_path,
+        "vae_type": vae_backend.vae_type,
+        "vae_requested_type": args.vae_type,
+        "vae_max_len": vae_backend.max_len,
+        "stats_path": stats_path,
+        "openpose_stats_path": openpose_stats_path,
+        "latent_stats_path": latent_stats_path,
+        "latent_stats_available": bool(latent_stats_available),
+        "seq_len": int(seq_len),
+        "latent_len": int(latent_len),
+        "d_z": int(flow_d_z),
+        "datasets": sorted(datasets),
+        "aist_crop_mode": args.aist_crop_mode,
+        "aist_clip_repeat": int(args.aist_clip_repeat),
+        "conditioning": {
+            "cond_frames_min": int(cond_frames_min),
+            "cond_frames_max": int(cond_frames_max),
+            "eval_cond_frames": int(eval_cond_frames),
+            "cond_drop_prob": args.cond_drop_prob,
+            "cond_frame_drop_prob": args.cond_frame_drop_prob,
+            "cond_frame_drop_start_epoch": args.cond_frame_drop_start_epoch,
+            "cfg_drop_prob": args.cfg_drop_prob,
+            "cfg_start_epoch": args.cfg_start_epoch,
+        },
+        "regularization": {
+            "solver_cond_start_epoch": args.solver_cond_start_epoch,
+            "solver_smooth_start_epoch": args.solver_smooth_start_epoch,
+            "lambda_cond": args.lambda_cond,
+            "lambda_acc": args.lambda_acc,
+            "lambda_jerk": args.lambda_jerk,
+            "solver_reg_subbatch_size": args.solver_reg_subbatch_size,
+            "smooth_loss_domain": args.smooth_loss_domain,
+        },
+        "eval": {
+            "steps": args.eval_steps,
+            "aist_splits": args.eval_aist_splits,
+            "aist_cameras": args.eval_aist_cameras,
+            "aist_crop_mode": args.eval_aist_crop_mode,
+            "replications": args.eval_replications,
+            "t2m_motion_encoder_ckpt": config.get("t2m_motion_encoder_ckpt"),
+            "t2m_eval_mean_path": config.get("t2m_eval_mean_path"),
+            "t2m_eval_std_path": config.get("t2m_eval_std_path"),
+        },
+        "flow_config": config.get("flow", {}),
+    }
+
+
+def _flow_checkpoint_state(flow_model, optimizer, *, epoch, lr_halved, ema, metadata):
+    state = {
+        "model": flow_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "lr_halved": lr_halved,
+        "metadata": dict(metadata),
+        "vae_ckpt": metadata.get("vae_ckpt"),
+        "vae_type": metadata.get("vae_type"),
+        "latent_stats_path": metadata.get("latent_stats_path"),
+        "stats_path": metadata.get("stats_path"),
+        "openpose_stats_path": metadata.get("openpose_stats_path"),
+    }
+    if ema is not None:
+        state["ema"] = ema.state_dict()
+    return state
+
+
 def _poll_async_eval_job(job, wandb_run, log_step=None):
     if job is None:
         return None
@@ -1687,12 +1847,6 @@ def _launch_async_cpu_eval(
     epoch,
     flow_ckpt,
     vae_ckpt,
-    stats_path,
-    openpose_stats_path,
-    latent_stats_path,
-    eval_t2m_ckpt,
-    eval_t2m_mean_path,
-    eval_t2m_std_path,
     seq_len,
 ):
     log_dir = args.async_eval_log_dir or os.path.join(args.checkpoint_dir, "async_eval")
@@ -1720,8 +1874,6 @@ def _launch_async_cpu_eval(
         "0",
         "--seq-len",
         str(seq_len),
-        "--vae-max-len",
-        str(seq_len),
         "--datasets",
         "AIST",
         "--aist-splits",
@@ -1740,12 +1892,6 @@ def _launch_async_cpu_eval(
         str(args.eval_steps),
         "--solver",
         "heun",
-        "--stats-path",
-        stats_path,
-        "--openpose-stats-path",
-        openpose_stats_path,
-        "--latent-stats-path",
-        latent_stats_path,
         "--aist-crop-mode",
         args.eval_aist_crop_mode,
         "--replications",
@@ -1756,28 +1902,13 @@ def _launch_async_cpu_eval(
         csv_path,
         "--save-plot",
         plot_path,
-        "--diversity-times",
-        str(args.eval_diversity_times),
-        "--multimodality-repeats",
-        str(args.eval_multimodality_repeats),
-        "--multimodality-times",
-        str(args.eval_multimodality_times),
     ]
-    if args.vae_latent_len is not None:
-        cmd.extend(["--vae-latent-len", str(args.vae_latent_len)])
-    if args.vae_latent_token_mode is not None:
-        cmd.extend(["--vae-latent-token-mode", args.vae_latent_token_mode])
     if args.eval_use_ema:
         cmd.append("--use-ema")
+    else:
+        cmd.append("--no-use-ema")
     if args.eval_no_dist:
         cmd.append("--no-dist")
-    else:
-        if eval_t2m_ckpt:
-            cmd.extend(["--t2m-motion-encoder-ckpt", eval_t2m_ckpt])
-        if eval_t2m_mean_path:
-            cmd.extend(["--t2m-mean-path", eval_t2m_mean_path])
-        if eval_t2m_std_path:
-            cmd.extend(["--t2m-std-path", eval_t2m_std_path])
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ""
     cpu_eval_threads = str(max(1, int(args.async_eval_cpu_threads)))
@@ -1786,10 +1917,9 @@ def _launch_async_cpu_eval(
     env["OPENBLAS_NUM_THREADS"] = env.get(
         "FLOWMIMIC_CPU_EVAL_THREADS", cpu_eval_threads
     )
-    env["NUMEXPR_NUM_THREADS"] = env.get(
-        "FLOWMIMIC_CPU_EVAL_THREADS", cpu_eval_threads
-    )
+    env["NUMEXPR_NUM_THREADS"] = env.get("FLOWMIMIC_CPU_EVAL_THREADS", cpu_eval_threads)
     env["PYTHONUNBUFFERED"] = "1"
+
     def _preexec_child():
         if args.async_eval_nice:
             try:
@@ -2084,7 +2214,11 @@ def _aggregate_eval_summaries(rows):
         }
     )
     return {
-        key: float(np.mean([row[key] for row in rows if isinstance(row.get(key), (int, float))]))
+        key: float(
+            np.mean(
+                [row[key] for row in rows if isinstance(row.get(key), (int, float))]
+            )
+        )
         for key in keys
     }
 

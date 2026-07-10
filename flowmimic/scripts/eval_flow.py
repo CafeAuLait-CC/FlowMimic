@@ -955,85 +955,102 @@ def evaluate_dataset(
     return summary, results if save_per_sample else None
 
 
+def _checkpoint_metadata(state):
+    metadata = state.get("metadata", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def main():
+    cfg = load_config()
+    flow_eval_cfg = cfg.get("flow", {}).get("eval", {})
     parser = argparse.ArgumentParser()
     parser.add_argument("--flow-ckpt", required=True)
     parser.add_argument("--vae-ckpt", default=None)
+    parser.add_argument("--latent-stats-path", default=None)
     parser.add_argument(
         "--vae-type",
         choices=("auto", "motion_vae", "motion_vqvae"),
         default="auto",
     )
-    parser.add_argument("--t2m-motion-encoder-ckpt", default=None)
-    parser.add_argument("--t2m-mean-path", default=None)
-    parser.add_argument("--t2m-std-path", default=None)
-    parser.add_argument("--stats-path", default=None)
-    parser.add_argument("--openpose-stats-path", default=None)
-    parser.add_argument("--latent-stats-path", default=None)
     parser.add_argument(
-        "--aist-crop-mode", choices=("first", "random", "uniform"), default="first"
+        "--aist-crop-mode",
+        choices=("first", "random", "uniform"),
+        default=flow_eval_cfg.get("aist_crop_mode", "first"),
     )
-    parser.add_argument("--use-ema", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-samples", type=int, default=200)
+    parser.add_argument(
+        "--use-ema",
+        action=argparse.BooleanOptionalAction,
+        default=flow_eval_cfg.get("use_ema", False),
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=flow_eval_cfg.get("batch_size", 32)
+    )
+    parser.add_argument(
+        "--num-samples", type=int, default=flow_eval_cfg.get("num_samples", 200)
+    )
     parser.add_argument("--seq-len", type=int, default=None)
-    parser.add_argument("--vae-max-len", type=int, default=None)
-    parser.add_argument("--vae-latent-len", type=int, default=None)
     parser.add_argument(
-        "--vae-latent-token-mode",
-        choices=("pool", "query"),
-        default=None,
+        "--cond-frames", type=int, default=flow_eval_cfg.get("cond_frames")
     )
-    parser.add_argument("--cond-frames", type=int, default=None)
-    parser.add_argument("--guidance-scale", type=float, default=1.0)
-    parser.add_argument("--aist-splits", type=str, default="val")
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=flow_eval_cfg.get("guidance_scale", 1.0),
+    )
+    parser.add_argument(
+        "--aist-splits", type=str, default=flow_eval_cfg.get("aist_splits", "val")
+    )
     parser.add_argument(
         "--aist-cameras",
         type=str,
-        default=None,
+        default=flow_eval_cfg.get("aist_cameras"),
         help="Comma-separated AIST cameras for eval. Defaults to config aist_cameras.",
     )
     parser.add_argument(
         "--datasets",
         type=str,
-        default="AIST,MVH",
+        default=flow_eval_cfg.get("datasets", "AIST,MVH"),
         help="Comma-separated datasets to evaluate: AIST,MVH.",
     )
-    parser.add_argument("--steps", type=str, default="16,8,4,2,1")
-    parser.add_argument("--solver", type=str, default="heun")
-    parser.add_argument("--cam-mode", type=str, default="fixed", choices=["fixed", "per_frame"])
-    parser.add_argument("--slack-seconds", type=float, default=0.1)
+    parser.add_argument("--steps", type=str, default=flow_eval_cfg.get("steps", "16,8,4,2,1"))
+    parser.add_argument("--solver", type=str, default=flow_eval_cfg.get("solver", "heun"))
+    parser.add_argument("--seed", type=int, default=cfg.get("seed", 42))
     parser.add_argument(
-        "--cond-drop-prob",
-        type=float,
-        default=0.0,
-        help="Drop probability for sparse conditioning keypoints during eval. Defaults to 0; training augmentation should not be applied to validation.",
+        "--replications", type=int, default=flow_eval_cfg.get("replications", 1)
     )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--replications", type=int, default=1)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-csv", type=str, default=None)
     parser.add_argument("--save-plot", type=str, default=None)
-    parser.add_argument("--diversity-times", type=int, default=300)
-    parser.add_argument("--multimodality-repeats", type=int, default=1)
-    parser.add_argument("--multimodality-times", type=int, default=20)
     parser.add_argument("--no-dist", action="store_true")
-    parser.add_argument("--save-per-sample", action="store_true")
     args = parser.parse_args()
 
     _set_eval_seed(args.seed, args.device)
+    eval_cond_drop_prob = float(flow_eval_cfg.get("cond_drop_prob", 0.0))
+    eval_cam_mode = flow_eval_cfg.get("cam_mode", "fixed")
+    eval_slack_seconds = float(flow_eval_cfg.get("slack_seconds", 0.1))
+    eval_diversity_times = int(flow_eval_cfg.get("diversity_times", 300))
+    eval_multimodality_repeats = int(
+        flow_eval_cfg.get("multimodality_repeats", 1)
+    )
+    eval_multimodality_times = int(flow_eval_cfg.get("multimodality_times", 20))
+    eval_save_per_sample = bool(flow_eval_cfg.get("save_per_sample", False))
 
-    print("Loading config")
-    cfg = load_config()
-    seq_len = args.seq_len or cfg["seq_len"]
-    vae_max_len = args.vae_max_len or cfg["seq_len"]
+    print(f"Loading flow checkpoint metadata: {args.flow_ckpt}")
+    state = torch.load(args.flow_ckpt, map_location=args.device)
+    ckpt_metadata = _checkpoint_metadata(state)
+    seq_len = args.seq_len or ckpt_metadata.get("seq_len") or cfg["seq_len"]
+    vae_max_len = ckpt_metadata.get("vae_max_len") or cfg["seq_len"]
     if seq_len > vae_max_len:
-        raise ValueError(f"--seq-len ({seq_len}) cannot exceed --vae-max-len ({vae_max_len})")
-    stats_path = args.stats_path or cfg["stats_path"]
+        raise ValueError(
+            f"--seq-len ({seq_len}) cannot exceed VAE max length ({vae_max_len})"
+        )
+    stats_path = ckpt_metadata.get("stats_path") or cfg["stats_path"]
     print("Loading 263D stats")
     mean, std = load_mean_std(stats_path)
-    openpose_stats_path = args.openpose_stats_path or cfg.get(
+    openpose_stats_path = ckpt_metadata.get("openpose_stats_path") or cfg.get(
         "openpose_stats_path", "data/openpose_stats.npz"
     )
     print("Loading OpenPose stats")
@@ -1043,8 +1060,10 @@ def main():
         k2d_std = op_stats["std"]
     else:
         raise FileNotFoundError(f"OpenPose stats not found: {openpose_stats_path}")
-    latent_stats_path = args.latent_stats_path or cfg.get(
-        "latent_stats_path", "data/latent_stats.npz"
+    latent_stats_path = (
+        args.latent_stats_path
+        or ckpt_metadata.get("latent_stats_path")
+        or cfg.get("latent_stats_path", "data/latent_stats.npz")
     )
     latent_mean = None
     latent_std = None
@@ -1057,7 +1076,9 @@ def main():
     print("Building models")
     mapping, computed = _build_smpl22_to_body25(cfg["smpl45_to_body25_def"])
     print("Loading VAE")
-    vae_ckpt = args.vae_ckpt or cfg.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt")
+    vae_ckpt = args.vae_ckpt or ckpt_metadata.get("vae_ckpt") or cfg.get(
+        "vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt"
+    )
     print(f"Loading VAE model: {vae_ckpt}")
     vae_backend = load_vae_backend(
         vae_ckpt,
@@ -1065,8 +1086,8 @@ def main():
         args.device,
         seq_len=seq_len,
         vae_type=args.vae_type,
-        latent_len=args.vae_latent_len,
-        latent_token_mode=args.vae_latent_token_mode,
+        latent_len=flow_eval_cfg.get("vae_latent_len"),
+        latent_token_mode=flow_eval_cfg.get("vae_latent_token_mode"),
     )
     vae = vae_backend.model
     d_z = vae_backend.d_z
@@ -1092,7 +1113,6 @@ def main():
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
     ).to(args.device)
     print(f"Loading flow model: {args.flow_ckpt}")
-    state = torch.load(args.flow_ckpt, map_location=args.device)
     flow_state = state.get("ema") if args.use_ema and "ema" in state else state["model"]
     if args.use_ema and "ema" not in state:
         print("Warning: --use-ema requested but checkpoint has no EMA state; using model.")
@@ -1102,18 +1122,19 @@ def main():
     t2m_extractor = None
     t2m_stats = None
     if not args.no_dist:
-        t2m_ckpt = args.t2m_motion_encoder_ckpt or cfg.get("t2m_motion_encoder_ckpt")
-        t2m_mean_path = args.t2m_mean_path or cfg.get("t2m_eval_mean_path")
-        t2m_std_path = args.t2m_std_path or cfg.get("t2m_eval_std_path")
+        t2m_ckpt = cfg.get("t2m_motion_encoder_ckpt")
+        t2m_mean_path = cfg.get("t2m_eval_mean_path")
+        t2m_std_path = cfg.get("t2m_eval_std_path")
         if not t2m_ckpt:
             raise ValueError(
                 "Distribution metrics requested but no T2M checkpoint provided. "
-                "Use --t2m-motion-encoder-ckpt or set t2m_motion_encoder_ckpt in config."
+                "Set evaluator.t2m_motion_encoder_ckpt in config.json."
             )
         if not t2m_mean_path or not t2m_std_path:
             raise ValueError(
                 "Distribution metrics requested but no T2M mean/std provided. "
-                "Use --t2m-mean-path/--t2m-std-path or set t2m_eval_mean_path/t2m_eval_std_path in config."
+                "Set evaluator.t2m_eval_mean_path and evaluator.t2m_eval_std_path "
+                "in config.json."
             )
         if not os.path.exists(t2m_mean_path) or not os.path.exists(t2m_std_path):
             raise FileNotFoundError(
@@ -1170,7 +1191,7 @@ def main():
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
             cond_frames_min=args.cond_frames or flow_cfg.get("cond_frames_min", 7),
             cond_frames_max=args.cond_frames or flow_cfg.get("cond_frames_max", 7),
-            cond_drop_prob=args.cond_drop_prob,
+            cond_drop_prob=eval_cond_drop_prob,
             crop_mode=args.aist_crop_mode,
         )
         loaders.append((
@@ -1196,7 +1217,7 @@ def main():
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
             cond_frames_min=args.cond_frames or flow_cfg.get("cond_frames_min", 7),
             cond_frames_max=args.cond_frames or flow_cfg.get("cond_frames_max", 7),
-            cond_drop_prob=args.cond_drop_prob,
+            cond_drop_prob=eval_cond_drop_prob,
         )
         loaders.append((
             "MVH",
@@ -1210,8 +1231,8 @@ def main():
         d_z=d_z,
         latent_len=latent_len,
         fps=cfg.get("target_fps", 30),
-        slack_seconds=args.slack_seconds,
-        cam_mode=args.cam_mode,
+        slack_seconds=eval_slack_seconds,
+        cam_mode=eval_cam_mode,
     )
 
     openpose_cfg = {
@@ -1221,7 +1242,7 @@ def main():
         "mvh_cameras": cfg.get("mvh_cameras", ["22327091", "22327113", "22327084"]),
         "cond_frames_min": args.cond_frames or flow_cfg.get("cond_frames_min", 2),
         "cond_frames_max": args.cond_frames or flow_cfg.get("cond_frames_max", 10),
-        "cond_drop_prob": args.cond_drop_prob,
+        "cond_drop_prob": eval_cond_drop_prob,
         "aist_fps": cfg.get("aist_fps", 60),
         "mvh_fps": cfg.get("mvh_fps", 5),
         "target_fps": cfg.get("target_fps", 30),
@@ -1266,12 +1287,12 @@ def main():
                     rep_seed,
                     device=args.device,
                     compute_dist=not args.no_dist,
-                    save_per_sample=args.save_per_sample,
+                    save_per_sample=eval_save_per_sample,
                     metric_extractor=t2m_extractor,
                     t2m_stats=t2m_stats,
-                    diversity_times=args.diversity_times,
-                    multimodality_repeats=args.multimodality_repeats,
-                    multimodality_times=args.multimodality_times,
+                    diversity_times=eval_diversity_times,
+                    multimodality_repeats=eval_multimodality_repeats,
+                    multimodality_times=eval_multimodality_times,
                     guidance_scale=args.guidance_scale,
                 )
                 rep_row = {
@@ -1325,6 +1346,14 @@ def main():
             "steps": steps_list,
             "seed": args.seed,
             "device": args.device,
+            "flow_checkpoint": args.flow_ckpt,
+            "vae_checkpoint": vae_ckpt,
+            "stats_path": stats_path,
+            "openpose_stats_path": openpose_stats_path,
+            "latent_stats_path": latent_stats_path,
+            "cam_mode": eval_cam_mode,
+            "slack_seconds": eval_slack_seconds,
+            "cond_drop_prob": eval_cond_drop_prob,
         },
     }
     with open(save_json, "w", encoding="utf-8") as f:

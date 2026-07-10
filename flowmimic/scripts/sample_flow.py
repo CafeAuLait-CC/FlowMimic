@@ -38,49 +38,56 @@ def _join_cmd(parts):
     return " ".join(shlex.quote(str(p)) for p in parts)
 
 
+def _checkpoint_metadata(state):
+    metadata = state.get("metadata", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def main():
+    config = load_config()
+    sample_cfg = config.get("sample", {})
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--vae-checkpoint", default=None)
+    parser.add_argument("--latent-stats-path", default=None)
     parser.add_argument(
         "--vae-type",
         choices=("auto", "motion_vae", "motion_vqvae"),
         default="auto",
     )
-    parser.add_argument("--vae-latent-len", type=int, default=None)
-    parser.add_argument(
-        "--vae-latent-token-mode",
-        choices=("pool", "query"),
-        default=None,
-    )
     parser.add_argument("--seq-len", type=int, default=None)
-    parser.add_argument("--steps", type=int, default=8)
-    parser.add_argument("--solver", type=str, default="heun")
-    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument("--steps", type=int, default=sample_cfg.get("steps", 8))
+    parser.add_argument("--solver", type=str, default=sample_cfg.get("solver", "heun"))
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=sample_cfg.get("guidance_scale", 1.0),
+    )
     parser.add_argument("--style-id", type=int, default=None)
     parser.add_argument("--domain-id", type=int, default=0)
     parser.add_argument("--k2d-npy", type=str, default=None)
-    parser.add_argument("--tau-cond-npy", type=str, default=None)
     parser.add_argument("--sample-path", type=str, default=None)
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--dataset", type=str, choices=["auto", "aist", "mvh"], default="auto")
     parser.add_argument("--camera", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--out", type=str, default="result_smpl22.npy")
+    parser.add_argument("--out", type=str, default=sample_cfg.get("output_name", "result_smpl22.npy"))
     parser.add_argument("--use-ema", action="store_true")
-    parser.add_argument("--src-fps", type=int, default=None)
-    parser.add_argument("--target-fps", type=int, default=None)
-    parser.add_argument("--out-dir", type=str, default="output/flow")
+    parser.add_argument("--out-dir", type=str, default=sample_cfg.get("output_dir", "output/flow"))
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
     args = parser.parse_args()
 
-    config = load_config()
-    seq_len = args.seq_len or config["seq_len"]
-    openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
-    target_fps = args.target_fps or config.get("target_fps", None)
-    vae_ckpt_path = args.vae_checkpoint or config.get(
+    device = torch.device(args.device)
+    state = torch.load(args.checkpoint, map_location=device)
+    ckpt_metadata = _checkpoint_metadata(state)
+    seq_len = args.seq_len or ckpt_metadata.get("seq_len") or config["seq_len"]
+    openpose_stats_path = ckpt_metadata.get("openpose_stats_path") or config.get(
+        "openpose_stats_path", "data/openpose_stats.npz"
+    )
+    target_fps = sample_cfg.get("target_fps") or config.get("target_fps", None)
+    vae_ckpt_path = args.vae_checkpoint or ckpt_metadata.get("vae_ckpt") or config.get(
         "vae_ckpt", "checkpoints/motion_vae_best.pt"
     )
     ckpt_parent = os.path.basename(os.path.dirname(os.path.normpath(args.checkpoint)))
@@ -93,8 +100,14 @@ def main():
         run_tag = f"{ts_base}_{suffix:02d}"
         run_out_dir = os.path.join(args.out_dir, model_name, run_tag)
         suffix += 1
-    stats_path = config.get("stats_path", "data/mean_std_263_train.npz")
-    latent_stats_path = config.get("latent_stats_path", "data/latent_stats.npz")
+    stats_path = ckpt_metadata.get("stats_path") or config.get(
+        "stats_path", "data/mean_std_263_train.npz"
+    )
+    latent_stats_path = (
+        args.latent_stats_path
+        or ckpt_metadata.get("latent_stats_path")
+        or config.get("latent_stats_path", "data/latent_stats.npz")
+    )
     cond_frames_min = config.get("flow", {}).get("cond_frames_min", 2)
     cond_frames_max = config.get("flow", {}).get("cond_frames_max", 10)
     cond_cache_root = config.get("cond_cache_root", "data/cached_cond")
@@ -122,11 +135,11 @@ def main():
     vae_backend = load_vae_backend(
         vae_ckpt_path,
         config,
-        torch.device(args.device),
+        device,
         seq_len=seq_len,
         vae_type=args.vae_type,
-        latent_len=args.vae_latent_len,
-        latent_token_mode=args.vae_latent_token_mode,
+        latent_len=sample_cfg.get("vae_latent_len"),
+        latent_token_mode=sample_cfg.get("vae_latent_token_mode"),
     )
     vae = vae_backend.model
     d_z = vae_backend.d_z
@@ -147,8 +160,6 @@ def main():
         cond_heads=flow_cfg.get("cond_heads", 4),
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
     )
-    device = torch.device(args.device)
-    state = torch.load(args.checkpoint, map_location=device)
     if args.use_ema and "ema" in state:
         flow.load_state_dict(state["ema"])
     else:
@@ -208,7 +219,7 @@ def main():
             k2d, vis = load_aist_openpose(
                 pkl_path,
                 aist_openpose_dir,
-                src_fps=args.src_fps,
+                src_fps=sample_cfg.get("src_fps"),
                 target_fps=target_fps,
                 cache_root=cond_cache_root,
                 camera=cam,
@@ -235,7 +246,7 @@ def main():
                 mv_root,
                 mvh_openpose_root,
                 mvh_cameras,
-                src_fps=args.src_fps,
+                src_fps=sample_cfg.get("src_fps"),
                 target_fps=target_fps,
                 cache_root=cond_cache_root,
                 camera=cam,
@@ -400,18 +411,10 @@ def main():
     ]
     if args.use_ema:
         replicate_cmd.append("--use-ema")
-    if args.vae_latent_len is not None:
-        replicate_cmd.extend(["--vae-latent-len", str(args.vae_latent_len)])
-    if args.vae_latent_token_mode is not None:
-        replicate_cmd.extend(["--vae-latent-token-mode", args.vae_latent_token_mode])
-    if args.src_fps is not None:
-        replicate_cmd.extend(["--src-fps", str(args.src_fps)])
-    if args.target_fps is not None:
-        replicate_cmd.extend(["--target-fps", str(args.target_fps)])
+    if args.latent_stats_path is not None:
+        replicate_cmd.extend(["--latent-stats-path", args.latent_stats_path])
     if args.k2d_npy:
         replicate_cmd.extend(["--k2d-npy", args.k2d_npy])
-        if args.tau_cond_npy:
-            replicate_cmd.extend(["--tau-cond-npy", args.tau_cond_npy])
     elif meta_out["dataset"] in ("aist", "mvh"):
         replicate_cmd.extend(["--dataset", meta_out["dataset"]])
         if meta_out["path"]:

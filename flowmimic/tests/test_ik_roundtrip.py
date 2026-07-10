@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 
@@ -9,6 +8,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from flowmimic.src.data.dataloader import blender_to_yup, load_aistpp_smpl22_30fps
+from flowmimic.src.config.config import load_config
 from flowmimic.src.motion.ik.common.quaternion import qbetween_np, qrot_np
 from flowmimic.src.motion.process_motion import (
     _FACE_JOINT_INDX,
@@ -45,8 +45,7 @@ def _normalize_smpl22(positions):
 
 
 def _load_first_aist_smpl22():
-    with open("flowmimic/src/config/config.json", "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = load_config()
 
     motions_dir = cfg["aist_motions_dir"]
     files = sorted(

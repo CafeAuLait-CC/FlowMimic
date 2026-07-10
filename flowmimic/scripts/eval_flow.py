@@ -31,7 +31,7 @@ from flowmimic.src.metrics import (
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
-from flowmimic.src.model.vae.motion_vae import MotionVAE
+from flowmimic.src.model.vae.backend import decode_motion_latent, load_vae_backend
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
 from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
@@ -78,6 +78,46 @@ def _aist_paths_for_splits(cfg, split_names):
         seen.add(path)
         unique.append(path)
     return unique
+
+
+def _parse_csv(value):
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _set_eval_seed(seed, device):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _aggregate_replication_rows(rows):
+    if not rows:
+        return {}
+    numeric_keys = sorted(
+        {
+            key
+            for row in rows
+            for key, value in row.items()
+            if key not in ("dataset", "steps", "replication", "seed")
+            and isinstance(value, (int, float))
+        }
+    )
+    out = {}
+    for key in numeric_keys:
+        vals = np.asarray(
+            [row[key] for row in rows if isinstance(row.get(key), (int, float))],
+            dtype=np.float64,
+        )
+        if vals.size == 0:
+            continue
+        out[key] = float(vals.mean())
+        if len(rows) > 1:
+            std = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+            out[f"{key}_std"] = std
+            out[f"{key}_conf"] = float(1.96 * std / np.sqrt(vals.size))
+    return out
 
 
 def _normalize_meta(metas_raw):
@@ -474,6 +514,7 @@ def _generate_batch(
     k2d_std,
     d_z,
     latent_len,
+    out_len,
     guidance_scale=1.0,
 ):
     t_start = time.perf_counter()
@@ -533,7 +574,9 @@ def _generate_batch(
         t_vae_start = time.perf_counter()
         if latent_mean is not None and latent_std is not None:
             z_hat = z_hat * (latent_std + 1e-6) + latent_mean
-        x_hat = vae.decode(z_hat, vae.cond(domain_id, style_id))
+        x_hat = decode_motion_latent(
+            vae, z_hat, domain_id, style_id, out_len=out_len
+        )
         if isinstance(device, torch.device) and device.type == "cuda":
             torch.cuda.synchronize()
         t_vae = time.perf_counter() - t_vae_start
@@ -749,6 +792,7 @@ def evaluate_dataset(
             k2d_std,
             cfg.d_z,
             cfg.latent_len,
+            cfg.seq_len,
             guidance_scale=guidance_scale,
         )
         total_time_net += net_time
@@ -757,6 +801,12 @@ def evaluate_dataset(
         total_time_vae += vae_time
         seq_count += batch_size
         joints = joints if isinstance(joints, np.ndarray) else joints
+        motion_ref_np = motion.detach().cpu().numpy().copy()
+        cont_end = LAYOUT_SLICES["feet_contact"][0]
+        # The generated motion is denormalized before ik263_to_smpl22; use the same
+        # convention for the reference clip so smoothness metrics are comparable.
+        motion_ref_np[..., :cont_end] = motion_ref_np[..., :cont_end] * std + mean
+        joints_ref = ik263_to_smpl22(motion_ref_np)
 
         k2d_np = k2d_batch.cpu().numpy()
         conf_np = conf_batch.cpu().numpy()
@@ -783,6 +833,7 @@ def evaluate_dataset(
             skate = _foot_skate(joints[i], contact_logits[i], cfg.fps)
             bone = _bone_var(joints[i], edges)
             smooth = _smoothness(joints[i], cfg.fps)
+            smooth_ref = _smoothness(joints_ref[i], cfg.fps)
             record = {
                 "dataset": name,
                 "e2d_strict": err["e2d_strict"],
@@ -800,6 +851,14 @@ def evaluate_dataset(
                 "accel_p90": smooth["accel_p90"],
                 "jerk_median": smooth["jerk_median"],
                 "jerk_p90": smooth["jerk_p90"],
+                "accel_median_ref": smooth_ref["accel_median"],
+                "accel_p90_ref": smooth_ref["accel_p90"],
+                "jerk_median_ref": smooth_ref["jerk_median"],
+                "jerk_p90_ref": smooth_ref["jerk_p90"],
+                "accel_p90_ratio": smooth["accel_p90"]
+                / max(smooth_ref["accel_p90"], 1e-8),
+                "jerk_p90_ratio": smooth["jerk_p90"]
+                / max(smooth_ref["jerk_p90"], 1e-8),
             }
             results.append(record)
 
@@ -852,6 +911,7 @@ def evaluate_dataset(
                         k2d_std,
                         cfg.d_z,
                         cfg.latent_len,
+                        cfg.seq_len,
                         guidance_scale=guidance_scale,
                     )
                     mm_batch.append(
@@ -899,6 +959,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--flow-ckpt", required=True)
     parser.add_argument("--vae-ckpt", default=None)
+    parser.add_argument(
+        "--vae-type",
+        choices=("auto", "motion_vae", "motion_vqvae"),
+        default="auto",
+    )
     parser.add_argument("--t2m-motion-encoder-ckpt", default=None)
     parser.add_argument("--t2m-mean-path", default=None)
     parser.add_argument("--t2m-std-path", default=None)
@@ -924,6 +989,12 @@ def main():
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--aist-splits", type=str, default="val")
     parser.add_argument(
+        "--aist-cameras",
+        type=str,
+        default=None,
+        help="Comma-separated AIST cameras for eval. Defaults to config aist_cameras.",
+    )
+    parser.add_argument(
         "--datasets",
         type=str,
         default="AIST,MVH",
@@ -940,6 +1011,7 @@ def main():
         help="Drop probability for sparse conditioning keypoints during eval. Defaults to 0; training augmentation should not be applied to validation.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--replications", type=int, default=1)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-csv", type=str, default=None)
     parser.add_argument("--save-plot", type=str, default=None)
@@ -950,9 +1022,7 @@ def main():
     parser.add_argument("--save-per-sample", action="store_true")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    _set_eval_seed(args.seed, args.device)
 
     print("Loading config")
     cfg = load_config()
@@ -960,7 +1030,6 @@ def main():
     vae_max_len = args.vae_max_len or cfg["seq_len"]
     if seq_len > vae_max_len:
         raise ValueError(f"--seq-len ({seq_len}) cannot exceed --vae-max-len ({vae_max_len})")
-    d_z = cfg["d_z"]
     stats_path = args.stats_path or cfg["stats_path"]
     print("Loading 263D stats")
     mean, std = load_mean_std(stats_path)
@@ -987,6 +1056,25 @@ def main():
 
     print("Building models")
     mapping, computed = _build_smpl22_to_body25(cfg["smpl45_to_body25_def"])
+    print("Loading VAE")
+    vae_ckpt = args.vae_ckpt or cfg.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt")
+    print(f"Loading VAE model: {vae_ckpt}")
+    vae_backend = load_vae_backend(
+        vae_ckpt,
+        cfg,
+        args.device,
+        seq_len=seq_len,
+        vae_type=args.vae_type,
+        latent_len=args.vae_latent_len,
+        latent_token_mode=args.vae_latent_token_mode,
+    )
+    vae = vae_backend.model
+    d_z = vae_backend.d_z
+    latent_len = vae_backend.latent_len
+    print(
+        f"Loaded {vae_backend.vae_type}: latent_len={latent_len}, "
+        f"d_z={d_z}, max_len={vae_backend.max_len}"
+    )
 
     flow_cfg = cfg.get("flow", {})
     flow = ConditionalRectFlow(
@@ -1010,28 +1098,6 @@ def main():
         print("Warning: --use-ema requested but checkpoint has no EMA state; using model.")
     flow.load_state_dict(flow_state)
     flow.eval()
-
-    print("Loading VAE")
-    vae_ckpt = args.vae_ckpt or cfg.get("vae_ckpt", "checkpoints/vae/len200/motion_vae_best.pt")
-    print(f"Loading VAE model: {vae_ckpt}")
-    vae_state = torch.load(vae_ckpt, map_location=args.device)
-    vae_config = vae_state.get("config", {})
-    vae_latent_len = args.vae_latent_len
-    if vae_latent_len is None:
-        vae_latent_len = vae_config.get("latent_len")
-    vae_latent_token_mode = (
-        args.vae_latent_token_mode or vae_config.get("latent_token_mode", "pool")
-    )
-    vae = MotionVAE(
-        d_in=cfg["d_in"],
-        d_z=d_z,
-        num_styles=cfg["num_styles"],
-        max_len=vae_max_len,
-        latent_len=vae_latent_len,
-        latent_token_mode=vae_latent_token_mode,
-    ).to(args.device)
-    vae.load_state_dict(vae_state["model"])
-    vae.eval()
 
     t2m_extractor = None
     t2m_stats = None
@@ -1082,6 +1148,11 @@ def main():
     genre_to_id = build_genre_to_id(cfg.get("aist_genres", []))
     loaders = []
     if "AIST" in requested_datasets:
+        aist_cameras = (
+            _parse_csv(args.aist_cameras)
+            if args.aist_cameras is not None
+            else cfg.get("aist_cameras", ["01", "02", "08", "09"])
+        )
         aist_ds = AISTDataset(
             cfg["aist_motions_dir"],
             genre_to_id,
@@ -1092,7 +1163,7 @@ def main():
             cache_root=cfg["cache_root"],
             target_fps=cfg.get("target_fps", 30),
             src_fps=cfg.get("aist_fps", 60),
-            camera_ids=cfg.get("aist_cameras", ["01", "02", "08", "09"]),
+            camera_ids=aist_cameras,
             expand_cameras=True,
             include_cond=True,
             openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
@@ -1137,7 +1208,7 @@ def main():
     eval_cfg = EvalConfig(
         seq_len=seq_len,
         d_z=d_z,
-        latent_len=args.vae_latent_len or seq_len,
+        latent_len=latent_len,
         fps=cfg.get("target_fps", 30),
         slack_seconds=args.slack_seconds,
         cam_mode=args.cam_mode,
@@ -1167,54 +1238,95 @@ def main():
     save_csv = args.save_csv or os.path.join(out_dir, "flow_eval.csv")
     save_plot = args.save_plot or os.path.join(out_dir, "flow_eval_steps.png")
     summary_rows = []
+    replication_rows = []
     per_sample = []
+    replications = max(1, int(args.replications))
     for steps in steps_list:
         print(f"Evaluating steps={steps}")
         for dataset_name, loader in loaders:
-            summary, samples = evaluate_dataset(
-                dataset_name,
-                loader,
-                flow,
-                vae,
-                eval_cfg,
-                mapping,
-                computed,
-                openpose_cfg,
-                (mean, std),
-                (latent_mean, latent_std),
-                steps,
-                args.solver,
-                args.num_samples,
-                args.seed,
-                device=args.device,
-                compute_dist=not args.no_dist,
-                save_per_sample=args.save_per_sample,
-                metric_extractor=t2m_extractor,
-                t2m_stats=t2m_stats,
-                diversity_times=args.diversity_times,
-                multimodality_repeats=args.multimodality_repeats,
-                multimodality_times=args.multimodality_times,
-                guidance_scale=args.guidance_scale,
-            )
-            row = {"dataset": dataset_name, "steps": steps}
-            row.update(summary)
+            reps_for_group = []
+            for rep_idx in range(replications):
+                rep_seed = args.seed + rep_idx
+                print(f"Replication {rep_idx + 1}/{replications} seed={rep_seed}")
+                _set_eval_seed(rep_seed, args.device)
+                summary, samples = evaluate_dataset(
+                    dataset_name,
+                    loader,
+                    flow,
+                    vae,
+                    eval_cfg,
+                    mapping,
+                    computed,
+                    openpose_cfg,
+                    (mean, std),
+                    (latent_mean, latent_std),
+                    steps,
+                    args.solver,
+                    args.num_samples,
+                    rep_seed,
+                    device=args.device,
+                    compute_dist=not args.no_dist,
+                    save_per_sample=args.save_per_sample,
+                    metric_extractor=t2m_extractor,
+                    t2m_stats=t2m_stats,
+                    diversity_times=args.diversity_times,
+                    multimodality_repeats=args.multimodality_repeats,
+                    multimodality_times=args.multimodality_times,
+                    guidance_scale=args.guidance_scale,
+                )
+                rep_row = {
+                    "dataset": dataset_name,
+                    "steps": steps,
+                    "replication": rep_idx,
+                    "seed": rep_seed,
+                }
+                rep_row.update(summary)
+                replication_rows.append(rep_row)
+                reps_for_group.append(rep_row)
+                if samples:
+                    for rec in samples:
+                        rec["steps"] = steps
+                        rec["replication"] = rep_idx
+                        rec["seed"] = rep_seed
+                        per_sample.append(rec)
+            row = {
+                "dataset": dataset_name,
+                "steps": steps,
+                "replications": replications,
+            }
+            row.update(_aggregate_replication_rows(reps_for_group))
             summary_rows.append(row)
-            if samples:
-                for rec in samples:
-                    rec["steps"] = steps
-                    per_sample.append(rec)
 
     print(f"Writing outputs: {save_csv}, {save_json}, {save_plot}")
     os.makedirs(os.path.dirname(save_csv), exist_ok=True)
-    fieldnames = ["dataset", "steps"] + [
-        k for k in summary_rows[0].keys() if k not in ("dataset", "steps")
-    ]
+    fieldnames = ["dataset", "steps"] + sorted(
+        {
+            k
+            for row in summary_rows
+            for k in row.keys()
+            if k not in ("dataset", "steps")
+        }
+    )
     with open(save_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
 
-    out = {"summary": summary_rows, "per_sample": per_sample}
+    out = {
+        "summary": summary_rows,
+        "replications": replication_rows,
+        "per_sample": per_sample,
+        "protocol": {
+            "aist_splits": args.aist_splits,
+            "aist_cameras": args.aist_cameras,
+            "aist_crop_mode": args.aist_crop_mode,
+            "num_samples": args.num_samples,
+            "replications": replications,
+            "steps": steps_list,
+            "seed": args.seed,
+            "device": args.device,
+        },
+    }
     with open(save_json, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
 

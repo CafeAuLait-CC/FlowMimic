@@ -17,7 +17,7 @@ from flowmimic.src.config.config import load_config
 from flowmimic.src.model.flow.cond_api import build_cond_inputs, build_dummy_cond
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.solver import solve_flow
-from flowmimic.src.model.vae.motion_vae import MotionVAE
+from flowmimic.src.model.vae.backend import decode_motion_latent, load_vae_backend
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import (
     align_smpl22_with_contact_and_center,
@@ -42,8 +42,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--vae-checkpoint", default=None)
+    parser.add_argument(
+        "--vae-type",
+        choices=("auto", "motion_vae", "motion_vqvae"),
+        default="auto",
+    )
+    parser.add_argument("--vae-latent-len", type=int, default=None)
+    parser.add_argument(
+        "--vae-latent-token-mode",
+        choices=("pool", "query"),
+        default=None,
+    )
+    parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--solver", type=str, default="heun")
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--style-id", type=int, default=None)
     parser.add_argument("--domain-id", type=int, default=0)
     parser.add_argument("--k2d-npy", type=str, default=None)
@@ -64,8 +77,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
-    seq_len = config["seq_len"]
-    d_z = config["d_z"]
+    seq_len = args.seq_len or config["seq_len"]
     openpose_stats_path = config.get("openpose_stats_path", "data/openpose_stats.npz")
     target_fps = args.target_fps or config.get("target_fps", None)
     vae_ckpt_path = args.vae_checkpoint or config.get(
@@ -107,6 +119,19 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_used)
 
+    vae_backend = load_vae_backend(
+        vae_ckpt_path,
+        config,
+        torch.device(args.device),
+        seq_len=seq_len,
+        vae_type=args.vae_type,
+        latent_len=args.vae_latent_len,
+        latent_token_mode=args.vae_latent_token_mode,
+    )
+    vae = vae_backend.model
+    d_z = vae_backend.d_z
+    latent_len = vae_backend.latent_len
+
     flow_cfg = config.get("flow", {})
     flow = ConditionalRectFlow(
         d_z=d_z,
@@ -130,12 +155,6 @@ def main():
         flow.load_state_dict(state["model"])
     flow.to(device)
     flow.eval()
-
-    vae = MotionVAE(d_in=config["d_in"], d_z=d_z, num_styles=config["num_styles"], max_len=seq_len)
-    vae_state = torch.load(vae_ckpt_path, map_location=device)
-    vae.load_state_dict(vae_state["model"])
-    vae.to(device)
-    vae.eval()
 
     k2d_mean = None
     k2d_std = None
@@ -265,8 +284,8 @@ def main():
         vis_sparse = vis[sample_idx] if vis is not None else None
         cond = build_cond_inputs(k2d_sparse, tau_cond, device, vis_mask=vis_sparse)
 
-    tau_out = torch.linspace(0.0, 1.0, steps=seq_len, device=device)
-    x0 = torch.randn(1, seq_len, d_z, device=device)
+    tau_out = torch.linspace(0.0, 1.0, steps=latent_len, device=device)
+    x0 = torch.randn(1, latent_len, d_z, device=device)
 
     g, mem, _vis = flow.cond_encoder(
         cond["k2d"],
@@ -281,12 +300,37 @@ def main():
     g = flow.cond_mlp(torch.cat([g, style], dim=-1))
 
     cond_batch = {"tau_out": tau_out, "mem": mem, "g": g}
+    if args.guidance_scale != 1.0:
+        k2d_uncond = torch.zeros_like(cond["k2d"])
+        vis_uncond = (
+            torch.zeros_like(cond["vis_mask"]) if "vis_mask" in cond else None
+        )
+        g2d_uncond, mem_uncond, _ = flow.cond_encoder(
+            k2d_uncond,
+            cond["tau_cond"],
+            vis_mask=vis_uncond,
+            mean=k2d_mean,
+            std=k2d_std,
+        )
+        style_uncond = flow.style_emb(
+            torch.zeros_like(style_id), domain_id, apply_dropout=False
+        )
+        g_uncond = flow.cond_mlp(torch.cat([g2d_uncond, style_uncond], dim=-1))
+        cond_batch.update(
+            {
+                "mem_uncond": mem_uncond,
+                "g_uncond": g_uncond,
+                "guidance_scale": args.guidance_scale,
+            }
+        )
     z_hat = solve_flow(flow.flow, x0, cond_batch, num_steps=args.steps, method=args.solver)
     if latent_mean is not None and latent_std is not None:
         z_hat = z_hat * (latent_std + 1e-6) + latent_mean
 
     with torch.no_grad():
-        x_hat = vae.decode(z_hat, vae.cond(domain_id, style_id))
+        x_hat = decode_motion_latent(
+            vae, z_hat, domain_id, style_id, out_len=seq_len
+        )
     ik263 = x_hat.squeeze(0).cpu().numpy()
     mean, std = load_mean_std(stats_path)
     cont_end = LAYOUT_SLICES["feet_contact"][0]
@@ -323,6 +367,9 @@ def main():
         "start": meta.get("start", ""),
         "seed": seed_used,
         "seq_len": seq_len,
+        "latent_len": latent_len,
+        "vae_type": vae_backend.vae_type,
+        "guidance_scale": args.guidance_scale,
         "sparse_indices": sample_idx_out,
         "tau_cond": tau_cond.tolist(),
     }
@@ -334,10 +381,16 @@ def main():
         args.checkpoint,
         "--vae-checkpoint",
         vae_ckpt_path,
+        "--vae-type",
+        args.vae_type,
+        "--seq-len",
+        str(seq_len),
         "--steps",
         str(args.steps),
         "--solver",
         args.solver,
+        "--guidance-scale",
+        str(args.guidance_scale),
         "--out",
         args.out,
         "--out-dir",
@@ -347,6 +400,10 @@ def main():
     ]
     if args.use_ema:
         replicate_cmd.append("--use-ema")
+    if args.vae_latent_len is not None:
+        replicate_cmd.extend(["--vae-latent-len", str(args.vae_latent_len)])
+    if args.vae_latent_token_mode is not None:
+        replicate_cmd.extend(["--vae-latent-token-mode", args.vae_latent_token_mode])
     if args.src_fps is not None:
         replicate_cmd.extend(["--src-fps", str(args.src_fps)])
     if args.target_fps is not None:

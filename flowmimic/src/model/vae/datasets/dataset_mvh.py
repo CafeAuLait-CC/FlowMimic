@@ -54,6 +54,7 @@ class MVHumanNetDataset(Dataset):
         cond_frames_min=None,
         cond_frames_max=None,
         cond_drop_prob=0.0,
+        cond_frame_drop_prob=0.0,
     ):
         if sequence_dirs is None:
             self.sequence_dirs = sorted(
@@ -81,6 +82,7 @@ class MVHumanNetDataset(Dataset):
         self.cond_frames_min = cond_frames_min
         self.cond_frames_max = cond_frames_max
         self.cond_drop_prob = cond_drop_prob
+        self.cond_frame_drop_prob = cond_frame_drop_prob
         self._clip_counts = None
         self._index_map = None
         self._build_index_map()
@@ -190,6 +192,14 @@ class MVHumanNetDataset(Dataset):
                 vis_sparse = vis_sparse * (~drop)
                 conf_sparse = conf_sparse * (~drop)
                 k2d_sparse = k2d_sparse * vis_sparse[..., None]
+            if self.cond_frame_drop_prob > 0 and valid_len > 1:
+                frame_drop = np.random.rand(valid_len) < self.cond_frame_drop_prob
+                if frame_drop.all():
+                    frame_drop[np.random.randint(0, valid_len)] = False
+                drop_idx = np.flatnonzero(frame_drop)
+                vis_sparse[drop_idx] = 0.0
+                conf_sparse[drop_idx] = 0.0
+                k2d_sparse[drop_idx] = 0.0
             pad = k_frames - valid_len
             if pad > 0:
                 k2d_sparse = np.concatenate(

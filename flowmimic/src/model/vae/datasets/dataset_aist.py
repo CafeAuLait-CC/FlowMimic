@@ -65,6 +65,7 @@ class AISTDataset(Dataset):
         cond_frames_min=None,
         cond_frames_max=None,
         cond_drop_prob=0.0,
+        cond_frame_drop_prob=0.0,
         crop_mode="random",
         clip_repeat=1,
     ):
@@ -90,6 +91,7 @@ class AISTDataset(Dataset):
         self.cond_frames_min = cond_frames_min
         self.cond_frames_max = cond_frames_max
         self.cond_drop_prob = cond_drop_prob
+        self.cond_frame_drop_prob = cond_frame_drop_prob
         self.crop_mode = crop_mode
         self.clip_repeat = max(1, int(clip_repeat))
         self._clip_counts = None
@@ -230,6 +232,14 @@ class AISTDataset(Dataset):
                 vis_sparse = vis_sparse * (~drop)
                 conf_sparse = conf_sparse * (~drop)
                 k2d_sparse = k2d_sparse * vis_sparse[..., None]
+            if self.cond_frame_drop_prob > 0 and valid_len > 1:
+                frame_drop = np.random.rand(valid_len) < self.cond_frame_drop_prob
+                if frame_drop.all():
+                    frame_drop[np.random.randint(0, valid_len)] = False
+                drop_idx = np.flatnonzero(frame_drop)
+                vis_sparse[drop_idx] = 0.0
+                conf_sparse[drop_idx] = 0.0
+                k2d_sparse[drop_idx] = 0.0
             pad = frame_budget - valid_len
             if pad > 0:
                 k2d_sparse = np.concatenate(

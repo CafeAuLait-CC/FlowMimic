@@ -54,9 +54,9 @@
     }
   },
   "evaluator": {
-    "t2m_motion_encoder_ckpt": "data/t2m_evaluator/t2m/text_mot_match/model/finest.tar",
-    "t2m_eval_mean_path": "data/t2m_evaluator/t2m/Comp_v6_KLD01/meta/mean.npy",
-    "t2m_eval_std_path": "data/t2m_evaluator/t2m/Comp_v6_KLD01/meta/std.npy"
+    "t2m_motion_encoder_ckpt": "runs/aist_t2m_evaluator_deps/t2m/text_mot_match/model/finest.tar",
+    "t2m_eval_mean_path": "runs/aist_t2m_evaluator_deps/t2m/Comp_v6_KLD01/meta/mean.npy",
+    "t2m_eval_std_path": "runs/aist_t2m_evaluator_deps/t2m/Comp_v6_KLD01/meta/std.npy"
   },
   "runtime": {
     "seed": 42,
@@ -96,6 +96,9 @@
       "cond_drop_prob": 0.2,
       "cond_frame_drop_prob": 0.0,
       "cond_frame_drop_start_epoch": 0,
+      "cond_frame_drop_ramp_epochs": 0,
+      "cond_frame_drop_mode": "block",
+      "cond_frame_drop_max_block_frac": 0.2,
       "cfg_drop_prob": 0.0,
       "cfg_start_epoch": 0
     },
@@ -107,27 +110,30 @@
     },
     "ema_decay": 0.999,
     "checkpointing": {
-      "save_every_steps": 100,
-      "save_every_epochs": 1
+      "save_every_steps": 0,
+      "save_every_epochs": 5
     },
     "regularization": {
       "solver_every": 8,
       "solver_method": "euler",
-      "solver_cond_start_epoch": 30,
+      "solver_cond_start_epoch": 50,
       "solver_cond_ramp_epochs": 10,
-      "solver_smooth_start_epoch": 40,
+      "solver_smooth_start_epoch": 60,
       "solver_smooth_ramp_epochs": 10,
       "lambda_cond": 0.001,
-      "lambda_acc": 0.05,
-      "lambda_jerk": 0.0005,
+      "lambda_acc": 8.0,
+      "lambda_jerk": 0.08,
       "smooth_loss_domain": "joints",
+      "cond_match_camera_mode": "shared",
+      "cond_match_min_conf": 0.4,
+      "cond_match_min_joints": 6,
       "smooth_subbatch_size": 32,
       "solver_reg_subbatch_size": 0,
-      "reg_decode_batch_size": 128,
+      "reg_decode_batch_size": 32,
       "reg_decode_checkpoint": true,
       "solver_checkpoint": true,
       "cond_every": null,
-      "smooth_every": null,
+      "smooth_every": 2,
       "solver_steps_early": "16",
       "solver_steps_mid": "8,16",
       "solver_steps_late": "4,8,2",
@@ -141,7 +147,7 @@
       "solver": "heun",
       "every_epochs": null,
       "datasets": "AIST",
-      "num_samples": 200,
+      "num_samples": 0,
       "cond_frames": null,
       "aist_splits": "test",
       "aist_cameras": "01",

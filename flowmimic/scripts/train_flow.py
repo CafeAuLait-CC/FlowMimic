@@ -82,6 +82,15 @@ def _apply_train_flow_config_defaults(args, config):
         args.cond_drop_prob = flow_cfg.get("cond_drop_prob")
     if args.cond_frame_drop_prob is None:
         args.cond_frame_drop_prob = flow_cfg.get("cond_frame_drop_prob", 0.0)
+    if args.cond_frame_drop_ramp_epochs is None:
+        args.cond_frame_drop_ramp_epochs = int(
+            flow_cfg.get("cond_frame_drop_ramp_epochs", 0) or 0
+        )
+    if args.cond_frame_drop_mode is None:
+        args.cond_frame_drop_mode = flow_cfg.get("cond_frame_drop_mode", "random")
+    args.cond_frame_drop_max_block_frac = float(
+        flow_cfg.get("cond_frame_drop_max_block_frac", 0.25)
+    )
     if args.ema_decay is None:
         args.ema_decay = flow_cfg.get("ema_decay")
     if args.lr is None:
@@ -112,6 +121,23 @@ def _apply_train_flow_config_defaults(args, config):
         args.lambda_acc = float(flow_cfg.get("lambda_acc", 5e-2))
     if args.lambda_jerk is None:
         args.lambda_jerk = float(flow_cfg.get("lambda_jerk", 5e-4))
+    if args.cond_match_camera_mode is None:
+        args.cond_match_camera_mode = flow_reg_cfg.get(
+            "cond_match_camera_mode",
+            flow_cfg.get("cond_match_camera_mode", "per_frame"),
+        )
+    args.cond_match_min_conf = float(
+        flow_reg_cfg.get(
+            "cond_match_min_conf",
+            flow_cfg.get("cond_match_min_conf", 0.4),
+        )
+    )
+    args.cond_match_min_joints = int(
+        flow_reg_cfg.get(
+            "cond_match_min_joints",
+            flow_cfg.get("cond_match_min_joints", 6),
+        )
+    )
     if args.solver_reg_subbatch_size is None:
         args.solver_reg_subbatch_size = int(
             flow_cfg.get("solver_reg_subbatch_size", 0) or 0
@@ -194,6 +220,18 @@ def main():
         default=None,
         help="1-based epoch to enable sequence-frame condition masking. 0 enables it from the start.",
     )
+    parser.add_argument(
+        "--cond-frame-drop-ramp-epochs",
+        type=int,
+        default=None,
+        help="Linearly ramp sequence-frame condition masking over this many epochs.",
+    )
+    parser.add_argument(
+        "--cond-frame-drop-mode",
+        choices=("random", "block", "mixed"),
+        default=None,
+        help="How to select sequence condition frames to mask.",
+    )
     parser.add_argument("--cfg-drop-prob", type=float, default=None)
     parser.add_argument(
         "--cfg-start-epoch",
@@ -228,6 +266,12 @@ def main():
     parser.add_argument("--lambda-cond", type=float, default=None)
     parser.add_argument("--lambda-acc", type=float, default=None)
     parser.add_argument("--lambda-jerk", type=float, default=None)
+    parser.add_argument(
+        "--cond-match-camera-mode",
+        choices=("per_frame", "shared"),
+        default=None,
+        help="Camera alignment used by the differentiable condition matching loss.",
+    )
     parser.add_argument(
         "--solver-reg-subbatch-size",
         type=int,
@@ -386,6 +430,11 @@ def main():
                     if args.cond_frame_drop_prob is not None
                     else config.get("flow", {}).get("cond_frame_drop_prob", 0.0),
                     "cond_frame_drop_start_epoch": args.cond_frame_drop_start_epoch,
+                    "cond_frame_drop_ramp_epochs": args.cond_frame_drop_ramp_epochs,
+                    "cond_frame_drop_mode": args.cond_frame_drop_mode,
+                    "cond_frame_drop_max_block_frac": (
+                        args.cond_frame_drop_max_block_frac
+                    ),
                     "cfg_drop_prob": args.cfg_drop_prob,
                     "cfg_start_epoch": args.cfg_start_epoch,
                     "ema_decay": args.ema_decay
@@ -394,6 +443,9 @@ def main():
                     "vae_latent_len": args.vae_latent_len,
                     "aist_clip_repeat": args.aist_clip_repeat,
                     "solver_reg_subbatch_size": args.solver_reg_subbatch_size,
+                    "cond_match_camera_mode": args.cond_match_camera_mode,
+                    "cond_match_min_conf": args.cond_match_min_conf,
+                    "cond_match_min_joints": args.cond_match_min_joints,
                 },
             )
     aist_dir = config["aist_motions_dir"]
@@ -521,6 +573,8 @@ def main():
             cond_frames_max=cond_frames_max,
             cond_drop_prob=cond_drop_prob,
             cond_frame_drop_prob=cond_frame_drop_prob,
+            cond_frame_drop_mode=args.cond_frame_drop_mode,
+            cond_frame_drop_max_block_frac=args.cond_frame_drop_max_block_frac,
             crop_mode=args.aist_crop_mode,
             clip_repeat=args.aist_clip_repeat,
         )
@@ -545,6 +599,8 @@ def main():
             cond_frames_max=cond_frames_max,
             cond_drop_prob=cond_drop_prob,
             cond_frame_drop_prob=cond_frame_drop_prob,
+            cond_frame_drop_mode=args.cond_frame_drop_mode,
+            cond_frame_drop_max_block_frac=args.cond_frame_drop_max_block_frac,
         )
 
     if is_main:
@@ -656,10 +712,13 @@ def main():
             f"Cond LR scale={cond_lr_scale}; cond_frames={cond_frames_min}-{cond_frames_max}; "
             f"eval_cond_frames={eval_cond_frames}; cond_frame_drop_prob={cond_frame_drop_prob}; "
             f"cond_frame_drop_start_epoch={args.cond_frame_drop_start_epoch}; "
+            f"cond_frame_drop_ramp_epochs={args.cond_frame_drop_ramp_epochs}; "
+            f"cond_frame_drop_mode={args.cond_frame_drop_mode}; "
             f"cfg_drop_prob={args.cfg_drop_prob}; cfg_start_epoch={args.cfg_start_epoch}; "
             f"ema_decay={ema_decay}; "
             f"lr_decay_epoch={lr_decay_epoch}; "
-            f"solver_reg_subbatch_size={solver_reg_subbatch_size or 'full'}"
+            f"solver_reg_subbatch_size={solver_reg_subbatch_size or 'full'}; "
+            f"cond_match_camera_mode={args.cond_match_camera_mode}"
         )
 
     cond_params = list(flow_model.cond_encoder.parameters()) + list(
@@ -905,11 +964,13 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         flow.train()
         epoch_num = epoch + 1
-        effective_cond_frame_drop_prob = (
+        effective_cond_frame_drop_prob = _scheduled_probability(
+            epoch_num,
             cond_frame_drop_prob
-            if args.cond_frame_drop_start_epoch <= 0
-            or epoch_num >= args.cond_frame_drop_start_epoch
-            else 0.0
+            if cond_frame_drop_prob is not None
+            else 0.0,
+            start_epoch=args.cond_frame_drop_start_epoch,
+            ramp_epochs=args.cond_frame_drop_ramp_epochs,
         )
         effective_cfg_drop_prob = (
             args.cfg_drop_prob
@@ -922,6 +983,12 @@ def main():
         if is_main and (
             epoch == start_epoch
             or epoch_num == args.cond_frame_drop_start_epoch
+            or (
+                args.cond_frame_drop_ramp_epochs
+                and epoch_num
+                == max(1, args.cond_frame_drop_start_epoch)
+                + args.cond_frame_drop_ramp_epochs
+            )
             or epoch_num == args.cfg_start_epoch
         ):
             print(
@@ -1322,6 +1389,9 @@ def main():
                                     mask_cond_reg[reg_slice],
                                     body25_to_smpl_idx,
                                     body25_to_smpl_valid,
+                                    camera_mode=args.cond_match_camera_mode,
+                                    min_conf=args.cond_match_min_conf,
+                                    min_joints=args.cond_match_min_joints,
                                 )
                                 cond_loss_sum = cond_loss_sum + cond_chunk * chunk_size
                                 cond_loss_weight += chunk_size
@@ -1759,6 +1829,9 @@ def _make_checkpoint_metadata(
             "cond_drop_prob": args.cond_drop_prob,
             "cond_frame_drop_prob": args.cond_frame_drop_prob,
             "cond_frame_drop_start_epoch": args.cond_frame_drop_start_epoch,
+            "cond_frame_drop_ramp_epochs": args.cond_frame_drop_ramp_epochs,
+            "cond_frame_drop_mode": args.cond_frame_drop_mode,
+            "cond_frame_drop_max_block_frac": args.cond_frame_drop_max_block_frac,
             "cfg_drop_prob": args.cfg_drop_prob,
             "cfg_start_epoch": args.cfg_start_epoch,
         },
@@ -1770,6 +1843,9 @@ def _make_checkpoint_metadata(
             "lambda_jerk": args.lambda_jerk,
             "solver_reg_subbatch_size": args.solver_reg_subbatch_size,
             "smooth_loss_domain": args.smooth_loss_domain,
+            "cond_match_camera_mode": args.cond_match_camera_mode,
+            "cond_match_min_conf": args.cond_match_min_conf,
+            "cond_match_min_joints": args.cond_match_min_joints,
         },
         "eval": {
             "steps": args.eval_steps,
@@ -2233,6 +2309,23 @@ def _ramp_weight(epoch, start_epoch, ramp_epochs):
     return (epoch - start_epoch) / float(ramp_epochs)
 
 
+def _scheduled_probability(epoch_num, target_prob, start_epoch=0, ramp_epochs=0):
+    target_prob = float(target_prob or 0.0)
+    if target_prob <= 0.0:
+        return 0.0
+    start_epoch = int(start_epoch or 0)
+    ramp_epochs = int(ramp_epochs or 0)
+    if start_epoch > 0 and epoch_num < start_epoch:
+        return 0.0
+    if ramp_epochs <= 0:
+        return target_prob
+
+    ramp_start = max(1, start_epoch)
+    progress = (int(epoch_num) - ramp_start) / float(ramp_epochs)
+    progress = min(max(progress, 0.0), 1.0)
+    return target_prob * progress
+
+
 def _pick_solver_steps(epoch, early, mid, late, mid_epoch, late_epoch):
     if epoch < mid_epoch:
         pool = early
@@ -2311,6 +2404,9 @@ def _condition_match_loss(
     mask_cond,
     body25_to_smpl_idx,
     body25_to_smpl_valid,
+    camera_mode="per_frame",
+    min_conf=0.4,
+    min_joints=6,
     eps=1e-6,
 ):
     bsz, _, _, _ = joints22.shape
@@ -2331,10 +2427,33 @@ def _condition_match_loss(
     joints_cond = torch.gather(joints22, 1, gather_idx)
     xy = joints_cond[..., :2]
 
-    s, tx, ty, wsum = _fit_weak_persp_torch(xy, k2d_smpl, conf_smpl, eps=eps)
-    pred = s.unsqueeze(-1).unsqueeze(-1) * xy
-    pred[..., 0] = pred[..., 0] + tx.unsqueeze(-1)
-    pred[..., 1] = pred[..., 1] + ty.unsqueeze(-1)
+    if camera_mode == "per_frame":
+        s, tx, ty, _ = _fit_weak_persp_torch(xy, k2d_smpl, conf_smpl, eps=eps)
+        pred = s.unsqueeze(-1).unsqueeze(-1) * xy
+        pred[..., 0] = pred[..., 0] + tx.unsqueeze(-1)
+        pred[..., 1] = pred[..., 1] + ty.unsqueeze(-1)
+    elif camera_mode == "shared":
+        fit_conf = conf_smpl * (conf_smpl >= float(min_conf)).to(conf_smpl.dtype)
+        enough_fit_joints = (fit_conf > eps).sum(dim=(1, 2), keepdim=True) >= max(
+            int(min_joints), 1
+        )
+        fit_conf = torch.where(enough_fit_joints, fit_conf, conf_smpl)
+        flat_joints = xy.reshape(bsz, 1, num_cond * 22, 2)
+        flat_k2d = k2d_smpl.reshape(bsz, 1, num_cond * 22, 2)
+        flat_conf = fit_conf.reshape(bsz, 1, num_cond * 22)
+        s, tx, ty, _ = _fit_weak_persp_torch(
+            flat_joints,
+            flat_k2d,
+            flat_conf,
+            eps=eps,
+        )
+        pred = s.view(bsz, 1, 1, 1) * xy
+        pred[..., 0] = pred[..., 0] + tx.view(bsz, 1, 1)
+        pred[..., 1] = pred[..., 1] + ty.view(bsz, 1, 1)
+    else:
+        raise ValueError(f"Unsupported condition match camera mode: {camera_mode}")
+
+    wsum = conf_smpl.sum(dim=-1)
     err = torch.linalg.norm(pred - k2d_smpl, dim=-1)
     frame_err = (err * conf_smpl).sum(dim=-1) / (wsum + eps)
     valid = wsum > eps

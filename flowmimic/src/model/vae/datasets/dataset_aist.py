@@ -8,6 +8,9 @@ from torch.utils.data import Dataset
 
 from flowmimic.src.data.dataloader import blender_to_yup, load_aistpp_smpl22_30fps
 from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
+from flowmimic.src.model.vae.datasets.condition_masking import (
+    make_condition_frame_drop_mask,
+)
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
 
@@ -66,6 +69,8 @@ class AISTDataset(Dataset):
         cond_frames_max=None,
         cond_drop_prob=0.0,
         cond_frame_drop_prob=0.0,
+        cond_frame_drop_mode="random",
+        cond_frame_drop_max_block_frac=0.25,
         crop_mode="random",
         clip_repeat=1,
     ):
@@ -92,6 +97,8 @@ class AISTDataset(Dataset):
         self.cond_frames_max = cond_frames_max
         self.cond_drop_prob = cond_drop_prob
         self.cond_frame_drop_prob = cond_frame_drop_prob
+        self.cond_frame_drop_mode = cond_frame_drop_mode
+        self.cond_frame_drop_max_block_frac = cond_frame_drop_max_block_frac
         self.crop_mode = crop_mode
         self.clip_repeat = max(1, int(clip_repeat))
         self._clip_counts = None
@@ -233,9 +240,12 @@ class AISTDataset(Dataset):
                 conf_sparse = conf_sparse * (~drop)
                 k2d_sparse = k2d_sparse * vis_sparse[..., None]
             if self.cond_frame_drop_prob > 0 and valid_len > 1:
-                frame_drop = np.random.rand(valid_len) < self.cond_frame_drop_prob
-                if frame_drop.all():
-                    frame_drop[np.random.randint(0, valid_len)] = False
+                frame_drop = make_condition_frame_drop_mask(
+                    valid_len,
+                    self.cond_frame_drop_prob,
+                    mode=self.cond_frame_drop_mode,
+                    max_block_frac=self.cond_frame_drop_max_block_frac,
+                )
                 drop_idx = np.flatnonzero(frame_drop)
                 vis_sparse[drop_idx] = 0.0
                 conf_sparse[drop_idx] = 0.0

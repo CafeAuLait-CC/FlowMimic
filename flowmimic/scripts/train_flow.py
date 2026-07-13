@@ -1583,7 +1583,6 @@ def main():
             if wandb_run is not None:
                 wandb_run.log(
                     {
-                        "loss/avg_velocity_mse": total_loss / max(total_count, 1),
                         "loss/avg_total": total_loss_avg,
                         "loss/base_velocity_mse": base_loss_avg,
                         "loss/smooth_weighted": smooth_weighted_avg,

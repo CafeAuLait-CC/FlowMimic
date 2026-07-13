@@ -166,6 +166,7 @@ const els = {
   statusLog: document.getElementById("statusLog"),
   clipVideo: document.getElementById("clipVideo"),
   noVideoMsg: document.getElementById("noVideoMsg"),
+  framesMeta: document.getElementById("framesMeta"),
   framesGrid: document.getElementById("framesGrid"),
   lightbox: document.getElementById("lightbox"),
   lightboxImage: document.getElementById("lightboxImage"),
@@ -183,6 +184,7 @@ let styleNameById = new Map([[0, "Unknown"]]);
 let currentFrameUrls = [];
 let lightboxOpen = false;
 let lightboxIndex = 0;
+let currentFrameInfo = {};
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
 let defaultsCache = {
   default_steps: 8,
@@ -190,6 +192,8 @@ let defaultsCache = {
   default_dataset: "auto",
   default_style_id: null,
   default_device: "",
+  default_vae_checkpoint: "",
+  configured_vae_checkpoint: "",
 };
 
 function appendLog(text) {
@@ -254,6 +258,17 @@ function loadFormState() {
     applyFormState(JSON.parse(raw));
   } catch (_err) {
     // Ignore malformed storage payloads.
+  }
+}
+
+function clearStaleDefaultVaeOverride() {
+  if (
+    !defaultsCache.default_vae_checkpoint &&
+    defaultsCache.configured_vae_checkpoint &&
+    els.vaeCheckpoint.value === defaultsCache.configured_vae_checkpoint
+  ) {
+    els.vaeCheckpoint.value = "";
+    saveFormState();
   }
 }
 
@@ -450,7 +465,7 @@ function resetArgsKeepCheckpoints() {
   clearLog();
   closeLightbox();
   setVideo(null);
-  setFrames([]);
+  setFrames([], {});
   genView.setMotion(null);
   condView.setMotion(null);
   if (els.genTitle) {
@@ -463,15 +478,38 @@ function resetArgsKeepCheckpoints() {
   saveFormState();
 }
 
-function setFrames(urls) {
+function updateFramesMeta() {
+  if (!els.framesMeta) return;
+  const total = Number(currentFrameInfo.total || currentFrameUrls.length || 0);
+  const shown = Number(currentFrameInfo.shown || currentFrameUrls.length || 0);
+  if (!total) {
+    els.framesMeta.textContent = "";
+    return;
+  }
+  const limit = Number(currentFrameInfo.limit || 0);
+  const limitText = shown < total && limit > 0 ? ` (preview capped at ${limit})` : "";
+  els.framesMeta.textContent = shown < total
+    ? `Frames: ${shown} / ${total}${limitText}`
+    : `Frames: ${shown}`;
+}
+
+function setFrames(urls, info = {}) {
   currentFrameUrls = Array.isArray(urls) ? urls.slice() : [];
+  currentFrameInfo = info && typeof info === "object" ? info : {};
   els.framesGrid.innerHTML = "";
+  updateFramesMeta();
   if (!currentFrameUrls || currentFrameUrls.length === 0) return;
+  const previewIndices = Array.isArray(currentFrameInfo.preview_indices)
+    ? currentFrameInfo.preview_indices
+    : [];
   for (let i = 0; i < currentFrameUrls.length; i += 1) {
     const u = currentFrameUrls[i];
     const img = document.createElement("img");
     img.src = u;
     img.loading = "lazy";
+    const frameNo = previewIndices[i];
+    img.alt = frameNo == null ? `Condition frame ${i + 1}` : `Condition frame ${frameNo}`;
+    img.title = frameNo == null ? `Condition frame ${i + 1}` : `Condition frame ${frameNo}`;
     img.addEventListener("click", () => openLightbox(i));
     els.framesGrid.appendChild(img);
   }
@@ -494,7 +532,12 @@ function updateLightboxView() {
   const idx = ((lightboxIndex % currentFrameUrls.length) + currentFrameUrls.length) % currentFrameUrls.length;
   lightboxIndex = idx;
   els.lightboxImage.src = currentFrameUrls[idx];
-  els.lightboxIndex.textContent = `${idx + 1} / ${currentFrameUrls.length}`;
+  const previewIndices = Array.isArray(currentFrameInfo.preview_indices)
+    ? currentFrameInfo.preview_indices
+    : [];
+  const frameNo = previewIndices[idx];
+  const frameText = frameNo == null ? "" : ` - frame ${frameNo}`;
+  els.lightboxIndex.textContent = `${idx + 1} / ${currentFrameUrls.length}${frameText}`;
 }
 
 function openLightbox(idx) {
@@ -597,7 +640,7 @@ async function onGenerate() {
     genView.setMotion(data.generated_motion);
     condView.setMotion(data.condition_motion);
     setVideo(data.video_url);
-    setFrames(data.frame_urls || []);
+    setFrames(data.frame_urls || [], data.condition_frame_info || {});
   } catch (err) {
     appendLog(`Request failed: ${err}`);
   } finally {
@@ -680,6 +723,7 @@ requestAnimationFrame(animate);
 async function boot() {
   await loadDefaults();
   loadFormState();
+  clearStaleDefaultVaeOverride();
   initViewports();
 }
 

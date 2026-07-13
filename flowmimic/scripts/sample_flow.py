@@ -43,6 +43,20 @@ def _checkpoint_metadata(state):
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _metadata_section(metadata, key):
+    value = metadata.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _select_preview_indices(indices, max_items=24):
+    indices = [int(i) for i in indices]
+    if max_items <= 0 or len(indices) <= max_items:
+        return indices
+    pick = np.linspace(0, len(indices) - 1, max_items)
+    pick = np.unique(np.round(pick).astype(int))
+    return [indices[int(i)] for i in pick]
+
+
 def main():
     config = load_config()
     sample_cfg = config.get("sample", {})
@@ -108,8 +122,22 @@ def main():
         or ckpt_metadata.get("latent_stats_path")
         or config.get("latent_stats_path", "data/latent_stats.npz")
     )
-    cond_frames_min = config.get("flow", {}).get("cond_frames_min", 2)
-    cond_frames_max = config.get("flow", {}).get("cond_frames_max", 10)
+    conditioning_metadata = _metadata_section(ckpt_metadata, "conditioning")
+    flow_config_metadata = _metadata_section(ckpt_metadata, "flow_config")
+    cond_frames_min = (
+        conditioning_metadata.get("eval_cond_frames")
+        or conditioning_metadata.get("cond_frames_min")
+        or flow_config_metadata.get("cond_frames_min")
+        or config.get("flow", {}).get("cond_frames_min", 2)
+    )
+    cond_frames_max = (
+        conditioning_metadata.get("eval_cond_frames")
+        or conditioning_metadata.get("cond_frames_max")
+        or flow_config_metadata.get("cond_frames_max")
+        or config.get("flow", {}).get("cond_frames_max", 10)
+    )
+    cond_frames_min = max(1, min(int(cond_frames_min), int(seq_len)))
+    cond_frames_max = max(cond_frames_min, min(int(cond_frames_max), int(seq_len)))
     cond_cache_root = config.get("cond_cache_root", "data/cached_cond")
     aist_cameras = config.get("aist_cameras", ["01", "02", "08", "09"])
     mvh_cameras = config.get("mvh_cameras", ["22327091", "22327113", "22327084"])
@@ -359,6 +387,8 @@ def main():
         sample_idx_out = sample_idx.tolist()
     else:
         sample_idx_out = list(sample_idx)
+    sample_idx_out = [int(i) for i in sample_idx_out]
+    preview_idx_out = _select_preview_indices(sample_idx_out, max_items=24)
     meta_out = {
         "dataset": meta.get("dataset", "unknown"),
         "path": meta.get("path", ""),
@@ -382,6 +412,12 @@ def main():
         "vae_type": vae_backend.vae_type,
         "guidance_scale": args.guidance_scale,
         "sparse_indices": sample_idx_out,
+        "condition_indices": sample_idx_out,
+        "condition_frame_count": len(sample_idx_out),
+        "condition_preview_indices": preview_idx_out,
+        "condition_preview_frame_count": len(preview_idx_out),
+        "condition_frames_min": cond_frames_min,
+        "condition_frames_max": cond_frames_max,
         "tau_cond": tau_cond.tolist(),
     }
 

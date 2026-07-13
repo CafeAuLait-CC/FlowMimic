@@ -199,12 +199,19 @@ canvas {
   font-size: 13px;
 }
 
+.frames-meta {
+  margin-top: 4px;
+  min-height: 18px;
+}
+
 .frames-grid {
   margin-top: 10px;
   display: grid;
   width: 100%;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 8px;
+  max-height: 360px;
+  overflow: auto;
 }
 
 .frames-grid img {

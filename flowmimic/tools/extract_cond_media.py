@@ -1,4 +1,4 @@
-"""Extract a cropped AIST++ video clip and sparse frames from flow sample metadata.
+"""Extract a cropped AIST++ video clip and condition preview frames from flow sample metadata.
 
 Example:
   python flowmimic/tools/extract_cond_media.py
@@ -39,11 +39,48 @@ def _parse_list(text):
         return []
 
 
+def _as_int_list(value):
+    if not isinstance(value, list):
+        value = _parse_list(str(value))
+    out = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _select_preview_indices(indices, max_items):
+    indices = [int(i) for i in indices]
+    if max_items <= 0 or len(indices) <= max_items:
+        return indices
+    pick = np.linspace(0, len(indices) - 1, max_items)
+    pick = np.unique(np.round(pick).astype(int))
+    return [indices[int(i)] for i in pick]
+
+
+def _write_preview_meta(path, condition_indices, frame_indices, all_frames):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "condition_frame_count": len(condition_indices),
+                "preview_frame_count": len(frame_indices),
+                "preview_indices": [int(i) for i in frame_indices],
+                "all_frames": bool(all_frames),
+            },
+            f,
+            indent=2,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta", default="output/flow/last/result_meta.json")
     parser.add_argument("--out-dir", default="output/flow/last/cond_media")
     parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument("--max-frames", type=int, default=24)
+    parser.add_argument("--all-frames", action="store_true")
     args = parser.parse_args()
 
     if not os.path.exists(args.meta):
@@ -75,9 +112,16 @@ def main():
     if orig_len <= 0:
         orig_len = seq_len
 
-    sparse_indices = meta.get("sparse_indices", [])
-    if not isinstance(sparse_indices, list):
-        sparse_indices = _parse_list(str(sparse_indices))
+    condition_indices = _as_int_list(
+        meta.get("condition_indices", meta.get("sparse_indices", []))
+    )
+    preview_indices = _as_int_list(meta.get("condition_preview_indices", []))
+    if args.all_frames:
+        frame_indices = condition_indices
+    elif preview_indices:
+        frame_indices = preview_indices
+    else:
+        frame_indices = _select_preview_indices(condition_indices, args.max_frames)
 
     tag = "result"
     out_dir = args.out_dir
@@ -87,6 +131,13 @@ def main():
     frame_dir = os.path.join(out_dir, f"{tag}_frames")
     os.makedirs(frame_dir, exist_ok=True)
     smpl_out = os.path.join(out_dir, "cond_clip_smpl22.npy")
+    preview_meta_path = os.path.join(out_dir, "condition_preview_meta.json")
+    _write_preview_meta(
+        preview_meta_path,
+        condition_indices=condition_indices,
+        frame_indices=frame_indices,
+        all_frames=args.all_frames,
+    )
 
     if dataset == "aist":
         base = os.path.splitext(os.path.basename(motion_path))[0]
@@ -119,7 +170,7 @@ def main():
         ]
         subprocess.run(ffmpeg_cmd, check=True)
 
-        for idx in sparse_indices:
+        for idx in frame_indices:
             ts = float(idx) / float(target_fps)
             out_path = os.path.join(frame_dir, f"frame_{int(idx):06d}.png")
             frame_cmd = [
@@ -151,8 +202,12 @@ def main():
         np.save(smpl_out, joints)
 
         print(f"Saved clip: {clip_path}")
-        print(f"Saved frames: {frame_dir}")
+        print(
+            f"Saved preview frames: {frame_dir} "
+            f"({len(frame_indices)}/{len(condition_indices)} condition frames)"
+        )
         print(f"Saved smpl22: {smpl_out}")
+        print(f"Saved preview meta: {preview_meta_path}")
         return
 
     if dataset not in ("mvh", "mvh_kinematic"):
@@ -182,7 +237,7 @@ def main():
         return None
 
     frame_map = []
-    for idx in sparse_indices:
+    for idx in frame_indices:
         abs_idx = start + int(idx)
         time_sec = float(abs_idx) / float(target_fps)
         frame_src = int(round(time_sec * mvh_fps))
@@ -215,8 +270,12 @@ def main():
         for idx, src_frame, out_path in frame_map:
             f.write(f"{idx}\t{src_frame}\t{out_path}\n")
 
-    print(f"Saved frames: {frame_dir}")
+    print(
+        f"Saved preview frames: {frame_dir} "
+        f"({len(frame_indices)}/{len(condition_indices)} condition frames)"
+    )
     print(f"Saved smpl22: {smpl_out}")
+    print(f"Saved preview meta: {preview_meta_path}")
 
 
 if __name__ == "__main__":

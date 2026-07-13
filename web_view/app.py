@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -25,6 +26,7 @@ OUTPUT_ROOT = (ROOT_DIR / "output" / "flow").resolve()
 SAMPLE_SCRIPT = ROOT_DIR / "flowmimic" / "scripts" / "sample_flow.py"
 EXTRACT_SCRIPT = ROOT_DIR / "flowmimic" / "tools" / "extract_cond_media.py"
 GENRE_TO_ID_PATH = ROOT_DIR / "flowmimic" / "src" / "config" / "genre_to_id.json"
+COND_PREVIEW_MAX_FRAMES = int(os.environ.get("FLOWMIMIC_COND_PREVIEW_MAX_FRAMES", "24"))
 BASE_PATH = os.environ.get("FLOWMIMIC_BASE_PATH", "/flowmimic").strip()
 if BASE_PATH in ("", "/"):
     BASE_PATH = ""
@@ -35,6 +37,37 @@ BASE_PATH = BASE_PATH.rstrip("/")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="FlowMimic Web View", version="0.1.0")
+
+
+def _configure_uvicorn_timestamp_logging() -> None:
+    try:
+        from uvicorn.logging import AccessFormatter, DefaultFormatter
+    except ImportError:
+        return
+
+    datefmt = os.environ.get("FLOWMIMIC_LOG_DATEFMT", "%Y-%m-%d %H:%M:%S %Z")
+    default_fmt = os.environ.get(
+        "FLOWMIMIC_UVICORN_LOG_FMT",
+        "%(asctime)s %(levelprefix)s %(message)s",
+    )
+    access_fmt = os.environ.get(
+        "FLOWMIMIC_UVICORN_ACCESS_LOG_FMT",
+        '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+    )
+
+    for logger_name in ("uvicorn", "uvicorn.error"):
+        for handler in logging.getLogger(logger_name).handlers:
+            handler.setFormatter(DefaultFormatter(default_fmt, datefmt=datefmt))
+    for handler in logging.getLogger("uvicorn.access").handlers:
+        handler.setFormatter(AccessFormatter(access_fmt, datefmt=datefmt))
+
+
+_configure_uvicorn_timestamp_logging()
+
+
+@app.on_event("startup")
+async def _startup_configure_logging() -> None:
+    _configure_uvicorn_timestamp_logging()
 
 GENRE_FULL_BY_ABBR = {
     "BR": "Break",
@@ -216,7 +249,8 @@ def defaults() -> dict:
         "default_checkpoint": "",
         "default_model_name": "",
         "default_model_filename": "flow_round0_last.pt",
-        "default_vae_checkpoint": cfg.get("vae_ckpt", ""),
+        "default_vae_checkpoint": "",
+        "configured_vae_checkpoint": cfg.get("vae_ckpt", ""),
         "default_steps": 8,
         "default_solver": "heun",
         "default_dataset": "auto",
@@ -333,6 +367,8 @@ def generate(req: GenerateRequest) -> dict:
         str(meta_path),
         "--out-dir",
         str(extract_out_dir),
+        "--max-frames",
+        str(COND_PREVIEW_MAX_FRAMES),
     ]
     if req.target_fps is not None:
         extract_cmd.extend(["--fps", str(req.target_fps)])
@@ -349,6 +385,13 @@ def generate(req: GenerateRequest) -> dict:
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
+    condition_indices = meta.get("condition_indices") or meta.get("sparse_indices") or []
+    condition_preview_indices = meta.get("condition_preview_indices") or condition_indices
+    preview_meta_path = extract_out_dir / "condition_preview_meta.json"
+    preview_meta = {}
+    if preview_meta_path.exists():
+        with open(preview_meta_path, "r", encoding="utf-8") as f:
+            preview_meta = json.load(f)
 
     gen_motion_path = run_dir / req.out
     cond_motion_path = extract_out_dir / "cond_clip_smpl22.npy"
@@ -382,5 +425,14 @@ def generate(req: GenerateRequest) -> dict:
         else None,
         "video_url": _file_url(video_path) if video_path.exists() else None,
         "frame_urls": frame_urls,
+        "condition_frame_info": {
+            "total": int(meta.get("condition_frame_count") or len(condition_indices)),
+            "shown": len(frame_urls),
+            "limit": COND_PREVIEW_MAX_FRAMES,
+            "indices": condition_indices,
+            "preview_indices": preview_meta.get(
+                "preview_indices", condition_preview_indices
+            ),
+        },
         "meta_url": _file_url(meta_path),
     }

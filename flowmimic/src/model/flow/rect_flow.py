@@ -53,8 +53,30 @@ class ConditionalRectFlow(nn.Module):
         g = self.cond_mlp(torch.cat([g_2d, style], dim=-1))
         return g, mem, vis_mask
 
-    def forward(self, x_t, t_flow, tau_out, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True, vis_mask=None):
-        g, mem, _vis = self.encode_cond(
-            k2d, tau_cond, style_id, domain_id, apply_style_dropout=apply_style_dropout, vis_mask=vis_mask
-        )
-        return self.flow(x_t, t_flow, tau_out, mem, g)
+    def forward(
+        self,
+        x_t,
+        t_flow,
+        tau_out,
+        k2d=None,
+        tau_cond=None,
+        style_id=None,
+        domain_id=None,
+        apply_style_dropout=True,
+        vis_mask=None,
+        mem=None,
+        g=None,
+        mem_mask=None,
+    ):
+        if mem is None or g is None:
+            if any(value is None for value in (k2d, tau_cond, style_id, domain_id)):
+                raise ValueError("Raw conditions or pre-encoded mem/g are required")
+            g, mem, _vis = self.encode_cond(
+                k2d,
+                tau_cond,
+                style_id,
+                domain_id,
+                apply_style_dropout=apply_style_dropout,
+                vis_mask=vis_mask,
+            )
+        return self.flow(x_t, t_flow, tau_out, mem, g, mem_mask=mem_mask)

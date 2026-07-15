@@ -93,6 +93,8 @@
     "conditioning": {
       "cond_frames_min": 7,
       "cond_frames_max": 7,
+      "cond_frame_choices": null,
+      "cond_frame_choice_probs": null,
       "cond_drop_prob": 0.2,
       "cond_frame_drop_prob": 0.0,
       "cond_frame_drop_start_epoch": 0,

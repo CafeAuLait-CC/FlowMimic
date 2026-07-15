@@ -543,7 +543,12 @@ def _generate_batch(
         )
         style = flow.style_emb(style_id, domain_id, apply_dropout=False)
         g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
-        cond_batch = {"tau_out": tau_out, "mem": mem, "g": g}
+        cond_batch = {
+            "tau_out": tau_out,
+            "mem": mem,
+            "g": g,
+            "mem_mask": ~mask_cond,
+        }
         if guidance_scale != 1.0:
             k2d_uncond = torch.zeros_like(k2d_batch)
             vis_uncond = torch.zeros_like(vis_batch)

@@ -12,6 +12,7 @@ from flowmimic.src.data.dataloader import (
 )
 from flowmimic.src.model.vae.datasets.condition_masking import (
     make_condition_frame_drop_mask,
+    sample_condition_frame_count,
 )
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
@@ -56,6 +57,8 @@ class MVHumanNetDataset(Dataset):
         cond_cache_root=None,
         cond_frames_min=None,
         cond_frames_max=None,
+        cond_frame_choices=None,
+        cond_frame_choice_probs=None,
         cond_drop_prob=0.0,
         cond_frame_drop_prob=0.0,
         cond_frame_drop_mode="random",
@@ -86,6 +89,8 @@ class MVHumanNetDataset(Dataset):
         self.cond_cache_root = cond_cache_root
         self.cond_frames_min = cond_frames_min
         self.cond_frames_max = cond_frames_max
+        self.cond_frame_choices = cond_frame_choices
+        self.cond_frame_choice_probs = cond_frame_choice_probs
         self.cond_drop_prob = cond_drop_prob
         self.cond_frame_drop_prob = cond_frame_drop_prob
         self.cond_frame_drop_mode = cond_frame_drop_mode
@@ -184,7 +189,13 @@ class MVHumanNetDataset(Dataset):
                     [conf, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
                 )
             t_len = k2d.shape[0]
-            k_frames = self.cond_frames_min or 1
+            k_frames, frame_budget = sample_condition_frame_count(
+                self.seq_len,
+                self.cond_frames_min,
+                self.cond_frames_max,
+                self.cond_frame_choices,
+                self.cond_frame_choice_probs,
+            )
             if t_len <= k_frames:
                 idxs = np.arange(t_len)
             else:
@@ -210,7 +221,7 @@ class MVHumanNetDataset(Dataset):
                 vis_sparse[drop_idx] = 0.0
                 conf_sparse[drop_idx] = 0.0
                 k2d_sparse[drop_idx] = 0.0
-            pad = k_frames - valid_len
+            pad = frame_budget - valid_len
             if pad > 0:
                 k2d_sparse = np.concatenate(
                     [k2d_sparse, np.zeros((pad, 25, 2), dtype=np.float32)], axis=0

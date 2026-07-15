@@ -70,6 +70,12 @@ def main():
         default="auto",
     )
     parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument(
+        "--cond-frames",
+        type=int,
+        default=None,
+        help="Number of uniformly spaced condition frames; defaults to checkpoint metadata.",
+    )
     parser.add_argument("--steps", type=int, default=sample_cfg.get("steps", 8))
     parser.add_argument("--solver", type=str, default=sample_cfg.get("solver", "heun"))
     parser.add_argument(
@@ -124,13 +130,15 @@ def main():
     )
     conditioning_metadata = _metadata_section(ckpt_metadata, "conditioning")
     flow_config_metadata = _metadata_section(ckpt_metadata, "flow_config")
-    cond_frames_min = (
+    if args.cond_frames is not None and args.cond_frames < 1:
+        parser.error("--cond-frames must be at least 1")
+    cond_frames_min = args.cond_frames or (
         conditioning_metadata.get("eval_cond_frames")
         or conditioning_metadata.get("cond_frames_min")
         or flow_config_metadata.get("cond_frames_min")
         or config.get("flow", {}).get("cond_frames_min", 2)
     )
-    cond_frames_max = (
+    cond_frames_max = args.cond_frames or (
         conditioning_metadata.get("eval_cond_frames")
         or conditioning_metadata.get("cond_frames_max")
         or flow_config_metadata.get("cond_frames_max")
@@ -411,6 +419,9 @@ def main():
         "latent_len": latent_len,
         "vae_type": vae_backend.vae_type,
         "guidance_scale": args.guidance_scale,
+        "solver_steps": args.steps,
+        "solver": args.solver,
+        "use_ema": args.use_ema,
         "sparse_indices": sample_idx_out,
         "condition_indices": sample_idx_out,
         "condition_frame_count": len(sample_idx_out),
@@ -418,6 +429,7 @@ def main():
         "condition_preview_frame_count": len(preview_idx_out),
         "condition_frames_min": cond_frames_min,
         "condition_frames_max": cond_frames_max,
+        "condition_frames_requested": args.cond_frames,
         "tau_cond": tau_cond.tolist(),
     }
 
@@ -438,6 +450,8 @@ def main():
         args.solver,
         "--guidance-scale",
         str(args.guidance_scale),
+        "--cond-frames",
+        str(len(sample_idx_out)),
         "--out",
         args.out,
         "--out-dir",

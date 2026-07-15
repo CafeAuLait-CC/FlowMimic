@@ -72,12 +72,17 @@ def _apply_train_flow_config_defaults(args, config):
 
     args.vae_latent_len = flow_cfg.get("vae_latent_len")
     args.vae_latent_token_mode = flow_cfg.get("vae_latent_token_mode")
-    args.eval_cond_frames = flow_eval_cfg.get("cond_frames")
+    if args.eval_cond_frames is None:
+        args.eval_cond_frames = flow_eval_cfg.get("cond_frames")
 
     if args.cond_frames_min is None:
         args.cond_frames_min = flow_cfg.get("cond_frames_min")
     if args.cond_frames_max is None:
         args.cond_frames_max = flow_cfg.get("cond_frames_max")
+    if args.cond_frame_choices is None:
+        args.cond_frame_choices = flow_cfg.get("cond_frame_choices")
+    if args.cond_frame_choice_probs is None:
+        args.cond_frame_choice_probs = flow_cfg.get("cond_frame_choice_probs")
     if args.cond_drop_prob is None:
         args.cond_drop_prob = flow_cfg.get("cond_drop_prob")
     if args.cond_frame_drop_prob is None:
@@ -212,6 +217,18 @@ def main():
     parser.add_argument("--aist-clip-repeat", type=int, default=1)
     parser.add_argument("--cond-frames-min", type=int, default=None)
     parser.add_argument("--cond-frames-max", type=int, default=None)
+    parser.add_argument(
+        "--cond-frame-choices",
+        type=str,
+        default=None,
+        help="Comma-separated discrete condition counts sampled per training clip.",
+    )
+    parser.add_argument(
+        "--cond-frame-choice-probs",
+        type=str,
+        default=None,
+        help="Optional comma-separated sampling weights for --cond-frame-choices.",
+    )
     parser.add_argument("--cond-drop-prob", type=float, default=None)
     parser.add_argument("--cond-frame-drop-prob", type=float, default=None)
     parser.add_argument(
@@ -333,6 +350,12 @@ def main():
         type=int,
         default=flow_eval_cfg.get("replications", 3),
     )
+    parser.add_argument(
+        "--eval-cond-frames",
+        type=int,
+        default=None,
+        help="Fixed condition count for periodic evaluation.",
+    )
     parser.add_argument("--eval-no-dist", action="store_true")
     parser.add_argument(
         "--async-cpu-eval",
@@ -342,6 +365,13 @@ def main():
     parser.add_argument("--async-eval-log-dir", type=str, default=None)
     args = parser.parse_args()
     _apply_train_flow_config_defaults(args, config)
+    args.cond_frame_choices, args.cond_frame_choice_probs = (
+        _parse_condition_frame_mixture(
+            args.cond_frame_choices,
+            args.cond_frame_choice_probs,
+            args.seq_len or config.get("seq_len"),
+        )
+    )
 
     env_world_size = int(os.environ.get("WORLD_SIZE") or "1")
     ddp = args.ddp or env_world_size > 1
@@ -423,6 +453,8 @@ def main():
                     "cond_frames_max": args.cond_frames_max
                     if args.cond_frames_max is not None
                     else config.get("flow", {}).get("cond_frames_max"),
+                    "cond_frame_choices": args.cond_frame_choices,
+                    "cond_frame_choice_probs": args.cond_frame_choice_probs,
                     "cond_drop_prob": args.cond_drop_prob
                     if args.cond_drop_prob is not None
                     else config.get("flow", {}).get("cond_drop_prob"),
@@ -500,6 +532,8 @@ def main():
         if args.cond_frames_max is not None
         else flow_cfg.get("cond_frames_max", 10)
     )
+    cond_frame_choices = args.cond_frame_choices
+    cond_frame_choice_probs = args.cond_frame_choice_probs
     eval_cond_frames = args.eval_cond_frames or cond_frames_min
     cond_drop_prob = (
         args.cond_drop_prob
@@ -571,6 +605,8 @@ def main():
             cond_cache_root=cond_cache_root,
             cond_frames_min=cond_frames_min,
             cond_frames_max=cond_frames_max,
+            cond_frame_choices=cond_frame_choices,
+            cond_frame_choice_probs=cond_frame_choice_probs,
             cond_drop_prob=cond_drop_prob,
             cond_frame_drop_prob=cond_frame_drop_prob,
             cond_frame_drop_mode=args.cond_frame_drop_mode,
@@ -597,6 +633,8 @@ def main():
             cond_cache_root=cond_cache_root,
             cond_frames_min=cond_frames_min,
             cond_frames_max=cond_frames_max,
+            cond_frame_choices=cond_frame_choices,
+            cond_frame_choice_probs=cond_frame_choice_probs,
             cond_drop_prob=cond_drop_prob,
             cond_frame_drop_prob=cond_frame_drop_prob,
             cond_frame_drop_mode=args.cond_frame_drop_mode,
@@ -710,6 +748,8 @@ def main():
         )
         print(
             f"Cond LR scale={cond_lr_scale}; cond_frames={cond_frames_min}-{cond_frames_max}; "
+            f"cond_frame_choices={cond_frame_choices}; "
+            f"cond_frame_choice_probs={cond_frame_choice_probs}; "
             f"eval_cond_frames={eval_cond_frames}; cond_frame_drop_prob={cond_frame_drop_prob}; "
             f"cond_frame_drop_start_epoch={args.cond_frame_drop_start_epoch}; "
             f"cond_frame_drop_ramp_epochs={args.cond_frame_drop_ramp_epochs}; "
@@ -905,6 +945,8 @@ def main():
         latent_len=latent_len,
         cond_frames_min=cond_frames_min,
         cond_frames_max=cond_frames_max,
+        cond_frame_choices=cond_frame_choices,
+        cond_frame_choice_probs=cond_frame_choice_probs,
         eval_cond_frames=eval_cond_frames,
     )
 
@@ -1163,7 +1205,12 @@ def main():
                                 style_id_cond, domain_id, apply_dropout=False
                             )
                             g_t = flow_model.cond_mlp(torch.cat([g2d, style_t], dim=-1))
-                            cond_batch = {"tau_out": tau_out, "mem": mem, "g": g_t}
+                            cond_batch = {
+                                "tau_out": tau_out,
+                                "mem": mem,
+                                "g": g_t,
+                                "mem_mask": ~mask_cond,
+                            }
                         z_data = teacher.generate_x1_hat(x0, cond_batch)
                         if not torch.isfinite(z_data).all():
                             if args.debug:
@@ -1185,7 +1232,14 @@ def main():
                 g = flow_model.cond_mlp(torch.cat([g2d, style], dim=-1))
                 t3 = time.perf_counter()
                 t_cond += t3 - t2
-                v_pred = flow_model.flow(x_t, t, tau_out, mem, g)
+                v_pred = flow(
+                    x_t,
+                    t,
+                    tau_out,
+                    mem=mem,
+                    g=g,
+                    mem_mask=~mask_cond,
+                )
                 target = z_data - x0
                 if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
                     if args.debug:
@@ -1803,6 +1857,8 @@ def _make_checkpoint_metadata(
     latent_len,
     cond_frames_min,
     cond_frames_max,
+    cond_frame_choices,
+    cond_frame_choice_probs,
     eval_cond_frames,
 ):
     return {
@@ -1824,6 +1880,8 @@ def _make_checkpoint_metadata(
         "conditioning": {
             "cond_frames_min": int(cond_frames_min),
             "cond_frames_max": int(cond_frames_max),
+            "cond_frame_choices": cond_frame_choices,
+            "cond_frame_choice_probs": cond_frame_choice_probs,
             "eval_cond_frames": int(eval_cond_frames),
             "cond_drop_prob": args.cond_drop_prob,
             "cond_frame_drop_prob": args.cond_frame_drop_prob,
@@ -2266,6 +2324,57 @@ def _parse_steps(raw):
     if not vals:
         return [8]
     return vals
+
+
+def _parse_condition_frame_mixture(raw_choices, raw_probs, seq_len):
+    if raw_choices is None or raw_choices == "":
+        if raw_probs not in (None, "", []):
+            raise ValueError(
+                "cond_frame_choice_probs requires cond_frame_choices"
+            )
+        return None, None
+
+    if isinstance(raw_choices, str):
+        choices = [
+            int(value.strip())
+            for value in raw_choices.split(",")
+            if value.strip()
+        ]
+    else:
+        choices = [int(value) for value in raw_choices]
+    if not choices:
+        raise ValueError("cond_frame_choices cannot be empty")
+    if any(value <= 0 for value in choices):
+        raise ValueError(f"Condition frame choices must be positive: {choices}")
+    if len(set(choices)) != len(choices):
+        raise ValueError(f"Condition frame choices must be unique: {choices}")
+    if seq_len is not None and any(value > int(seq_len) for value in choices):
+        raise ValueError(
+            f"Condition frame choices exceed seq_len={seq_len}: {choices}"
+        )
+
+    if raw_probs is None or raw_probs == "":
+        return choices, None
+    if isinstance(raw_probs, str):
+        probs = [
+            float(value.strip())
+            for value in raw_probs.split(",")
+            if value.strip()
+        ]
+    else:
+        probs = [float(value) for value in raw_probs]
+    if len(probs) != len(choices):
+        raise ValueError(
+            "Condition frame choice probabilities must match the choices: "
+            f"{len(probs)} != {len(choices)}"
+        )
+    if any(value < 0.0 for value in probs) or sum(probs) <= 0.0:
+        raise ValueError(
+            "Condition frame choice probabilities must be non-negative and "
+            "have a positive sum"
+        )
+    total = sum(probs)
+    return choices, [value / total for value in probs]
 
 
 def _select_wandb_eval_metrics(row, prefix):

@@ -10,6 +10,7 @@ from flowmimic.src.data.dataloader import blender_to_yup, load_aistpp_smpl22_30f
 from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
 from flowmimic.src.model.vae.datasets.condition_masking import (
     make_condition_frame_drop_mask,
+    sample_condition_frame_count,
 )
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
@@ -67,6 +68,8 @@ class AISTDataset(Dataset):
         cond_cache_root=None,
         cond_frames_min=None,
         cond_frames_max=None,
+        cond_frame_choices=None,
+        cond_frame_choice_probs=None,
         cond_drop_prob=0.0,
         cond_frame_drop_prob=0.0,
         cond_frame_drop_mode="random",
@@ -95,6 +98,8 @@ class AISTDataset(Dataset):
         self.cond_cache_root = cond_cache_root
         self.cond_frames_min = cond_frames_min
         self.cond_frames_max = cond_frames_max
+        self.cond_frame_choices = cond_frame_choices
+        self.cond_frame_choice_probs = cond_frame_choice_probs
         self.cond_drop_prob = cond_drop_prob
         self.cond_frame_drop_prob = cond_frame_drop_prob
         self.cond_frame_drop_mode = cond_frame_drop_mode
@@ -106,13 +111,13 @@ class AISTDataset(Dataset):
         self._build_index_map()
 
     def _condition_frame_counts(self):
-        min_frames = int(self.cond_frames_min or 1)
-        max_frames = int(self.cond_frames_max or min_frames)
-        min_frames = max(1, min(min_frames, self.seq_len))
-        max_frames = max(min_frames, min(max_frames, self.seq_len))
-        if max_frames > min_frames:
-            return random.randint(min_frames, max_frames), max_frames
-        return min_frames, max_frames
+        return sample_condition_frame_count(
+            self.seq_len,
+            self.cond_frames_min,
+            self.cond_frames_max,
+            self.cond_frame_choices,
+            self.cond_frame_choice_probs,
+        )
 
     def __len__(self):
         return len(self._index_map)

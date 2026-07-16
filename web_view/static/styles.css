@@ -33,10 +33,12 @@ h1 {
 main {
   padding: 14px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
 .panel {
+  min-width: 0;
   border: 1px solid var(--line);
   background: var(--panel);
   border-radius: 10px;
@@ -46,6 +48,24 @@ main {
 .panel h2 {
   margin: 0 0 10px 0;
   font-size: 17px;
+}
+
+.panel-heading,
+.dialog-heading,
+.dialog-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.panel-heading {
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.panel-heading h2,
+.dialog-heading h2 {
+  margin: 0;
 }
 
 .form-grid {
@@ -62,16 +82,24 @@ label {
 
 input,
 select,
+textarea,
 button {
   font: inherit;
 }
 
 input,
-select {
+select,
+textarea {
   padding: 7px 8px;
   border: 1px solid #bfc4c0;
   border-radius: 8px;
   background: #fff;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+  line-height: 1.45;
 }
 
 .checkbox {
@@ -92,6 +120,10 @@ select {
 #generateBtn,
 #clearBtn {
   width: 110px;
+}
+
+.secondary-btn {
+  background: #5f6f7d;
 }
 
 button {
@@ -127,6 +159,127 @@ button {
 button:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.blend-dialog {
+  width: min(640px, calc(100vw - 28px));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  color: var(--ink);
+  background: var(--panel);
+  box-shadow: 0 24px 64px rgba(13, 20, 28, 0.32);
+}
+
+.blend-dialog::backdrop {
+  background: rgba(7, 10, 14, 0.68);
+}
+
+.dialog-heading {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.dialog-heading h2 {
+  font-size: 18px;
+}
+
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  font-size: 24px;
+  line-height: 1;
+}
+
+.caption-editor {
+  margin-top: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.caption-editor-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.caption-editor-heading label {
+  font-weight: 600;
+}
+
+.compact-btn {
+  min-height: 30px;
+  padding: 5px 10px;
+}
+
+.caption-editor-meta {
+  min-height: 18px;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+
+.sketch-frame-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.source-frame-summary {
+  min-height: 20px;
+  margin-top: 8px;
+}
+
+.dialog-actions {
+  margin-top: 16px;
+}
+
+.download-btn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: #235a92;
+  color: #fff;
+  text-decoration: none;
+}
+
+.download-btn[hidden] {
+  display: none;
+}
+
+.blend-status {
+  min-height: 20px;
+  margin-top: 10px;
+}
+
+@media (max-width: 560px) {
+  .panel-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .sketch-frame-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .baseline-caption,
+  .baseline-conditions {
+    grid-template-columns: 1fr;
+  }
+
+  .stick-sketch-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .spinner {
@@ -168,13 +321,103 @@ button:disabled {
   font-size: 14px;
 }
 
+.view-card {
+  min-width: 0;
+  overflow: hidden;
+}
+
 canvas {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   height: 360px;
   border: 1px solid var(--line);
   border-radius: 8px;
   display: block;
   background: #f9faf8;
+}
+
+.baseline-caption {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.baseline-caption span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.baseline-caption p {
+  margin: 0;
+  line-height: 1.45;
+  font-size: 14px;
+}
+
+.baseline-conditions {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+  gap: 16px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.baseline-conditions h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.stick-sketch-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.stick-sketch {
+  margin: 0;
+  min-width: 0;
+}
+
+.stick-sketch canvas,
+.condition-canvas {
+  width: 100%;
+  height: 220px;
+}
+
+.stick-sketch figcaption {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+@media (max-width: 560px) {
+  .view-grid,
+  .baseline-caption,
+  .baseline-conditions,
+  .stick-sketch-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .baseline-panel,
+  .baseline-caption p,
+  .baseline-panel .muted {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .dialog-actions {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
 }
 
 .video-wrap {

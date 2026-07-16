@@ -51,6 +51,18 @@
           <input id="camera" placeholder="01 / 22327091 ..." />
         </label>
 
+        <label>Condition Frames
+          <select id="conditionFrames">
+            <option value="">checkpoint default</option>
+            <option value="196">196 (dense)</option>
+            <option value="98">98</option>
+            <option value="49">49</option>
+            <option value="28">28</option>
+            <option value="14">14</option>
+            <option value="7">7</option>
+          </select>
+        </label>
+
         <label>Steps
           <input id="steps" type="number" min="1" value="8" />
         </label>
@@ -99,7 +111,10 @@
     </section>
 
     <section class="panel viewers-panel">
-      <h2>3D Motion</h2>
+      <div class="panel-heading">
+        <h2>3D Motion</h2>
+        <button id="openBlendBtn" class="secondary-btn" type="button" disabled>Export comparison .blend</button>
+      </div>
       <div class="view-grid">
         <div class="view-card">
           <h3 id="genTitle">Generated</h3>
@@ -108,6 +123,37 @@
         <div class="view-card">
           <h3 id="condTitle">Condition Reference</h3>
           <canvas id="condCanvas"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section id="baselinePanel" class="panel baseline-panel" hidden>
+      <div class="panel-heading">
+        <h2>MLD and StickMotion</h2>
+        <div id="baselineSampleMeta" class="muted"></div>
+      </div>
+      <div class="baseline-caption">
+        <span>Text Condition</span>
+        <p id="baselineCaption"></p>
+      </div>
+      <div class="view-grid">
+        <div class="view-card">
+          <h3>MLD</h3>
+          <canvas id="mldCanvas"></canvas>
+        </div>
+        <div class="view-card">
+          <h3>StickMotion</h3>
+          <canvas id="stickmotionCanvas"></canvas>
+        </div>
+      </div>
+      <div class="baseline-conditions">
+        <div class="sketch-condition-area">
+          <h3>StickMotion Sketch Conditions</h3>
+          <div id="stickSketchGrid" class="stick-sketch-grid"></div>
+        </div>
+        <div class="locus-condition-area">
+          <h3>StickMotion Locus</h3>
+          <canvas id="stickLocusCanvas" class="condition-canvas"></canvas>
         </div>
       </div>
     </section>
@@ -128,6 +174,50 @@
     </section>
   </main>
 
+  <dialog id="blendDialog" class="blend-dialog">
+    <div class="dialog-heading">
+      <div>
+        <h2>Export Comparison Blend</h2>
+        <div id="blendSampleMeta" class="muted"></div>
+      </div>
+      <button id="closeBlendDialog" class="icon-btn" type="button" aria-label="Close" title="Close">&times;</button>
+    </div>
+
+    <div class="caption-editor">
+      <div class="caption-editor-heading">
+        <label for="comparisonText">Text Description</label>
+        <button id="randomizeCaptionBtn" class="secondary-btn compact-btn" type="button">Randomize</button>
+      </div>
+      <textarea
+        id="comparisonText"
+        rows="4"
+        maxlength="1000"
+        placeholder="Loading a description for this sample..."
+      ></textarea>
+      <div id="comparisonTextMeta" class="muted caption-editor-meta"></div>
+    </div>
+
+    <div class="sketch-frame-grid">
+      <label>Sketch Frame 1
+        <input id="stickFrame1" type="number" min="0" value="24" />
+      </label>
+      <label>Sketch Frame 2
+        <input id="stickFrame2" type="number" min="0" value="98" />
+      </label>
+      <label>Sketch Frame 3
+        <input id="stickFrame3" type="number" min="0" value="171" />
+      </label>
+    </div>
+    <div id="stickSourceFrames" class="muted source-frame-summary"></div>
+
+    <div class="dialog-actions">
+      <button id="buildBlendBtn" type="button">Build .blend</button>
+      <span id="blendSpinner" class="spinner" aria-hidden="true"></span>
+      <a id="blendDownload" class="download-btn" href="#" download hidden>Download .blend</a>
+    </div>
+    <div id="blendStatus" class="blend-status muted" aria-live="polite">Ready</div>
+  </dialog>
+
   <div id="lightbox" class="lightbox" aria-hidden="true">
     <div class="lightbox-content">
       <div class="lightbox-stage">
@@ -139,6 +229,6 @@
     </div>
   </div>
 
-  <script type="module" src="./static/app.js"></script>
+  <script type="module" src="./static/app.js?v=20260715-caption-editor"></script>
 </body>
 </html>

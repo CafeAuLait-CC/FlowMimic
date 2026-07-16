@@ -14,7 +14,7 @@ class NullViewport {
 
 function buildSkeletonViewportClass(THREE, OrbitControls) {
   return class SkeletonViewport {
-    constructor(canvasId) {
+    constructor(canvasId, jointColor = 0x0f5f94, boneColor = 0x264653) {
       this.canvas = document.getElementById(canvasId);
       this.scene = new THREE.Scene();
       this.scene.background = new THREE.Color(0xf8faf7);
@@ -39,7 +39,7 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
 
       this.joints = [];
       const sphereGeo = new THREE.SphereGeometry(0.025, 12, 12);
-      const sphereMat = new THREE.MeshStandardMaterial({ color: 0x0f5f94 });
+      const sphereMat = new THREE.MeshStandardMaterial({ color: jointColor });
       for (let i = 0; i < 22; i += 1) {
         const s = new THREE.Mesh(sphereGeo, sphereMat);
         this.scene.add(s);
@@ -51,7 +51,7 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
       boneGeo.setAttribute("position", new THREE.BufferAttribute(this.bonePos, 3));
       this.bones = new THREE.LineSegments(
         boneGeo,
-        new THREE.LineBasicMaterial({ color: 0x264653, linewidth: 1 })
+        new THREE.LineBasicMaterial({ color: boneColor, linewidth: 1 })
       );
       this.scene.add(this.bones);
 
@@ -79,6 +79,7 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
       this.motion = motion;
       this.frame = 0;
       this.accum = 0.0;
+      this._resize();
       this._fitCamera();
       this._renderFrame();
     }
@@ -128,6 +129,7 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
     }
 
     tick(dt) {
+      if (this.canvas.offsetParent === null) return;
       if (this.motion && this.playing) {
         this.accum += dt;
         const step = 1.0 / 30.0;
@@ -151,6 +153,7 @@ const els = {
   dataset: document.getElementById("dataset"),
   samplePath: document.getElementById("samplePath"),
   camera: document.getElementById("camera"),
+  conditionFrames: document.getElementById("conditionFrames"),
   steps: document.getElementById("steps"),
   solver: document.getElementById("solver"),
   styleId: document.getElementById("styleId"),
@@ -175,16 +178,46 @@ const els = {
   lightboxIndex: document.getElementById("lightboxIndex"),
   genTitle: document.getElementById("genTitle"),
   condTitle: document.getElementById("condTitle"),
+  openBlendBtn: document.getElementById("openBlendBtn"),
+  blendDialog: document.getElementById("blendDialog"),
+  closeBlendDialog: document.getElementById("closeBlendDialog"),
+  blendSampleMeta: document.getElementById("blendSampleMeta"),
+  stickFrame1: document.getElementById("stickFrame1"),
+  stickFrame2: document.getElementById("stickFrame2"),
+  stickFrame3: document.getElementById("stickFrame3"),
+  stickSourceFrames: document.getElementById("stickSourceFrames"),
+  comparisonText: document.getElementById("comparisonText"),
+  comparisonTextMeta: document.getElementById("comparisonTextMeta"),
+  randomizeCaptionBtn: document.getElementById("randomizeCaptionBtn"),
+  buildBlendBtn: document.getElementById("buildBlendBtn"),
+  blendSpinner: document.getElementById("blendSpinner"),
+  blendDownload: document.getElementById("blendDownload"),
+  blendStatus: document.getElementById("blendStatus"),
+  baselinePanel: document.getElementById("baselinePanel"),
+  baselineSampleMeta: document.getElementById("baselineSampleMeta"),
+  baselineCaption: document.getElementById("baselineCaption"),
+  stickSketchGrid: document.getElementById("stickSketchGrid"),
+  stickLocusCanvas: document.getElementById("stickLocusCanvas"),
 };
 
 let genView = new NullViewport();
 let condView = new NullViewport();
+let mldView = new NullViewport();
+let stickmotionView = new NullViewport();
+let SkeletonViewportType = null;
 let currentReplicateCommand = "";
 let styleNameById = new Map([[0, "Unknown"]]);
 let currentFrameUrls = [];
 let lightboxOpen = false;
 let lightboxIndex = 0;
 let currentFrameInfo = {};
+let currentComparisonSource = null;
+let currentComparisonCaption = null;
+let activeComparisonJobId = null;
+let comparisonPollTimer = null;
+let comparisonBusy = false;
+let comparisonCaptionLoading = false;
+let captionRequestSerial = 0;
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
 let defaultsCache = {
   default_steps: 8,
@@ -206,6 +239,183 @@ function clearLog() {
   els.statusLog.textContent = "";
 }
 
+function sketchFrameInputs() {
+  return [els.stickFrame1, els.stickFrame2, els.stickFrame3];
+}
+
+function selectedSketchFrames() {
+  return sketchFrameInputs().map((input) => parseOptionalInt(input.value));
+}
+
+function updateComparisonCaptionMeta() {
+  if (!currentComparisonCaption) {
+    els.comparisonTextMeta.textContent = comparisonCaptionLoading
+      ? "Selecting a random camera-matched description..."
+      : "No description selected.";
+    els.comparisonTextMeta.removeAttribute("title");
+    return;
+  }
+  const edited = els.comparisonText.value.trim() !== currentComparisonCaption.text;
+  const state = edited ? "Edited" : "Original";
+  els.comparisonTextMeta.textContent =
+    `Description ${currentComparisonCaption.index + 1} of ${currentComparisonCaption.count} | ${state}`;
+  els.comparisonTextMeta.title = currentComparisonCaption.source || "";
+}
+
+function updateComparisonControls() {
+  const hasCaption = Boolean(
+    currentComparisonCaption && els.comparisonText.value.trim()
+  );
+  els.buildBlendBtn.disabled =
+    comparisonBusy || comparisonCaptionLoading || !currentComparisonSource || !hasCaption;
+  sketchFrameInputs().forEach((input) => {
+    input.disabled = comparisonBusy;
+  });
+  els.comparisonText.disabled = comparisonBusy || comparisonCaptionLoading;
+  els.randomizeCaptionBtn.disabled =
+    comparisonBusy || comparisonCaptionLoading || !currentComparisonSource;
+  els.blendSpinner.style.display = comparisonBusy ? "inline-block" : "none";
+}
+
+function setComparisonBusy(busy) {
+  comparisonBusy = busy;
+  updateComparisonControls();
+}
+
+async function loadRandomComparisonCaption(excludeCurrent = false) {
+  if (!currentComparisonSource) return;
+  const requestSerial = ++captionRequestSerial;
+  const sourceResultId = currentComparisonSource.resultId;
+  comparisonCaptionLoading = true;
+  updateComparisonCaptionMeta();
+  updateComparisonControls();
+  els.blendStatus.textContent = "Loading text description";
+  try {
+    const payload = { result_id: sourceResultId };
+    if (excludeCurrent && currentComparisonCaption) {
+      payload.exclude_index = currentComparisonCaption.index;
+    }
+    const res = await fetch("./api/comparison-caption", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(
+        comparisonErrorText(data, `Description request failed (${res.status})`)
+      );
+    }
+    if (
+      requestSerial !== captionRequestSerial ||
+      currentComparisonSource?.resultId !== sourceResultId
+    ) {
+      return;
+    }
+    currentComparisonCaption = {
+      index: Number(data.index),
+      count: Number(data.count),
+      text: String(data.text || ""),
+      source: String(data.source || ""),
+    };
+    els.comparisonText.value = currentComparisonCaption.text;
+    els.blendStatus.textContent = "Ready";
+  } catch (err) {
+    if (requestSerial !== captionRequestSerial) return;
+    currentComparisonCaption = null;
+    els.comparisonText.value = "";
+    els.blendStatus.textContent = `Description failed: ${err}`;
+    appendLog(`Comparison description request failed: ${err}`);
+  } finally {
+    if (requestSerial === captionRequestSerial) {
+      comparisonCaptionLoading = false;
+      updateComparisonCaptionMeta();
+      updateComparisonControls();
+    }
+  }
+}
+
+function updateSketchSourceFrames() {
+  if (!currentComparisonSource) {
+    els.stickSourceFrames.textContent = "";
+    return;
+  }
+  const frames = selectedSketchFrames();
+  const start = Number(currentComparisonSource.meta?.start || 0);
+  if (frames.some((frame) => frame == null)) {
+    els.stickSourceFrames.textContent = "Enter three clip-local frame indices.";
+    return;
+  }
+  els.stickSourceFrames.textContent =
+    `Clip-local: ${frames.join(", ")} | Source: ${frames.map((frame) => frame + start).join(", ")}`;
+}
+
+function clearBaselineResults() {
+  els.baselinePanel.hidden = true;
+  els.baselineSampleMeta.textContent = "";
+  els.baselineCaption.textContent = "";
+  els.stickSketchGrid.innerHTML = "";
+  const context = els.stickLocusCanvas.getContext("2d");
+  context.clearRect(0, 0, els.stickLocusCanvas.width, els.stickLocusCanvas.height);
+  mldView.setMotion(null);
+  stickmotionView.setMotion(null);
+}
+
+function resetComparisonExport() {
+  captionRequestSerial += 1;
+  if (comparisonPollTimer != null) {
+    window.clearTimeout(comparisonPollTimer);
+    comparisonPollTimer = null;
+  }
+  activeComparisonJobId = null;
+  currentComparisonSource = null;
+  currentComparisonCaption = null;
+  comparisonCaptionLoading = false;
+  comparisonBusy = false;
+  els.openBlendBtn.disabled = true;
+  els.blendDownload.hidden = true;
+  els.blendDownload.removeAttribute("href");
+  els.blendStatus.textContent = "Ready";
+  els.blendSampleMeta.textContent = "";
+  els.comparisonText.value = "";
+  els.comparisonText.placeholder = "Loading a description for this sample...";
+  if (els.blendDialog.open) els.blendDialog.close();
+  clearBaselineResults();
+  setComparisonBusy(false);
+  updateComparisonCaptionMeta();
+  updateSketchSourceFrames();
+}
+
+function setComparisonSource(data) {
+  resetComparisonExport();
+  if (data?.meta?.dataset !== "aist" || !data.result_id) {
+    return;
+  }
+  const seqLen = Number(data.meta.seq_len || 0);
+  if (seqLen !== 196) {
+    return;
+  }
+  currentComparisonSource = {
+    resultId: data.result_id,
+    motionFilename: data.generated_motion_name || "result_smpl22.npy",
+    meta: data.meta,
+  };
+  const maxFrame = seqLen - 1;
+  sketchFrameInputs().forEach((input) => {
+    input.max = String(maxFrame);
+  });
+  els.stickFrame1.value = "24";
+  els.stickFrame2.value = "98";
+  els.stickFrame3.value = "171";
+  const sampleId = String(data.meta.path || "").split("/").pop()?.replace(/\.pkl$/, "") || "AIST++";
+  const camera = data.meta.camera || "?";
+  const start = Number(data.meta.start || 0);
+  els.blendSampleMeta.textContent = `${sampleId} | camera ${camera} | start ${start}`;
+  els.openBlendBtn.disabled = false;
+  setComparisonBusy(false);
+  updateSketchSourceFrames();
+}
+
 function getFormState() {
   return {
     modelName: els.modelName.value,
@@ -214,6 +424,7 @@ function getFormState() {
     dataset: els.dataset.value,
     samplePath: els.samplePath.value,
     camera: els.camera.value,
+    conditionFrames: els.conditionFrames.value,
     steps: els.steps.value,
     solver: els.solver.value,
     styleId: els.styleId.value,
@@ -233,6 +444,7 @@ function applyFormState(state) {
   if (typeof state.dataset === "string") els.dataset.value = state.dataset;
   if (typeof state.samplePath === "string") els.samplePath.value = state.samplePath;
   if (typeof state.camera === "string") els.camera.value = state.camera;
+  if (typeof state.conditionFrames === "string") els.conditionFrames.value = state.conditionFrames;
   if (typeof state.steps === "string") els.steps.value = state.steps;
   if (typeof state.solver === "string") els.solver.value = state.solver;
   if (typeof state.styleId === "string") setStyleSelectValue(state.styleId);
@@ -378,6 +590,7 @@ function applyReplicateCommand(cmd) {
   els.dataset.value = a.dataset || "auto";
   els.samplePath.value = a["sample-path"] || "";
   els.camera.value = a.camera || "";
+  els.conditionFrames.value = a["cond-frames"] || "";
   els.steps.value = a.steps || "8";
   els.solver.value = a.solver || "heun";
   setStyleSelectValue(a["style-id"] || "");
@@ -395,12 +608,16 @@ async function initViewports() {
       "https://unpkg.com/three@0.164.1/examples/jsm/controls/OrbitControls.js"
     );
     const SkeletonViewport = buildSkeletonViewportClass(THREE, OrbitControls);
-    genView = new SkeletonViewport("genCanvas");
-    condView = new SkeletonViewport("condCanvas");
+    SkeletonViewportType = SkeletonViewport;
+    genView = new SkeletonViewport("genCanvas", 0x0f5f94, 0x264653);
+    condView = new SkeletonViewport("condCanvas", 0x2d7a64, 0x28594d);
     appendLog("3D viewer ready.");
   } catch (err) {
     genView = new NullViewport();
     condView = new NullViewport();
+    mldView = new NullViewport();
+    stickmotionView = new NullViewport();
+    SkeletonViewportType = null;
     appendLog(`3D viewer disabled (failed to load three.js): ${err}`);
   }
 }
@@ -450,6 +667,9 @@ function resetArgsKeepCheckpoints() {
   els.dataset.value = defaultsCache.default_dataset || "auto";
   els.samplePath.value = "";
   els.camera.value = "";
+  els.conditionFrames.value = defaultsCache.default_condition_frames == null
+    ? ""
+    : String(defaultsCache.default_condition_frames);
   els.steps.value = String(defaultsCache.default_steps || 8);
   els.solver.value = defaultsCache.default_solver || "heun";
   els.styleId.value = defaultsCache.default_style_id == null ? "" : String(defaultsCache.default_style_id);
@@ -468,6 +688,7 @@ function resetArgsKeepCheckpoints() {
   setFrames([], {});
   genView.setMotion(null);
   condView.setMotion(null);
+  resetComparisonExport();
   if (els.genTitle) {
     els.genTitle.textContent = "Generated (result_smpl22.npy)";
   }
@@ -579,6 +800,247 @@ function updateViewportTitles(meta) {
   }
 }
 
+function comparisonErrorText(data, fallback) {
+  if (typeof data?.detail === "string") return data.detail;
+  if (typeof data?.error === "string") return data.error;
+  return fallback;
+}
+
+function canvasContext(canvas) {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const width = Math.max(180, Math.round(canvas.clientWidth || 320));
+  const height = Math.max(160, Math.round(canvas.clientHeight || 220));
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  const context = canvas.getContext("2d");
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.clearRect(0, 0, width, height);
+  return { context, width, height };
+}
+
+function projectedPointTransform(paths, width, height, padding = 18) {
+  const points = [];
+  for (const path of paths) {
+    for (const point of path || []) {
+      if (
+        Array.isArray(point) &&
+        Number.isFinite(point[0]) &&
+        Number.isFinite(point[1])
+      ) {
+        points.push(point);
+      }
+    }
+  }
+  if (!points.length) return null;
+  const xs = points.map((point) => point[0]);
+  const ys = points.map((point) => point[1]);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const spanX = Math.max(maxX - minX, 1e-6);
+  const spanY = Math.max(maxY - minY, 1e-6);
+  const scale = Math.min(
+    (width - padding * 2) / spanX,
+    (height - padding * 2) / spanY
+  );
+  const contentWidth = spanX * scale;
+  const contentHeight = spanY * scale;
+  const offsetX = (width - contentWidth) * 0.5;
+  const offsetY = (height - contentHeight) * 0.5;
+  return (point) => [
+    offsetX + (point[0] - minX) * scale,
+    height - offsetY - (point[1] - minY) * scale,
+  ];
+}
+
+function drawPaths(canvas, paths, color, lineWidth = 2) {
+  const { context, width, height } = canvasContext(canvas);
+  context.fillStyle = "#f9faf8";
+  context.fillRect(0, 0, width, height);
+  const transform = projectedPointTransform(paths, width, height);
+  if (!transform) return;
+  context.strokeStyle = color;
+  context.lineWidth = lineWidth;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  for (const path of paths) {
+    if (!Array.isArray(path) || path.length < 2) continue;
+    context.beginPath();
+    path.forEach((point, index) => {
+      const [x, y] = transform(point);
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.stroke();
+  }
+  return { context, transform };
+}
+
+function renderStickMotionConditions(data) {
+  els.stickSketchGrid.innerHTML = "";
+  const localFrames = data.stickman_frame_indices || [];
+  const sourceFrames = data.stickman_source_frame_indices || [];
+  const canvases = [];
+  for (let index = 0; index < (data.stickman_tracks || []).length; index += 1) {
+    const figure = document.createElement("figure");
+    figure.className = "stick-sketch";
+    const canvas = document.createElement("canvas");
+    canvas.className = "condition-canvas";
+    const caption = document.createElement("figcaption");
+    const local = localFrames[index] ?? "?";
+    const source = sourceFrames[index];
+    caption.textContent = source == null
+      ? `Frame ${local}`
+      : `Frame ${local} | source ${source}`;
+    figure.append(canvas, caption);
+    els.stickSketchGrid.appendChild(figure);
+    canvases.push([canvas, data.stickman_tracks[index]]);
+  }
+  window.requestAnimationFrame(() => {
+    for (const [canvas, tracks] of canvases) {
+      drawPaths(canvas, tracks, "#263238", 2.2);
+    }
+    const locus = Array.isArray(data.stickmotion_locus) ? data.stickmotion_locus : [];
+    const drawn = drawPaths(els.stickLocusCanvas, [locus], "#147a6f", 2.5);
+    if (drawn && locus.length > 0) {
+      const { context, transform } = drawn;
+      const endpoints = [
+        [locus[0], "#147a6f"],
+        [locus[locus.length - 1], "#b42318"],
+      ];
+      for (const [point, color] of endpoints) {
+        const [x, y] = transform(point);
+        context.beginPath();
+        context.arc(x, y, 4, 0, Math.PI * 2);
+        context.fillStyle = color;
+        context.fill();
+      }
+    }
+  });
+}
+
+async function loadComparisonResults(resultsUrl) {
+  const res = await fetch(resultsUrl, { cache: "no-store" });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(comparisonErrorText(data, `Result request failed (${res.status})`));
+  }
+  els.baselinePanel.hidden = false;
+  if (SkeletonViewportType && mldView instanceof NullViewport) {
+    mldView = new SkeletonViewportType("mldCanvas", 0xe36b32, 0x9e3f1e);
+    stickmotionView = new SkeletonViewportType("stickmotionCanvas", 0x9a67b2, 0x633974);
+  }
+  els.baselineSampleMeta.textContent = `${data.sample_id} | start ${data.clip_start}`;
+  els.baselineCaption.textContent = data.mld_text === data.stickmotion_text
+    ? data.mld_text
+    : `MLD: ${data.mld_text} | StickMotion: ${data.stickmotion_text}`;
+  mldView.setMotion(data.mld_motion);
+  stickmotionView.setMotion(data.stickmotion_motion);
+  renderStickMotionConditions(data);
+  els.baselinePanel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function pollComparisonJob(jobId, statusUrl) {
+  if (activeComparisonJobId !== jobId) return;
+  try {
+    const res = await fetch(statusUrl, { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(comparisonErrorText(data, `Status request failed (${res.status})`));
+    }
+    if (activeComparisonJobId !== jobId) return;
+    els.blendStatus.textContent = data.stage || data.status || "Working";
+    if (data.status === "complete") {
+      setComparisonBusy(false);
+      els.blendDownload.href = data.download_url;
+      els.blendDownload.hidden = false;
+      appendLog(`Comparison blend ready: ${data.download_url}`);
+      try {
+        await loadComparisonResults(data.results_url);
+      } catch (err) {
+        appendLog(`Comparison visualization failed: ${err}`);
+      }
+      comparisonPollTimer = null;
+      return;
+    }
+    if (data.status === "failed") {
+      setComparisonBusy(false);
+      const message = data.error || "Comparison blend failed.";
+      els.blendStatus.textContent = message;
+      appendLog(`Comparison blend failed: ${message}`);
+      if (data.log_url) appendLog(`build log: ${data.log_url}`);
+      comparisonPollTimer = null;
+      return;
+    }
+    comparisonPollTimer = window.setTimeout(
+      () => pollComparisonJob(jobId, statusUrl),
+      1500
+    );
+  } catch (err) {
+    if (activeComparisonJobId !== jobId) return;
+    els.blendStatus.textContent = `Status check failed: ${err}`;
+    comparisonPollTimer = window.setTimeout(
+      () => pollComparisonJob(jobId, statusUrl),
+      3000
+    );
+  }
+}
+
+async function onBuildBlend() {
+  if (!currentComparisonSource) return;
+  const frames = selectedSketchFrames();
+  const captionText = els.comparisonText.value.replaceAll("#", " ").trim();
+  const seqLen = Number(currentComparisonSource.meta?.seq_len || 0);
+  if (
+    frames.some((frame) => frame == null || frame < 0 || frame >= seqLen) ||
+    new Set(frames).size !== 3
+  ) {
+    els.blendStatus.textContent = `Select three distinct frames within [0, ${seqLen - 1}].`;
+    return;
+  }
+  if (!currentComparisonCaption || !captionText) {
+    els.blendStatus.textContent = "Select or enter a text description first.";
+    return;
+  }
+  if (comparisonPollTimer != null) {
+    window.clearTimeout(comparisonPollTimer);
+    comparisonPollTimer = null;
+  }
+  activeComparisonJobId = null;
+  els.blendDownload.hidden = true;
+  els.blendDownload.removeAttribute("href");
+  setComparisonBusy(true);
+  els.blendStatus.textContent = "Submitting build";
+  try {
+    const res = await fetch("./api/comparison-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        result_id: currentComparisonSource.resultId,
+        motion_filename: currentComparisonSource.motionFilename,
+        stickmotion_sketch_frames: frames,
+        caption_index: currentComparisonCaption.index,
+        caption_text: captionText,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(comparisonErrorText(data, `Build request failed (${res.status})`));
+    }
+    activeComparisonJobId = data.job_id;
+    els.blendStatus.textContent = data.stage || "Queued";
+    appendLog(
+      `Comparison blend queued: description ${currentComparisonCaption.index + 1}/${currentComparisonCaption.count}, sketches [${frames.join(", ")}], job ${data.job_id}`
+    );
+    pollComparisonJob(data.job_id, data.status_url);
+  } catch (err) {
+    setComparisonBusy(false);
+    els.blendStatus.textContent = `Build failed: ${err}`;
+    appendLog(`Comparison build request failed: ${err}`);
+  }
+}
+
 async function onGenerate() {
   const payload = {
     model_name: els.modelName.value.trim() || null,
@@ -587,6 +1049,7 @@ async function onGenerate() {
     dataset: els.dataset.value,
     sample_path: els.samplePath.value.trim() || null,
     camera: els.camera.value.trim() || null,
+    condition_frames: parseOptionalInt(els.conditionFrames.value),
     steps: parseOptionalInt(els.steps.value) ?? 8,
     solver: els.solver.value,
     style_id: parseOptionalInt(els.styleId?.value),
@@ -607,9 +1070,13 @@ async function onGenerate() {
   }
 
   els.generateBtn.disabled = true;
+  resetComparisonExport();
   if (els.generateSpinner) els.generateSpinner.style.display = "inline-block";
   clearLog();
   appendLog("Running sample_flow.py ...");
+  appendLog(
+    `Condition frames: ${payload.condition_frames == null ? "checkpoint default" : payload.condition_frames}`
+  );
   try {
     const res = await fetch("./api/generate", {
       method: "POST",
@@ -641,6 +1108,7 @@ async function onGenerate() {
     condView.setMotion(data.condition_motion);
     setVideo(data.video_url);
     setFrames(data.frame_urls || [], data.condition_frame_info || {});
+    setComparisonSource(data);
   } catch (err) {
     appendLog(`Request failed: ${err}`);
   } finally {
@@ -680,6 +1148,28 @@ function onLightboxKeydown(ev) {
 els.generateBtn.addEventListener("click", onGenerate);
 els.replicateBtn.addEventListener("click", onReplicate);
 els.clearBtn.addEventListener("click", resetArgsKeepCheckpoints);
+els.openBlendBtn.addEventListener("click", () => {
+  if (!currentComparisonSource) return;
+  els.blendDialog.showModal();
+  if (!currentComparisonCaption && !comparisonCaptionLoading) {
+    loadRandomComparisonCaption();
+  }
+});
+els.closeBlendDialog.addEventListener("click", () => els.blendDialog.close());
+els.blendDialog.addEventListener("click", (ev) => {
+  if (ev.target === els.blendDialog) els.blendDialog.close();
+});
+els.buildBlendBtn.addEventListener("click", onBuildBlend);
+els.randomizeCaptionBtn.addEventListener("click", () => {
+  loadRandomComparisonCaption(true);
+});
+els.comparisonText.addEventListener("input", () => {
+  updateComparisonCaptionMeta();
+  updateComparisonControls();
+});
+sketchFrameInputs().forEach((input) => {
+  input.addEventListener("input", updateSketchSourceFrames);
+});
 els.lightboxPrev.addEventListener("click", () => stepLightbox(-1));
 els.lightboxNext.addEventListener("click", () => stepLightbox(1));
 els.lightbox.addEventListener("click", (ev) => {
@@ -696,6 +1186,7 @@ window.addEventListener("keydown", onLightboxKeydown);
   els.dataset,
   els.samplePath,
   els.camera,
+  els.conditionFrames,
   els.steps,
   els.solver,
   els.styleId,
@@ -716,11 +1207,14 @@ function animate(ts) {
   lastTs = ts;
   genView.tick(dt);
   condView.tick(dt);
+  mldView.tick(dt);
+  stickmotionView.tick(dt);
   requestAnimationFrame(animate);
 }
 requestAnimationFrame(animate);
 
 async function boot() {
+  resetComparisonExport();
   await loadDefaults();
   loadFormState();
   clearStaleDefaultVaeOverride();

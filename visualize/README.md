@@ -3,10 +3,16 @@
 This folder adapts the SMPL fitting and Blender rendering pipeline from MLD:
 <https://github.com/ChenFengYe/motion-latent-diffusion>.
 
+Set the Python executable for your `mld` environment once per shell:
+
+```bash
+MLD_PYTHON="/path/to/miniconda3/envs/mld/bin/python"
+```
+
 The input is FlowMimic's `result_smpl22.npy`, which stores `(T, 22, 3)` joints in Blender Z-up space. The fitting script converts it back to Y-up before SMPLify, then writes a fitted SMPL mesh sequence and metadata:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/fit_smpl.py \
+"$MLD_PYTHON" visualize/fit_smpl.py \
   --input output/flow/last/result_smpl22.npy \
   --out-dir output/flow/last/visualize \
   --device auto
@@ -17,7 +23,7 @@ To use a custom SMPL definition, place it at `motion-latent-diffusion/deps/smpl_
 If your custom pickle is a saved SMPL output with fields like `betas`, `vertices`, and `joints`, convert it first:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/make_custom_smpl.py \
+"$MLD_PYTHON" visualize/make_custom_smpl.py \
   --shape-pkl motion-latent-diffusion/deps/smpl_models/smpl/SMPL_CUSTOM.pkl \
   --base motion-latent-diffusion/deps/smpl_models/smpl/SMPL_FEMALE.pkl \
   --out motion-latent-diffusion/deps/smpl_models/smpl/SMPL_CUSTOM.pkl \
@@ -29,7 +35,7 @@ This backs up the old file as `SMPL_CUSTOM.pkl.bak` and writes a real SMPL model
 Render the fitted mesh with Blender:
 
 ```bash
-/snap/bin/blender --background --python visualize/render_mesh_blender.py -- \
+blender --background --python visualize/render_mesh_blender.py -- \
   --mesh output/flow/last/visualize/result_smpl22/result_smpl22_mesh.npy \
   --faces output/flow/last/visualize/result_smpl22/result_smpl22_faces.npy \
   --out output/flow/last/visualize/result_smpl22/result_smpl22_smpl.mp4 \
@@ -42,9 +48,9 @@ To render with all visible GPUs, pass `--render-device all` through the wrapper,
 Rendering can also be split across multiple Blender processes. Use `--render-workers 0` to start one worker per render device:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/run_visualization.py \
+"$MLD_PYTHON" visualize/run_visualization.py \
   --input output/flow/last/result_smpl22.npy \
-  --fit-python /mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python \
+  --fit-python "$MLD_PYTHON" \
   --device cuda \
   --optimizer adam \
   --num-smplify-iters 30 \
@@ -58,18 +64,18 @@ Each render worker handles an independent frame range, so this is safe for anima
 Or run both stages through the wrapper:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/run_visualization.py \
+"$MLD_PYTHON" visualize/run_visualization.py \
   --input output/flow/last/result_smpl22.npy \
-  --fit-python /mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python \
-  --blender /snap/bin/blender
+  --fit-python "$MLD_PYTHON" \
+  --blender blender
 ```
 
 For a much faster visualization pass, use Adam and fewer iterations:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/run_visualization.py \
+"$MLD_PYTHON" visualize/run_visualization.py \
   --input output/flow/last/result_smpl22.npy \
-  --fit-python /mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python \
+  --fit-python "$MLD_PYTHON" \
   --device cuda:0 \
   --optimizer adam \
   --num-smplify-iters 30 \
@@ -81,9 +87,9 @@ For a much faster visualization pass, use Adam and fewer iterations:
 For CPU parallel fitting, split the sequence across workers:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/run_visualization.py \
+"$MLD_PYTHON" visualize/run_visualization.py \
   --input output/flow/last/result_smpl22.npy \
-  --fit-python /mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python \
+  --fit-python "$MLD_PYTHON" \
   --device cpu \
   --optimizer adam \
   --num-smplify-iters 30 \
@@ -99,9 +105,9 @@ Parallel fitting shows one parent-process progress bar. MLD's inner per-frame op
 For multi-GPU fitting, use `--device cuda` without a device number. This expands to all CUDA-visible GPUs and uses one fitting worker per GPU by default:
 
 ```bash
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/run_visualization.py \
+"$MLD_PYTHON" visualize/run_visualization.py \
   --input output/flow/last/result_smpl22.npy \
-  --fit-python /mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python \
+  --fit-python "$MLD_PYTHON" \
   --device cuda \
   --optimizer adam \
   --num-smplify-iters 30 \
@@ -115,9 +121,9 @@ For a quick smoke test:
 
 ```bash
 OMP_NUM_THREADS=128 MKL_NUM_THREADS=128 \
-/mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python visualize/run_visualization.py \
+"$MLD_PYTHON" visualize/run_visualization.py \
   --input output/flow/last/result_smpl22.npy \
-  --fit-python /mnt/data5_hdd/alex/miniconda3/envs/mld/bin/python \
+  --fit-python "$MLD_PYTHON" \
   --device cpu \
   --num-threads 128 \
   --max-frames 3 \

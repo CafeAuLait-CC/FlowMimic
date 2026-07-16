@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional directory added to sys.path before loading the spaCy model.",
     )
     parser.add_argument("--file", default=None, help="Only process this input filename.")
+    parser.add_argument(
+        "--text",
+        default=None,
+        help="Tokenize one caption and print its HumanML3D token string.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--preview",
@@ -91,6 +96,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     nlp = load_spacy(args.spacy_model, args.spacy_package_dir)
+
+    if args.text is not None:
+        print(process_text(nlp, args.text.replace("#", " ").strip()))
+        return
 
     input_dir = Path(args.input_dir)
     if args.file:

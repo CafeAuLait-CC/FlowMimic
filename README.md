@@ -411,7 +411,42 @@ python flowmimic/tools/export_stickmotion_aist_samples.py \
   --output-space blender
 ```
 
-MLD has upstream generation/export paths in `motion-latent-diffusion/demo.py` and test-time `save_npy()` support. A FlowMimic-side MLD sample exporter has not been added yet.
+Generate an aligned visual comparison for one AIST test or validation motion:
+
+```bash
+python flowmimic/tools/sample_aist_method_comparison.py \
+  --split test \
+  --sample-index 0 \
+  --camera 01 \
+  --start 0 \
+  --condition-frames 28 \
+  --stickmotion-sketch-frames 24 98 171 \
+  --flow-steps 50 \
+  --flow-gpu 0 \
+  --mld-gpu 0 \
+  --stickmotion-gpu 1
+```
+
+The comparison uses the first 196 frames of one split motion. FlowMimic receives the
+requested number of uniformly spaced camera-specific pose conditions. MLD and
+StickMotion receive the same camera-matched caption; StickMotion also receives its
+three generated stickman sketches and full locus condition. The output bundle contains
+four Blender Z-up `[196, 22, 3]` arrays, the StickMotion sketch tracks and locus,
+per-method metadata/logs, and `comparison_manifest.json`.
+
+Load all four motions, the text, and the StickMotion sketches into one Blender scene:
+
+```bash
+blender --python flowmimic/tools/vis_smpl22_blender.py -- \
+  --manifest output/aist_method_comparisons/<run>/comparison_manifest.json
+```
+
+Pass `--save-blend comparison.blend` after the manifest to save the scene beside the
+manifest. The timeline includes markers for FlowMimic condition frames and StickMotion
+sketch frames. Use `--sample-id` instead of `--sample-index` to select a specific motion,
+and `--caption-index` when a text file contains multiple descriptions. Pass
+`--caption-text "..."` to edit the selected description; the tool regenerates the
+HumanML3D token sequence for StickMotion while sending the same confirmed text to MLD.
 
 ## Diagnostic Tools
 

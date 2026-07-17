@@ -165,7 +165,7 @@ def _masked_distal_path_lengths(joints, mask):
     return np.stack(lengths, axis=0).astype(np.float32)
 
 
-def _joint_quality_from_arrays(pred_joints, target_joints, mask_np, prefix):
+def _joint_quality_from_arrays(pred_joints, target_joints, mask_np, prefix, fps=30.0):
     diff = pred_joints - target_joints
     valid_diff = diff[mask_np]
     if valid_diff.size == 0:
@@ -178,6 +178,40 @@ def _joint_quality_from_arrays(pred_joints, target_joints, mask_np, prefix):
     root_full_l2 = np.linalg.norm(diff[:, :, 0][mask_np], axis=-1)
     distal_diff = diff[:, :, list(DISTAL_JOINTS)]
     distal_l2 = np.linalg.norm(distal_diff[mask_np], axis=-1)
+
+    vel_mask = mask_np[:, 1:] & mask_np[:, :-1]
+    pred_velocity = np.diff(pred_joints, axis=1) * fps
+    target_velocity = np.diff(target_joints, axis=1) * fps
+    velocity_error = np.linalg.norm(pred_velocity - target_velocity, axis=-1)
+    distal_velocity_error = velocity_error[..., list(DISTAL_JOINTS)]
+    joint_velocity_l2 = float(velocity_error[vel_mask].mean())
+    distal_velocity_l2 = float(distal_velocity_error[vel_mask].mean())
+
+    full_clips = mask_np.all(axis=1)
+    if full_clips.any():
+        pred_distal_velocity = pred_velocity[full_clips][..., list(DISTAL_JOINTS), :]
+        target_distal_velocity = target_velocity[full_clips][..., list(DISTAL_JOINTS), :]
+        pred_spectrum = np.abs(np.fft.rfft(pred_distal_velocity, axis=1))
+        target_spectrum = np.abs(np.fft.rfft(target_distal_velocity, axis=1))
+        frequencies = np.fft.rfftfreq(pred_distal_velocity.shape[1], d=1.0 / fps)
+        high_frequency_mask = frequencies >= 3.0
+        high_frequency_spectrum_l1 = float(
+            np.abs(
+                pred_spectrum[:, high_frequency_mask]
+                - target_spectrum[:, high_frequency_mask]
+            ).sum()
+            / max(float(target_spectrum[:, high_frequency_mask].sum()), 1e-8)
+        )
+        high_frequency_energy_ratio = float(
+            np.square(pred_spectrum[:, high_frequency_mask]).sum()
+            / max(
+                float(np.square(target_spectrum[:, high_frequency_mask]).sum()),
+                1e-8,
+            )
+        )
+    else:
+        high_frequency_spectrum_l1 = 0.0
+        high_frequency_energy_ratio = 0.0
 
     pred_path = _masked_distal_path_lengths(pred_joints, mask_np)
     target_path = _masked_distal_path_lengths(target_joints, mask_np)
@@ -215,6 +249,14 @@ def _joint_quality_from_arrays(pred_joints, target_joints, mask_np, prefix):
         f"{prefix}/root_xz_l2": float(root_xz_l2.mean()),
         f"{prefix}/root_drift_l2": drift_l2,
         f"{prefix}/distal_l2": float(distal_l2.mean()),
+        f"{prefix}/joint_velocity_l2": joint_velocity_l2,
+        f"{prefix}/distal_velocity_l2": distal_velocity_l2,
+        f"{prefix}/distal_velocity_high_frequency_spectrum_l1_relative": (
+            high_frequency_spectrum_l1
+        ),
+        f"{prefix}/distal_velocity_high_frequency_energy_ratio": (
+            high_frequency_energy_ratio
+        ),
         f"{prefix}/distal_path_ratio": path_ratio_mean,
         f"{prefix}/distal_path_ratio_abs_err": path_ratio_abs_err,
         f"{prefix}/score": score,
@@ -222,7 +264,7 @@ def _joint_quality_from_arrays(pred_joints, target_joints, mask_np, prefix):
     return metrics, int(mask_np.shape[0])
 
 
-def _fixed_aist_joint_metrics(model, loader, device, mean, std, max_samples):
+def _fixed_aist_joint_metrics(model, loader, device, mean, std, max_samples, fps):
     if loader is None or max_samples <= 0:
         return {}
 
@@ -267,7 +309,7 @@ def _fixed_aist_joint_metrics(model, loader, device, mean, std, max_samples):
     target_all = np.concatenate(target_chunks, axis=0)
     mask_all = np.concatenate(mask_chunks, axis=0)
     metrics, samples = _joint_quality_from_arrays(
-        pred_all, target_all, mask_all, "val_quality/aist"
+        pred_all, target_all, mask_all, "val_quality/aist", fps=fps
     )
     legacy = {
         "val_fixed/aist_joint_mse": metrics["val_quality/aist/joint_mse"],
@@ -327,6 +369,12 @@ def main():
     parser.add_argument("--w-root-late-start", type=float, default=None)
     parser.add_argument("--w-root-late-factor", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/vqvae")
+    parser.add_argument(
+        "--archive-every-epochs",
+        type=int,
+        default=0,
+        help="Keep an immutable epoch checkpoint at this interval; 0 disables it.",
+    )
     parser.add_argument(
         "--genre-map", type=str, default="flowmimic/src/config/genre_to_id.json"
     )
@@ -917,6 +965,7 @@ def main():
                     mean,
                     std,
                     args.val_joint_metric_samples,
+                    target_fps,
                 )
                 if joint_metrics:
                     print(
@@ -997,6 +1046,21 @@ def main():
                             f"best {current_best_metric_name}={best_val:.6f} "
                             f"at epoch {best_epoch}"
                         )
+                if (
+                    args.archive_every_epochs > 0
+                    and (epoch + 1) % args.archive_every_epochs == 0
+                ):
+                    archive_state = dict(ckpt_state)
+                    archive_state["best_val"] = best_val
+                    archive_state["best_epoch"] = best_epoch
+                    archive_state["best_metric"] = current_best_metric_name
+                    archive_state["best_metric_value"] = best_val
+                    archive_path = os.path.join(
+                        args.checkpoint_dir,
+                        f"motion_vqvae_epoch{epoch + 1}.pt",
+                    )
+                    torch.save(archive_state, archive_path)
+                    print(f"Saved archive checkpoint: {archive_path}")
                 model_for_state.train()
                 if (
                     args.early_stop_patience > 0

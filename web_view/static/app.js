@@ -162,6 +162,7 @@ const els = {
   device: document.getElementById("device"),
   outName: document.getElementById("outName"),
   useEma: document.getElementById("useEma"),
+  loadLatestBtn: document.getElementById("loadLatestBtn"),
   replicateBtn: document.getElementById("replicateBtn"),
   generateBtn: document.getElementById("generateBtn"),
   generateSpinner: document.getElementById("generateSpinner"),
@@ -179,6 +180,7 @@ const els = {
   genTitle: document.getElementById("genTitle"),
   condTitle: document.getElementById("condTitle"),
   openBlendBtn: document.getElementById("openBlendBtn"),
+  comparisonHeaderSpinner: document.getElementById("comparisonHeaderSpinner"),
   blendDialog: document.getElementById("blendDialog"),
   closeBlendDialog: document.getElementById("closeBlendDialog"),
   blendSampleMeta: document.getElementById("blendSampleMeta"),
@@ -192,12 +194,12 @@ const els = {
   buildBlendBtn: document.getElementById("buildBlendBtn"),
   blendSpinner: document.getElementById("blendSpinner"),
   blendDownload: document.getElementById("blendDownload"),
+  baselineBlendDownload: document.getElementById("baselineBlendDownload"),
   blendStatus: document.getElementById("blendStatus"),
   baselinePanel: document.getElementById("baselinePanel"),
   baselineSampleMeta: document.getElementById("baselineSampleMeta"),
   baselineCaption: document.getElementById("baselineCaption"),
   stickSketchGrid: document.getElementById("stickSketchGrid"),
-  stickLocusCanvas: document.getElementById("stickLocusCanvas"),
 };
 
 let genView = new NullViewport();
@@ -218,6 +220,9 @@ let comparisonPollTimer = null;
 let comparisonBusy = false;
 let comparisonCaptionLoading = false;
 let captionRequestSerial = 0;
+let latestResultAvailable = false;
+let resultRequestBusy = false;
+let viewportsReady = false;
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
 let defaultsCache = {
   default_steps: 8,
@@ -237,6 +242,18 @@ function appendLog(text) {
 
 function clearLog() {
   els.statusLog.textContent = "";
+}
+
+function updateResultRequestControls() {
+  els.generateBtn.disabled = resultRequestBusy;
+  els.loadLatestBtn.disabled =
+    resultRequestBusy || !latestResultAvailable || !viewportsReady;
+  els.generateSpinner.style.display = resultRequestBusy ? "inline-block" : "none";
+}
+
+function setResultRequestBusy(busy) {
+  resultRequestBusy = busy;
+  updateResultRequestControls();
 }
 
 function sketchFrameInputs() {
@@ -274,7 +291,9 @@ function updateComparisonControls() {
   els.comparisonText.disabled = comparisonBusy || comparisonCaptionLoading;
   els.randomizeCaptionBtn.disabled =
     comparisonBusy || comparisonCaptionLoading || !currentComparisonSource;
+  els.openBlendBtn.disabled = comparisonBusy || !currentComparisonSource;
   els.blendSpinner.style.display = comparisonBusy ? "inline-block" : "none";
+  els.comparisonHeaderSpinner.style.display = comparisonBusy ? "inline-block" : "none";
 }
 
 function setComparisonBusy(busy) {
@@ -355,8 +374,8 @@ function clearBaselineResults() {
   els.baselineSampleMeta.textContent = "";
   els.baselineCaption.textContent = "";
   els.stickSketchGrid.innerHTML = "";
-  const context = els.stickLocusCanvas.getContext("2d");
-  context.clearRect(0, 0, els.stickLocusCanvas.width, els.stickLocusCanvas.height);
+  els.baselineBlendDownload.hidden = true;
+  els.baselineBlendDownload.removeAttribute("href");
   mldView.setMotion(null);
   stickmotionView.setMotion(null);
 }
@@ -630,6 +649,8 @@ async function loadDefaults() {
     ...defaultsCache,
     ...data,
   };
+  latestResultAvailable = Boolean(data.last_meta_exists);
+  updateResultRequestControls();
   els.vaeCheckpoint.value = data.default_vae_checkpoint || "";
   els.steps.value = data.default_steps || 8;
   els.solver.value = data.default_solver || "heun";
@@ -901,22 +922,6 @@ function renderStickMotionConditions(data) {
     for (const [canvas, tracks] of canvases) {
       drawPaths(canvas, tracks, "#263238", 2.2);
     }
-    const locus = Array.isArray(data.stickmotion_locus) ? data.stickmotion_locus : [];
-    const drawn = drawPaths(els.stickLocusCanvas, [locus], "#147a6f", 2.5);
-    if (drawn && locus.length > 0) {
-      const { context, transform } = drawn;
-      const endpoints = [
-        [locus[0], "#147a6f"],
-        [locus[locus.length - 1], "#b42318"],
-      ];
-      for (const [point, color] of endpoints) {
-        const [x, y] = transform(point);
-        context.beginPath();
-        context.arc(x, y, 4, 0, Math.PI * 2);
-        context.fillStyle = color;
-        context.fill();
-      }
-    }
   });
 }
 
@@ -955,6 +960,8 @@ async function pollComparisonJob(jobId, statusUrl) {
       setComparisonBusy(false);
       els.blendDownload.href = data.download_url;
       els.blendDownload.hidden = false;
+      els.baselineBlendDownload.href = data.download_url;
+      els.baselineBlendDownload.hidden = false;
       appendLog(`Comparison blend ready: ${data.download_url}`);
       try {
         await loadComparisonResults(data.results_url);
@@ -1041,6 +1048,50 @@ async function onBuildBlend() {
   }
 }
 
+function displayGeneratedResult(data) {
+  currentReplicateCommand = data.meta?.replicate_command || "";
+  els.replicateBtn.disabled = !currentReplicateCommand;
+  if (currentReplicateCommand) {
+    appendLog(`replicate_command: ${currentReplicateCommand}`);
+  }
+  updateViewportTitles(data.meta || {});
+  genView.setMotion(data.generated_motion);
+  condView.setMotion(data.condition_motion);
+  setVideo(data.video_url);
+  setFrames(data.frame_urls || [], data.condition_frame_info || {});
+  setComparisonSource(data);
+  latestResultAvailable = true;
+  updateResultRequestControls();
+}
+
+async function onLoadLatest() {
+  setResultRequestBusy(true);
+  clearLog();
+  appendLog("Loading latest generated result ...");
+  try {
+    const res = await fetch("./api/results/latest", { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 404) {
+        latestResultAvailable = false;
+      }
+      throw new Error(
+        comparisonErrorText(data, `Latest result request failed (${res.status})`)
+      );
+    }
+    displayGeneratedResult(data);
+    appendLog(`Loaded existing result: ${data.result_dir}`);
+    appendLog("No generation or media extraction was run.");
+    if (!data.condition_motion || !data.video_url) {
+      appendLog("Some condition media is unavailable for this saved result.");
+    }
+  } catch (err) {
+    appendLog(`Latest result load failed: ${err}`);
+  } finally {
+    setResultRequestBusy(false);
+  }
+}
+
 async function onGenerate() {
   const payload = {
     model_name: els.modelName.value.trim() || null,
@@ -1069,9 +1120,8 @@ async function onGenerate() {
     return;
   }
 
-  els.generateBtn.disabled = true;
+  setResultRequestBusy(true);
   resetComparisonExport();
-  if (els.generateSpinner) els.generateSpinner.style.display = "inline-block";
   clearLog();
   appendLog("Running sample_flow.py ...");
   appendLog(
@@ -1097,23 +1147,11 @@ async function onGenerate() {
     if (data.extract_run?.stdout) appendLog(data.extract_run.stdout);
     if (data.extract_run?.stderr) appendLog(data.extract_run.stderr);
     appendLog(`result_dir: ${data.result_dir}`);
-    if (data.meta?.replicate_command) {
-      currentReplicateCommand = data.meta.replicate_command;
-      els.replicateBtn.disabled = false;
-      appendLog(`replicate_command: ${currentReplicateCommand}`);
-    }
-    updateViewportTitles(data.meta || {});
-
-    genView.setMotion(data.generated_motion);
-    condView.setMotion(data.condition_motion);
-    setVideo(data.video_url);
-    setFrames(data.frame_urls || [], data.condition_frame_info || {});
-    setComparisonSource(data);
+    displayGeneratedResult(data);
   } catch (err) {
     appendLog(`Request failed: ${err}`);
   } finally {
-    els.generateBtn.disabled = false;
-    if (els.generateSpinner) els.generateSpinner.style.display = "none";
+    setResultRequestBusy(false);
   }
 }
 
@@ -1146,6 +1184,7 @@ function onLightboxKeydown(ev) {
 }
 
 els.generateBtn.addEventListener("click", onGenerate);
+els.loadLatestBtn.addEventListener("click", onLoadLatest);
 els.replicateBtn.addEventListener("click", onReplicate);
 els.clearBtn.addEventListener("click", resetArgsKeepCheckpoints);
 els.openBlendBtn.addEventListener("click", () => {
@@ -1218,7 +1257,9 @@ async function boot() {
   await loadDefaults();
   loadFormState();
   clearStaleDefaultVaeOverride();
-  initViewports();
+  await initViewports();
+  viewportsReady = true;
+  updateResultRequestControls();
 }
 
 boot();

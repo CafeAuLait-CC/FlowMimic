@@ -528,6 +528,124 @@ def _load_motion(path: Path) -> list | None:
     return arr.tolist()
 
 
+def _result_response(
+    run_dir: Path,
+    generated_motion_name: str,
+    *,
+    sample_run: dict | None = None,
+    extract_run: dict | None = None,
+    restored: bool = False,
+) -> dict:
+    meta_path = run_dir / "result_meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Result metadata not found") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Result metadata is unreadable") from exc
+
+    extract_out_dir = run_dir / "cond_media"
+    preview_meta_path = extract_out_dir / "condition_preview_meta.json"
+    preview_meta = {}
+    if preview_meta_path.exists():
+        try:
+            preview_meta = json.loads(preview_meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500, detail="Condition preview metadata is unreadable"
+            ) from exc
+
+    condition_indices = meta.get("condition_indices") or meta.get("sparse_indices") or []
+    condition_preview_indices = meta.get("condition_preview_indices") or condition_indices
+    gen_motion_path = run_dir / generated_motion_name
+    cond_motion_path = extract_out_dir / "cond_clip_smpl22.npy"
+    video_path = extract_out_dir / "result_clip.mp4"
+    frames_dir = extract_out_dir / "result_frames"
+
+    frame_urls = []
+    if frames_dir.exists():
+        frame_files = sorted(
+            p
+            for p in frames_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        )
+        frame_urls = [_file_url(path) for path in frame_files]
+
+    response = {
+        "ok": True,
+        "restored": restored,
+        "result_dir": str(run_dir),
+        "result_id": str(run_dir.relative_to(OUTPUT_ROOT)),
+        "generated_motion_name": generated_motion_name,
+        "meta": meta,
+        "generated_motion": _load_motion(gen_motion_path),
+        "condition_motion": _load_motion(cond_motion_path),
+        "generated_motion_url": _file_url(gen_motion_path)
+        if gen_motion_path.exists()
+        else None,
+        "condition_motion_url": _file_url(cond_motion_path)
+        if cond_motion_path.exists()
+        else None,
+        "video_url": _file_url(video_path) if video_path.exists() else None,
+        "frame_urls": frame_urls,
+        "condition_frame_info": {
+            "total": int(meta.get("condition_frame_count") or len(condition_indices)),
+            "shown": len(frame_urls),
+            "limit": COND_PREVIEW_MAX_FRAMES,
+            "indices": condition_indices,
+            "preview_indices": preview_meta.get(
+                "preview_indices", condition_preview_indices
+            ),
+        },
+        "meta_url": _file_url(meta_path),
+    }
+    if sample_run is not None:
+        response["sample_run"] = sample_run
+    if extract_run is not None:
+        response["extract_run"] = extract_run
+    return response
+
+
+def _latest_result() -> tuple[Path, str]:
+    last_link = OUTPUT_ROOT / "last"
+    if not last_link.exists():
+        raise HTTPException(status_code=404, detail="No generated result is available")
+    try:
+        run_dir = last_link.resolve(strict=True)
+        run_dir.relative_to(OUTPUT_ROOT)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="Latest result link is invalid") from exc
+
+    meta_path = run_dir / "result_meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Latest result metadata not found") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500, detail="Latest result metadata is unreadable"
+        ) from exc
+
+    generated_motion_name = str(
+        _replicate_arg(meta, "out", "result_smpl22.npy") or "result_smpl22.npy"
+    )
+    try:
+        generated_motion_name = _validate_rel_component(
+            generated_motion_name, "generated motion name"
+        )
+    except HTTPException:
+        generated_motion_name = "result_smpl22.npy"
+    generated_motion_path = run_dir / generated_motion_name
+    if not generated_motion_path.is_file():
+        candidates = sorted(run_dir.glob("*.npy"))
+        if len(candidates) != 1:
+            raise HTTPException(
+                status_code=404, detail="Latest generated motion could not be identified"
+            )
+        generated_motion_name = candidates[0].name
+    return run_dir, generated_motion_name
+
+
 def _list_checkpoints(max_items: int = 300) -> list[str]:
     ckpts = sorted((ROOT_DIR / "checkpoints" / "flow").glob("**/*.pt"))
     out = []
@@ -772,7 +890,6 @@ def comparison_job_results(job_id: str) -> dict:
         "mld_motion": bundle_dir / "mld.npy",
         "stickmotion_motion": bundle_dir / "stickmotion.npy",
         "stickman_tracks": bundle_dir / "stickman_tracks.npy",
-        "stickmotion_locus": bundle_dir / "stickmotion_locus.npy",
     }
     missing = [name for name, path in required.items() if not path.is_file()]
     if missing:
@@ -781,14 +898,9 @@ def comparison_job_results(job_id: str) -> dict:
             detail=f"Comparison artifacts are missing: {', '.join(missing)}",
         )
     tracks = np.load(required["stickman_tracks"]).astype(np.float32)
-    locus = np.load(required["stickmotion_locus"]).astype(np.float32)
     if tracks.ndim != 4 or tracks.shape[1:] != (6, 64, 2):
         raise HTTPException(
             status_code=500, detail=f"Unexpected StickMotion tracks: {tracks.shape}"
-        )
-    if locus.ndim != 2 or locus.shape[1] != 2:
-        raise HTTPException(
-            status_code=500, detail=f"Unexpected StickMotion locus: {locus.shape}"
         )
     stick = manifest.get("methods", {}).get("stickmotion", {})
     mld = manifest.get("methods", {}).get("mld", {})
@@ -808,9 +920,18 @@ def comparison_job_results(job_id: str) -> dict:
         "stickman_source_frame_indices": stick.get(
             "stickman_source_frame_indices", []
         ),
-        "stickmotion_locus": locus.tolist(),
         "manifest_url": _file_url(manifest_path),
     }
+
+
+@app.get(_prefix("/api/results/latest"))
+def latest_generated_result() -> dict:
+    run_dir, generated_motion_name = _latest_result()
+    return _result_response(
+        run_dir,
+        generated_motion_name,
+        restored=True,
+    )
 
 
 @app.post(_prefix("/api/generate"))
@@ -940,58 +1061,9 @@ def generate(req: GenerateRequest) -> dict:
             },
         )
 
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    condition_indices = meta.get("condition_indices") or meta.get("sparse_indices") or []
-    condition_preview_indices = meta.get("condition_preview_indices") or condition_indices
-    preview_meta_path = extract_out_dir / "condition_preview_meta.json"
-    preview_meta = {}
-    if preview_meta_path.exists():
-        with open(preview_meta_path, "r", encoding="utf-8") as f:
-            preview_meta = json.load(f)
-
-    gen_motion_path = run_dir / req.out
-    cond_motion_path = extract_out_dir / "cond_clip_smpl22.npy"
-    video_path = extract_out_dir / "result_clip.mp4"
-    frames_dir = extract_out_dir / "result_frames"
-
-    frame_urls = []
-    if frames_dir.exists():
-        frame_files = sorted(
-            [
-                p
-                for p in frames_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}
-            ]
-        )
-        frame_urls = [_file_url(p) for p in frame_files]
-
-    return {
-        "ok": True,
-        "sample_run": sample_run,
-        "extract_run": extract_run,
-        "result_dir": str(run_dir),
-        "result_id": str(run_dir.relative_to(OUTPUT_ROOT)),
-        "generated_motion_name": req.out,
-        "meta": meta,
-        "generated_motion": _load_motion(gen_motion_path),
-        "condition_motion": _load_motion(cond_motion_path),
-        "generated_motion_url": _file_url(gen_motion_path)
-        if gen_motion_path.exists()
-        else None,
-        "condition_motion_url": _file_url(cond_motion_path)
-        if cond_motion_path.exists()
-        else None,
-        "video_url": _file_url(video_path) if video_path.exists() else None,
-        "frame_urls": frame_urls,
-        "condition_frame_info": {
-            "total": int(meta.get("condition_frame_count") or len(condition_indices)),
-            "shown": len(frame_urls),
-            "limit": COND_PREVIEW_MAX_FRAMES,
-            "indices": condition_indices,
-            "preview_indices": preview_meta.get(
-                "preview_indices", condition_preview_indices
-            ),
-        },
-        "meta_url": _file_url(meta_path),
-    }
+    return _result_response(
+        run_dir,
+        req.out,
+        sample_run=sample_run,
+        extract_run=extract_run,
+    )

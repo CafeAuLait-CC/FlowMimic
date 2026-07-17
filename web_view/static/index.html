@@ -103,6 +103,7 @@
       </div>
 
       <div class="actions">
+        <button id="loadLatestBtn" type="button" class="secondary-btn" disabled>Load Last</button>
         <button id="replicateBtn" type="button" disabled>Replicate</button>
         <button id="generateBtn">Generate</button>
         <span id="generateSpinner" class="spinner" aria-hidden="true"></span>
@@ -113,7 +114,10 @@
     <section class="panel viewers-panel">
       <div class="panel-heading">
         <h2>3D Motion</h2>
-        <button id="openBlendBtn" class="secondary-btn" type="button" disabled>Export comparison .blend</button>
+        <div class="panel-heading-action">
+          <span id="comparisonHeaderSpinner" class="spinner" aria-hidden="true"></span>
+          <button id="openBlendBtn" class="secondary-btn" type="button" disabled>Generate Comparison</button>
+        </div>
       </div>
       <div class="view-grid">
         <div class="view-card">
@@ -130,7 +134,10 @@
     <section id="baselinePanel" class="panel baseline-panel" hidden>
       <div class="panel-heading">
         <h2>MLD and StickMotion</h2>
-        <div id="baselineSampleMeta" class="muted"></div>
+        <div class="baseline-heading-actions">
+          <div id="baselineSampleMeta" class="muted"></div>
+          <a id="baselineBlendDownload" class="download-btn" href="#" download hidden>Download .blend</a>
+        </div>
       </div>
       <div class="baseline-caption">
         <span>Text Condition</span>
@@ -150,10 +157,6 @@
         <div class="sketch-condition-area">
           <h3>StickMotion Sketch Conditions</h3>
           <div id="stickSketchGrid" class="stick-sketch-grid"></div>
-        </div>
-        <div class="locus-condition-area">
-          <h3>StickMotion Locus</h3>
-          <canvas id="stickLocusCanvas" class="condition-canvas"></canvas>
         </div>
       </div>
     </section>
@@ -229,6 +232,6 @@
     </div>
   </div>
 
-  <script type="module" src="./static/app.js?v=20260715-caption-editor"></script>
+  <script type="module" src="./static/app.js?v=20260716-comparison-spinner"></script>
 </body>
 </html>

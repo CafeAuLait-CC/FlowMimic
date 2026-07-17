@@ -63,6 +63,12 @@ main {
   margin-bottom: 10px;
 }
 
+.panel-heading-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .panel-heading h2,
 .dialog-heading h2 {
   margin: 0;
@@ -117,9 +123,20 @@ textarea {
 }
 
 #replicateBtn,
+#loadLatestBtn,
 #generateBtn,
 #clearBtn {
   width: 110px;
+}
+
+#loadLatestBtn {
+  width: 120px;
+  background: #ffc9c9;
+  color: #e03131;
+}
+
+#loadLatestBtn:hover:not(:disabled) {
+  background: #ffb8b8;
 }
 
 .secondary-btn {
@@ -363,11 +380,25 @@ canvas {
 
 .baseline-conditions {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   margin-top: 14px;
   padding-top: 14px;
   border-top: 1px solid var(--line);
+}
+
+.baseline-heading-actions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.baseline-heading-actions .muted {
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .baseline-conditions h3 {
@@ -417,6 +448,17 @@ canvas {
   .dialog-actions {
     align-items: flex-start;
     flex-wrap: wrap;
+  }
+
+  .baseline-heading-actions {
+    width: 100%;
+    align-items: flex-start;
+    justify-content: flex-start;
+    flex-direction: column;
+  }
+
+  .baseline-heading-actions .muted {
+    text-align: left;
   }
 }
 

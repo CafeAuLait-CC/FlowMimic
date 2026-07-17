@@ -13,6 +13,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 CONT_END = 259
 
 
@@ -57,6 +61,9 @@ def _safe_name(name: str) -> str:
 
 
 def _recover_smpl22(raw_features: torch.Tensor) -> np.ndarray:
+    mld_root = ROOT_DIR / "motion-latent-diffusion"
+    if str(mld_root) not in sys.path:
+        sys.path.insert(0, str(mld_root))
     from mld.data.humanml.scripts.motion_process import recover_from_ric
 
     joints = recover_from_ric(raw_features, 22)

@@ -41,6 +41,7 @@ from flowmimic.src.data.openpose import (
     load_mvh_openpose,
 )
 from flowmimic.src.metrics import T2MMotionFeatureExtractor
+from flowmimic.src.training.flow_curriculum import UnifiedRound0Curriculum
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
@@ -60,6 +61,7 @@ def _apply_train_flow_config_defaults(args, config):
     flow_eval_cfg = flow_cfg.get("eval", {})
     flow_reg_cfg = flow_cfg.get("regularization", {})
     flow_ckpt_cfg = flow_cfg.get("checkpointing", {})
+    flow_curriculum_cfg = flow_cfg.get("curriculum", {})
 
     args.stats_path = config.get("stats_path")
     args.openpose_stats_path = config.get(
@@ -98,6 +100,10 @@ def _apply_train_flow_config_defaults(args, config):
     )
     if args.ema_decay is None:
         args.ema_decay = flow_cfg.get("ema_decay")
+    if args.ema is None:
+        args.ema = bool(flow_cfg.get("ema_enabled", True))
+    if args.curriculum is None:
+        args.curriculum = flow_curriculum_cfg.get("default")
     if args.lr is None:
         args.lr = flow_cfg.get("lr")
     if args.num_workers is None:
@@ -257,6 +263,24 @@ def main():
         help="1-based epoch to enable sample-level full-condition CFG dropout. 0 enables it from the start.",
     )
     parser.add_argument("--ema-decay", type=float, default=None)
+    parser.add_argument(
+        "--ema",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Track and checkpoint a student-model exponential moving average.",
+    )
+    parser.add_argument(
+        "--curriculum",
+        choices=("unified_round0",),
+        default=None,
+        help="Use a named update-based training curriculum from config.json.",
+    )
+    parser.add_argument(
+        "--max-updates",
+        type=int,
+        default=None,
+        help="Override the selected curriculum's optimizer-update stopping point.",
+    )
     parser.add_argument("--eval-guidance-scale", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -365,6 +389,30 @@ def main():
     parser.add_argument("--async-eval-log-dir", type=str, default=None)
     args = parser.parse_args()
     _apply_train_flow_config_defaults(args, config)
+    curriculum = None
+    if args.curriculum == "unified_round0":
+        curriculum_config = (
+            config.get("flow", {})
+            .get("curriculum", {})
+            .get("unified_round0")
+        )
+        if not curriculum_config:
+            raise ValueError("Missing flow.curriculum.unified_round0 config")
+        curriculum = UnifiedRound0Curriculum(
+            curriculum_config,
+            max_updates=args.max_updates,
+        )
+        initial_curriculum_state = curriculum.state(0)
+        args.cond_frame_choices = list(
+            initial_curriculum_state.condition_choices
+        )
+        args.cond_frame_choice_probs = list(
+            initial_curriculum_state.condition_probs
+        )
+        args.cond_frames_min = min(initial_curriculum_state.condition_choices)
+        args.cond_frames_max = max(initial_curriculum_state.condition_choices)
+        args.lr = curriculum.lr_peak
+        args.lr_decay_epoch = 999999
     args.cond_frame_choices, args.cond_frame_choice_probs = (
         _parse_condition_frame_mixture(
             args.cond_frame_choices,
@@ -472,6 +520,9 @@ def main():
                     "ema_decay": args.ema_decay
                     if args.ema_decay is not None
                     else config.get("flow", {}).get("ema_decay"),
+                    "ema_enabled": args.ema,
+                    "curriculum": args.curriculum,
+                    "max_updates": curriculum.max_updates if curriculum else None,
                     "vae_latent_len": args.vae_latent_len,
                     "aist_clip_repeat": args.aist_clip_repeat,
                     "solver_reg_subbatch_size": args.solver_reg_subbatch_size,
@@ -755,7 +806,8 @@ def main():
             f"cond_frame_drop_ramp_epochs={args.cond_frame_drop_ramp_epochs}; "
             f"cond_frame_drop_mode={args.cond_frame_drop_mode}; "
             f"cfg_drop_prob={args.cfg_drop_prob}; cfg_start_epoch={args.cfg_start_epoch}; "
-            f"ema_decay={ema_decay}; "
+            f"ema_enabled={args.ema}; ema_decay={ema_decay}; "
+            f"curriculum={args.curriculum or 'none'}; "
             f"lr_decay_epoch={lr_decay_epoch}; "
             f"solver_reg_subbatch_size={solver_reg_subbatch_size or 'full'}; "
             f"cond_match_camera_mode={args.cond_match_camera_mode}"
@@ -774,6 +826,8 @@ def main():
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     start_epoch = 0
+    optimizer_updates = 0
+    last_eval_update = 0
     ema_state = None
     lr_halved = False
     if resume_state is not None:
@@ -781,13 +835,21 @@ def main():
             optimizer.load_state_dict(resume_state["optimizer"])
         if args.reset_optimizer and is_main:
             print("Resetting optimizer state for resume")
-        if args.use_ema_teacher and "ema" in resume_state:
+        if args.ema and "ema" in resume_state:
             ema_state = resume_state["ema"]
         start_epoch = int(resume_state.get("epoch", 0))
+        optimizer_updates = int(resume_state.get("optimizer_updates", 0))
+        last_eval_update = int(resume_state.get("last_eval_update", 0))
         lr_halved = bool(resume_state.get("lr_halved", start_epoch >= lr_decay_epoch))
-        scheduled_lrs = [
-            group_lr * (0.5 if lr_halved else 1.0) for group_lr in base_group_lrs
-        ]
+        if curriculum is not None:
+            resume_lr = curriculum.state(optimizer_updates).learning_rate
+            scheduled_lrs = [resume_lr, resume_lr * cond_lr_scale]
+            lr_halved = False
+        else:
+            scheduled_lrs = [
+                group_lr * (0.5 if lr_halved else 1.0)
+                for group_lr in base_group_lrs
+            ]
         old_lrs = [group["lr"] for group in optimizer.param_groups]
         _set_optimizer_group_lrs(optimizer, scheduled_lrs)
         new_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -917,7 +979,7 @@ def main():
             p_style_drop=flow_cfg.get("p_style_drop", 0.5),
         )
         state = torch.load(args.teacher_ckpt, map_location=device)
-        if "ema" in state:
+        if args.use_ema_teacher and "ema" in state:
             teacher_flow.load_state_dict(state["ema"])
         else:
             teacher_flow.load_state_dict(state["model"])
@@ -927,7 +989,7 @@ def main():
             solver_cfg={"num_steps": teacher_steps, "method": teacher_solver},
         )
 
-    ema = EMA(flow_model, decay=ema_decay) if args.use_ema_teacher else None
+    ema = EMA(flow_model, decay=ema_decay) if args.ema else None
     if ema is not None and args.resume and ema_state is not None:
         ema.load_state_dict(ema_state)
     checkpoint_metadata = _make_checkpoint_metadata(
@@ -949,6 +1011,11 @@ def main():
         cond_frame_choice_probs=cond_frame_choice_probs,
         eval_cond_frames=eval_cond_frames,
     )
+    checkpoint_metadata["ema_enabled"] = bool(args.ema)
+    checkpoint_metadata["ema_decay"] = float(ema_decay)
+    checkpoint_metadata["curriculum"] = (
+        curriculum.metadata() if curriculum is not None else None
+    )
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     last_path = os.path.join(
@@ -962,6 +1029,8 @@ def main():
             flow_model,
             optimizer,
             epoch=0,
+            optimizer_updates=optimizer_updates,
+            last_eval_update=last_eval_update,
             lr_halved=lr_halved,
             ema=ema,
             metadata=checkpoint_metadata,
@@ -1000,12 +1069,18 @@ def main():
 
     if is_main:
         print("Starting training loop")
-    global_step = 0
+    global_step = optimizer_updates
     async_eval_job = None
     cond_match_log_ema = None
+    last_completed_epoch = start_epoch
     for epoch in range(start_epoch, args.epochs):
+        if curriculum is not None and optimizer_updates >= curriculum.max_updates:
+            break
         flow.train()
         epoch_num = epoch + 1
+        curriculum_epoch_state = (
+            curriculum.state(optimizer_updates) if curriculum is not None else None
+        )
         effective_cond_frame_drop_prob = _scheduled_probability(
             epoch_num,
             cond_frame_drop_prob
@@ -1038,8 +1113,25 @@ def main():
                 f"{effective_cond_frame_drop_prob}; "
                 f"effective_cfg_drop_prob={effective_cfg_drop_prob}"
             )
-        w_cond_epoch = _ramp_weight(
-            epoch, solver_cond_start_epoch, solver_cond_ramp_epochs
+        if is_main and curriculum_epoch_state is not None:
+            print(
+                "Epoch {} curriculum={} updates={} lr={:.6g} cond_weight={:.4f} "
+                "condition_probs={}".format(
+                    epoch_num,
+                    curriculum_epoch_state.phase,
+                    optimizer_updates,
+                    curriculum_epoch_state.learning_rate,
+                    curriculum_epoch_state.condition_weight_scale,
+                    ",".join(
+                        f"{value:.4f}"
+                        for value in curriculum_epoch_state.condition_probs
+                    ),
+                )
+            )
+        w_cond_epoch = (
+            curriculum_epoch_state.condition_weight_scale
+            if curriculum_epoch_state is not None
+            else _ramp_weight(epoch, solver_cond_start_epoch, solver_cond_ramp_epochs)
         )
         w_smooth_epoch = _ramp_weight(
             epoch, solver_smooth_start_epoch, solver_smooth_ramp_epochs
@@ -1076,7 +1168,11 @@ def main():
             steps_per_epoch = len(loader_b)
         else:
             raise ValueError("No train loaders were created")
-        if not lr_halved and (epoch + 1) >= lr_decay_epoch:
+        if (
+            curriculum is None
+            and not lr_halved
+            and (epoch + 1) >= lr_decay_epoch
+        ):
             for group in optimizer.param_groups:
                 group["lr"] *= 0.5
             lr_halved = True
@@ -1092,7 +1188,25 @@ def main():
                 leave=False,
             )
         for step_idx in iter_range:
-            global_step += 1
+            if curriculum is not None and optimizer_updates >= curriculum.max_updates:
+                break
+            global_step = optimizer_updates + 1
+            curriculum_step_state = (
+                curriculum.state(optimizer_updates)
+                if curriculum is not None
+                else None
+            )
+            if curriculum_step_state is not None:
+                _set_optimizer_group_lrs(
+                    optimizer,
+                    [
+                        curriculum_step_state.learning_rate,
+                        curriculum_step_state.learning_rate * cond_lr_scale,
+                    ],
+                )
+                w_cond_step = curriculum_step_state.condition_weight_scale
+            else:
+                w_cond_step = w_cond_epoch
             bad_local = False
             loss = None
             drop_cond = None
@@ -1154,6 +1268,20 @@ def main():
                     )
                     tau_cond = tau_cond.to(device)
                     mask_cond = mask_cond.to(device)
+                    if curriculum_step_state is not None:
+                        (
+                            k2d_batch,
+                            vis_batch,
+                            conf_batch,
+                            mask_cond,
+                        ) = _apply_condition_count_schedule(
+                            k2d_batch,
+                            vis_batch,
+                            conf_batch,
+                            mask_cond,
+                            curriculum_step_state.condition_choices,
+                            curriculum_step_state.condition_probs,
+                        )
                     if not torch.isfinite(k2d_batch).all():
                         if args.debug:
                             _debug_log(
@@ -1265,7 +1393,7 @@ def main():
                 )
                 do_cond_reg = (
                     (global_step % cond_every == 0)
-                    and w_cond_epoch > 0.0
+                    and w_cond_step > 0.0
                     and lambda_cond > 0.0
                 )
                 needs_solver_reg = do_cond_reg or (
@@ -1322,14 +1450,19 @@ def main():
                     )
                     loss = loss + smooth_weighted_loss
                 if needs_solver_reg:
-                    solver_steps = _pick_solver_steps(
-                        epoch,
-                        solver_steps_early,
-                        solver_steps_mid,
-                        solver_steps_late,
-                        args.solver_mid_epoch,
-                        args.solver_late_epoch,
-                    )
+                    if curriculum_step_state is not None:
+                        solver_steps = random.choice(
+                            curriculum_step_state.solver_steps
+                        )
+                    else:
+                        solver_steps = _pick_solver_steps(
+                            epoch,
+                            solver_steps_early,
+                            solver_steps_mid,
+                            solver_steps_late,
+                            args.solver_mid_epoch,
+                            args.solver_late_epoch,
+                        )
                     solver_reg_idx = None
                     if (
                         solver_reg_subbatch_size > 0
@@ -1467,7 +1600,7 @@ def main():
                         if do_cond_reg and cond_loss_weight > 0:
                             cond_match_loss = cond_loss_sum / cond_loss_weight
                             cond_weighted_loss = (
-                                lambda_cond * w_cond_epoch
+                                lambda_cond * w_cond_step
                             ) * cond_match_loss
                             loss = loss + cond_weighted_loss
 
@@ -1508,6 +1641,7 @@ def main():
             if grad_clip_norm is not None and grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(flow_model.parameters(), grad_clip_norm)
             optimizer.step()
+            optimizer_updates = global_step
             if ema is not None:
                 ema.update(flow_model)
             t5 = time.perf_counter()
@@ -1527,11 +1661,13 @@ def main():
             if cond_match_loss is not None:
                 cond_match_sum += cond_match_loss.detach().item()
                 cond_count += 1
-            if save_every_steps and (step_idx + 1) % save_every_steps == 0:
+            if save_every_steps and optimizer_updates % save_every_steps == 0:
                 state = _flow_checkpoint_state(
                     flow_model,
                     optimizer,
                     epoch=epoch + 1,
+                    optimizer_updates=optimizer_updates,
+                    last_eval_update=last_eval_update,
                     lr_halved=lr_halved,
                     ema=ema,
                     metadata=checkpoint_metadata,
@@ -1575,6 +1711,10 @@ def main():
             ]
             smooth_count = int(stats[13].item())
             cond_count = int(stats[14].item())
+        curriculum_end_state = (
+            curriculum.state(optimizer_updates) if curriculum is not None else None
+        )
+        last_completed_epoch = epoch + 1
         if is_main:
             total_loss_avg = total_loss / max(total_count, 1)
             base_loss_avg = base_loss_sum / max(total_count, 1)
@@ -1623,20 +1763,40 @@ def main():
                     cond_updates,
                 )
             )
+            completed_eval_update = _completed_async_eval_update(async_eval_job)
             async_eval_job = _poll_async_eval_job(
                 async_eval_job, wandb_run, log_step=epoch + 1
             )
-            eval_every_epochs = (
-                args.eval_every_epochs
-                if args.eval_every_epochs is not None
-                else save_every_epochs
-            )
-            do_eval = (
-                eval_every_epochs and (epoch + 1) % eval_every_epochs == 0 and use_aist
-            )
+            if completed_eval_update is not None:
+                last_eval_update = max(last_eval_update, completed_eval_update)
+            if curriculum is not None:
+                eval_due = (
+                    optimizer_updates - last_eval_update
+                    >= curriculum.eval_every_updates
+                    or optimizer_updates >= curriculum.max_updates
+                )
+                do_eval = bool(eval_due and use_aist)
+            else:
+                eval_every_epochs = (
+                    args.eval_every_epochs
+                    if args.eval_every_epochs is not None
+                    else save_every_epochs
+                )
+                do_eval = bool(
+                    eval_every_epochs
+                    and (epoch + 1) % eval_every_epochs == 0
+                    and use_aist
+                )
+            if do_eval and args.async_cpu_eval and async_eval_job is not None:
+                print(
+                    "Deferring update-based eval because the previous async "
+                    f"eval for epoch {async_eval_job['epoch']} is still running."
+                )
+                do_eval = False
+            if do_eval and curriculum is not None and not args.async_cpu_eval:
+                last_eval_update = optimizer_updates
             if wandb_run is not None:
-                wandb_run.log(
-                    {
+                wandb_metrics = {
                         "loss/avg_total": total_loss_avg,
                         "loss/base_velocity_mse": base_loss_avg,
                         "loss/smooth_weighted": smooth_weighted_avg,
@@ -1654,11 +1814,28 @@ def main():
                         "loss/cond_match_effective_per_step": cond_match_effective,
                         "schedule/cond_fraction": cond_frequency,
                         "schedule/cond_updates": cond_updates,
-                        "schedule/w_cond_epoch": w_cond_epoch,
+                        "schedule/w_cond_epoch": (
+                            curriculum_end_state.condition_weight_scale
+                            if curriculum_end_state is not None
+                            else w_cond_epoch
+                        ),
                         "schedule/w_smooth_epoch": w_smooth_epoch,
                         "schedule/effective_cond_frame_drop_prob": effective_cond_frame_drop_prob,
                         "schedule/effective_cfg_drop_prob": effective_cfg_drop_prob,
-                    },
+                        "schedule/optimizer_updates": optimizer_updates,
+                        "schedule/learning_rate": optimizer.param_groups[0]["lr"],
+                    }
+                if curriculum_end_state is not None:
+                    wandb_metrics["schedule/curriculum_phase"] = (
+                        curriculum_end_state.phase
+                    )
+                    for choice, probability in zip(
+                        curriculum_end_state.condition_choices,
+                        curriculum_end_state.condition_probs,
+                    ):
+                        wandb_metrics[f"schedule/condition_k{choice}"] = probability
+                wandb_run.log(
+                    wandb_metrics,
                     step=epoch + 1,
                     commit=not do_eval,
                 )
@@ -1683,17 +1860,32 @@ def main():
                     flow_model,
                     optimizer,
                     epoch=epoch + 1,
+                    optimizer_updates=optimizer_updates,
+                    last_eval_update=last_eval_update,
                     lr_halved=lr_halved,
                     ema=ema,
                     metadata=checkpoint_metadata,
                 )
                 torch.save(state, last_path)
                 torch.save(state, last_good_path)
-                if save_every_epochs and (epoch + 1) % save_every_epochs == 0:
-                    ckpt_path = os.path.join(
-                        args.checkpoint_dir,
-                        f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt",
+                save_numbered = bool(
+                    do_eval
+                    or (
+                        save_every_epochs
+                        and (epoch + 1) % save_every_epochs == 0
                     )
+                )
+                if save_numbered:
+                    if curriculum is not None and do_eval:
+                        ckpt_name = (
+                            f"flow_round{args.reflow_round}_"
+                            f"update{optimizer_updates}.pt"
+                        )
+                    else:
+                        ckpt_name = (
+                            f"flow_round{args.reflow_round}_epoch{epoch + 1}.pt"
+                        )
+                    ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
                     torch.save(state, ckpt_path)
                     eval_ckpt_path = ckpt_path
             if do_eval:
@@ -1703,14 +1895,10 @@ def main():
                             args=args,
                             config=config,
                             epoch=epoch + 1,
+                            optimizer_updates=optimizer_updates,
                             flow_ckpt=eval_ckpt_path,
                             vae_ckpt=vae_ckpt_path,
                             seq_len=seq_len,
-                        )
-                    else:
-                        print(
-                            "Skipping async CPU eval launch because previous eval "
-                            f"for epoch {async_eval_job['epoch']} is still running."
                         )
                 else:
                     print(
@@ -1836,7 +2024,27 @@ def main():
             dist.barrier()
 
     if is_main:
-        _poll_async_eval_job(async_eval_job, wandb_run)
+        final_async_eval_job = async_eval_job
+        _wait_for_async_eval_job(
+            final_async_eval_job,
+            wandb_run,
+            log_step=last_completed_epoch,
+        )
+        completed_eval_update = _completed_async_eval_update(final_async_eval_job)
+        if completed_eval_update is not None:
+            last_eval_update = max(last_eval_update, completed_eval_update)
+            final_state = _flow_checkpoint_state(
+                flow_model,
+                optimizer,
+                epoch=last_completed_epoch,
+                optimizer_updates=optimizer_updates,
+                last_eval_update=last_eval_update,
+                lr_halved=lr_halved,
+                ema=ema,
+                metadata=checkpoint_metadata,
+            )
+            torch.save(final_state, last_path)
+            torch.save(final_state, last_good_path)
     if ddp:
         dist.destroy_process_group()
 
@@ -1918,11 +2126,27 @@ def _make_checkpoint_metadata(
     }
 
 
-def _flow_checkpoint_state(flow_model, optimizer, *, epoch, lr_halved, ema, metadata):
+def _flow_checkpoint_state(
+    flow_model,
+    optimizer,
+    *,
+    epoch,
+    optimizer_updates,
+    last_eval_update,
+    lr_halved,
+    ema,
+    metadata,
+):
     state = {
         "model": flow_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
+        "optimizer_updates": int(optimizer_updates),
+        "last_eval_update": int(last_eval_update),
+        "scheduler_position": {
+            "name": (metadata.get("curriculum") or {}).get("name"),
+            "completed_updates": int(optimizer_updates),
+        },
         "lr_halved": lr_halved,
         "metadata": dict(metadata),
         "vae_ckpt": metadata.get("vae_ckpt"),
@@ -1936,7 +2160,7 @@ def _flow_checkpoint_state(flow_model, optimizer, *, epoch, lr_halved, ema, meta
     return state
 
 
-def _poll_async_eval_job(job, wandb_run, log_step=None):
+def _poll_async_eval_job(job, wandb_run, log_step=None, commit=False):
     if job is None:
         return None
     proc = job["proc"]
@@ -1967,10 +2191,35 @@ def _poll_async_eval_job(job, wandb_run, log_step=None):
                 if log_step is None:
                     wandb_run.log(metrics, commit=True)
                 else:
-                    wandb_run.log(metrics, step=log_step, commit=False)
+                    wandb_run.log(metrics, step=log_step, commit=commit)
         except Exception as exc:
             print(f"Warning: failed to log async eval metrics to wandb: {exc}")
     return None
+
+
+def _wait_for_async_eval_job(job, wandb_run, log_step=None):
+    if job is None:
+        return None
+    print(
+        "Waiting for final async CPU eval from epoch {} before exit.".format(
+            job["epoch"]
+        )
+    )
+    job["proc"].wait()
+    return _poll_async_eval_job(
+        job,
+        wandb_run,
+        log_step=log_step,
+        commit=True,
+    )
+
+
+def _completed_async_eval_update(job):
+    if job is None or job["proc"].poll() != 0:
+        return None
+    if not os.path.exists(job["json_path"]):
+        return None
+    return int(job.get("optimizer_updates", 0))
 
 
 def _launch_async_cpu_eval(
@@ -1978,6 +2227,7 @@ def _launch_async_cpu_eval(
     args,
     config,
     epoch,
+    optimizer_updates,
     flow_ckpt,
     vae_ckpt,
     seq_len,
@@ -2086,6 +2336,7 @@ def _launch_async_cpu_eval(
     return {
         "proc": proc,
         "epoch": epoch,
+        "optimizer_updates": int(optimizer_updates),
         "json_path": json_path,
         "log_path": log_path,
     }
@@ -2432,6 +2683,42 @@ def _scheduled_probability(epoch_num, target_prob, start_epoch=0, ramp_epochs=0)
     progress = (int(epoch_num) - ramp_start) / float(ramp_epochs)
     progress = min(max(progress, 0.0), 1.0)
     return target_prob * progress
+
+
+def _apply_condition_count_schedule(
+    k2d,
+    vis,
+    conf,
+    mask_cond,
+    condition_choices,
+    condition_probs,
+):
+    """Apply an update-specific K mixture to a padded dense condition batch."""
+    if k2d.ndim < 2 or mask_cond.ndim != 2:
+        raise ValueError("Expected batched condition tensors")
+    batch_size, frame_budget = mask_cond.shape
+    probs = torch.as_tensor(condition_probs, device=k2d.device, dtype=torch.float32)
+    probs = probs / probs.sum()
+    sampled = torch.multinomial(probs, batch_size, replacement=True)
+    counts = torch.as_tensor(condition_choices, device=k2d.device)[sampled]
+    keep = torch.zeros_like(mask_cond, dtype=torch.bool)
+    for count in torch.unique(counts).tolist():
+        rows = torch.nonzero(counts == count, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            continue
+        count = max(1, min(int(count), frame_budget))
+        indices = torch.linspace(
+            0,
+            frame_budget - 1,
+            steps=count,
+            device=k2d.device,
+        ).round().long().unique()
+        keep[rows[:, None], indices[None, :]] = True
+    mask_cond = mask_cond.bool() & keep
+    k2d = k2d * mask_cond[..., None, None].to(k2d.dtype)
+    vis = vis * mask_cond[..., None].to(vis.dtype)
+    conf = conf * mask_cond[..., None].to(conf.dtype)
+    return k2d, vis, conf, mask_cond
 
 
 def _pick_solver_steps(epoch, early, mid, late, mid_epoch, late_epoch):

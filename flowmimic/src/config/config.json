@@ -110,7 +110,32 @@
       "teacher_steps": 16,
       "teacher_solver": "heun"
     },
-    "ema_decay": 0.999,
+    "ema_enabled": true,
+    "ema_decay": 0.99,
+    "curriculum": {
+      "default": null,
+      "unified_round0": {
+        "reference_updates_per_epoch": 346,
+        "warmup_end_update": 1730,
+        "dense_end_update": 13840,
+        "condition_start_update": 20760,
+        "condition_full_update": 27680,
+        "mid_end_update": 27680,
+        "sparse_end_update": 48440,
+        "max_updates": 48440,
+        "optional_max_updates": 55360,
+        "eval_every_updates": 1730,
+        "lr_peak": 0.0002,
+        "lr_mid": 0.0001,
+        "lr_final": 0.00005,
+        "condition_choices": [196, 98, 49, 28, 14, 7],
+        "dense_probs": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "mid_probs": [0.375, 0.1875, 0.25, 0.1875, 0.0, 0.0],
+        "final_probs": [0.30, 0.15, 0.20, 0.15, 0.12, 0.08],
+        "solver_steps_dense": [16],
+        "solver_steps_sparse": [8, 16]
+      }
+    },
     "checkpointing": {
       "save_every_steps": 0,
       "save_every_epochs": 5

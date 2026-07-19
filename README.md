@@ -422,6 +422,8 @@ python flowmimic/tools/sample_aist_method_comparison.py \
   --condition-frames 28 \
   --stickmotion-sketch-frames 24 98 171 \
   --flow-steps 50 \
+  --visualization-mode rigged \
+  --rigged-model web_view/assets/smpl22_rigged_calibrated.glb \
   --flow-gpu 0 \
   --mld-gpu 0 \
   --stickmotion-gpu 1
@@ -438,7 +440,9 @@ Load all four motions, the text, and the StickMotion sketches into one Blender s
 
 ```bash
 blender --python flowmimic/tools/vis_smpl22_blender.py -- \
-  --manifest output/aist_method_comparisons/<run>/comparison_manifest.json
+  --manifest output/aist_method_comparisons/<run>/comparison_manifest.json \
+  --visualization-mode rigged \
+  --rigged-model web_view/assets/smpl22_rigged_calibrated.glb
 ```
 
 Pass `--save-blend comparison.blend` after the manifest to save the scene beside the
@@ -447,6 +451,17 @@ sketch frames. Use `--sample-id` instead of `--sample-index` to select a specifi
 and `--caption-index` when a text file contains multiple descriptions. Pass
 `--caption-text "..."` to edit the selected description; the tool regenerates the
 HumanML3D token sequence for StickMotion while sending the same confirmed text to MLD.
+
+Rebuild the calibrated visualization rig after replacing the source GLB:
+
+```bash
+blender --background --python flowmimic/tools/calibrate_smpl22_rig.py -- \
+  --input web_view/assets/smpl22_rigged.glb \
+  --output web_view/assets/smpl22_rigged_calibrated.glb \
+  --knee-center-blend 0.70
+```
+
+The calibration centers the torso chain, mirrors and levels paired joints, and moves the knee pivots conservatively toward the measured mesh cross-section centers without changing the mesh rest shape.
 
 ## Diagnostic Tools
 

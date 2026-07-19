@@ -17,7 +17,7 @@ from pathlib import Path
 
 import bpy
 import numpy as np
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 CHAINS = [
@@ -34,6 +34,27 @@ PALETTE = {
     "stickmotion": ((0.48, 0.20, 0.62, 1.0), (0.71, 0.42, 0.82, 1.0)),
 }
 ROOT_COLLECTION = "FlowMimicComparison"
+SMPL22_BONES = [
+    "pelvis", "left_hip", "right_hip", "spine1", "left_knee", "right_knee",
+    "spine2", "left_ankle", "right_ankle", "spine3", "left_foot", "right_foot",
+    "neck", "left_collar", "right_collar", "head", "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+]
+PRIMARY_CHILD = {
+    0: 3, 1: 4, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11,
+    9: 12, 12: 15, 13: 16, 14: 17, 16: 18, 17: 19, 18: 20, 19: 21,
+}
+# The pelvis uses its hip triangle; pointing it at spine1 shears the waist.
+ORIENTATION_EDGE = {
+    **{
+        joint: (joint, child)
+        for joint, child in PRIMARY_CHILD.items()
+        if joint != 0
+    },
+    15: (12, 15),
+    20: (18, 20),
+    21: (19, 21),
+}
 
 
 def _script_args() -> argparse.Namespace:
@@ -48,6 +69,12 @@ def _script_args() -> argparse.Namespace:
     parser.add_argument("--rig-spacing", type=float, default=3.6)
     parser.add_argument("--sphere-radius", type=float, default=0.025)
     parser.add_argument("--bone-radius", type=float, default=0.012)
+    parser.add_argument(
+        "--visualization-mode", choices=("skeleton", "rigged"), default="skeleton"
+    )
+    parser.add_argument(
+        "--rigged-model", default=None
+    )
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     return parser.parse_args(argv)
 
@@ -186,6 +213,107 @@ def _build_rig(key, label, motion, offset, parent, sphere_radius, bone_radius):
     )
 
 
+def _pelvis_basis(points):
+    x_axis = (points[1] - points[2]).normalized()
+    hip_center = (points[1] + points[2]) * 0.5
+    up_hint = points[0] - hip_center
+    if x_axis.length_squared < 1e-10 or up_hint.length_squared < 1e-10:
+        return None
+    z_axis = x_axis.cross(up_hint).normalized()
+    if z_axis.length_squared < 1e-10:
+        return None
+    y_axis = z_axis.cross(x_axis).normalized()
+    return Matrix((x_axis, y_axis, z_axis)).transposed().to_quaternion()
+
+
+def _build_rigged_body(key, label, motion, offset, parent, model_path):
+    collection = _new_collection(f"Rig_{key}", parent)
+    existing = {obj.as_pointer() for obj in bpy.data.objects}
+    bpy.ops.import_scene.gltf(filepath=str(model_path))
+    imported = [obj for obj in bpy.data.objects if obj.as_pointer() not in existing]
+    armatures = [obj for obj in imported if obj.type == "ARMATURE"]
+    if len(armatures) != 1:
+        raise ValueError(f"{model_path}: expected one armature, found {len(armatures)}")
+    armature = armatures[0]
+    keep = {armature, *armature.children_recursive}
+    for obj in imported:
+        if obj not in keep:
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for obj in keep:
+        _move_to_collection(obj, collection)
+
+    armature.name = f"{key}_SMPL22_Armature"
+    armature.data.name = f"{key}_SMPL22_ArmatureData"
+    armature.show_in_front = True
+    body_material = _material(f"MAT_{key}_body", PALETTE.get(key, PALETTE["reference"])[1], roughness=0.48)
+    for obj in keep:
+        if obj.type == "MESH":
+            obj.name = f"{key}_SMPL22_Mesh"
+            obj.data.materials.clear()
+            obj.data.materials.append(body_material)
+
+    missing = [name for name in SMPL22_BONES if name not in armature.data.bones]
+    if missing:
+        raise ValueError(f"{model_path}: missing SMPL22 bones: {', '.join(missing)}")
+    rest_points = [armature.data.bones[name].head_local.copy() for name in SMPL22_BONES]
+    rest_basis = _pelvis_basis(rest_points)
+    if rest_basis is None:
+        raise ValueError(f"{model_path}: degenerate rest-pose body basis")
+    rest_quaternions = [
+        armature.data.bones[name].matrix_local.to_quaternion()
+        for name in SMPL22_BONES
+    ]
+    rest_directions = []
+    for index in range(len(SMPL22_BONES)):
+        edge = ORIENTATION_EDGE.get(index)
+        rest_directions.append(
+            None
+            if edge is None
+            else (rest_points[edge[1]] - rest_points[edge[0]]).normalized()
+        )
+    pose_bones = [armature.pose.bones[name] for name in SMPL22_BONES]
+    for pose_bone in pose_bones:
+        pose_bone.rotation_mode = "QUATERNION"
+
+    for frame_index, pose in enumerate(motion, start=1):
+        bpy.context.scene.frame_set(frame_index)
+        points = [Vector(point) + offset for point in pose]
+        target_basis = _pelvis_basis(points)
+        if target_basis is None:
+            continue
+        basis_delta = target_basis @ rest_basis.inverted()
+        for index, pose_bone in enumerate(pose_bones):
+            world_quaternion = basis_delta @ rest_quaternions[index]
+            edge = ORIENTATION_EDGE.get(index)
+            if edge is not None:
+                target_direction = points[edge[1]] - points[edge[0]]
+                if target_direction.length_squared > 1e-10:
+                    source_direction = rest_directions[index].copy()
+                    source_direction.rotate(basis_delta)
+                    align = source_direction.normalized().rotation_difference(
+                        target_direction.normalized()
+                    )
+                    world_quaternion = align @ world_quaternion
+            pose_bone.matrix = (
+                Matrix.Translation(points[index])
+                @ world_quaternion.to_matrix().to_4x4()
+            )
+            bpy.context.view_layer.update()
+        for pose_bone in pose_bones:
+            pose_bone.keyframe_insert("location", frame=frame_index)
+            pose_bone.keyframe_insert("rotation_quaternion", frame=frame_index)
+            pose_bone.keyframe_insert("scale", frame=frame_index)
+
+    _create_text(
+        f"Label_{key}",
+        label,
+        (offset.x, -0.55, 2.35),
+        parent,
+        size=0.34,
+        align="CENTER",
+    )
+
+
 def _create_text(name, body, location, collection, size=0.24, align="LEFT", width=0.0):
     curve = bpy.data.curves.new(name=f"{name}_curve", type="FONT")
     curve.body = body
@@ -307,6 +435,15 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
     ]
     frame_count = min(len(motion) for _, motion in motions)
     motions = [(item, motion[:frame_count]) for item, motion in motions]
+    rigged_model = Path(
+        args.rigged_model or "web_view/assets/smpl22_rigged_calibrated.glb"
+    )
+    if not rigged_model.is_absolute():
+        rigged_model = (Path.cwd() / rigged_model).resolve()
+    if args.rigged_model is None and not rigged_model.is_file():
+        rigged_model = (Path.cwd() / "web_view/assets/smpl22_rigged.glb").resolve()
+    if args.visualization_mode == "rigged" and not rigged_model.is_file():
+        raise FileNotFoundError(f"Rigged SMPL22 model not found: {rigged_model}")
 
     _remove_collection(ROOT_COLLECTION)
     _clear_scene_objects()
@@ -323,15 +460,21 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
     count = len(motions)
     offsets_x = (np.arange(count) - (count - 1) * 0.5) * args.rig_spacing
     for (item, motion), x in zip(motions, offsets_x):
-        _build_rig(
-            item["key"],
-            item["label"],
-            motion,
-            Vector((float(x), 0.0, 0.0)),
-            root,
-            args.sphere_radius,
-            args.bone_radius,
-        )
+        offset = Vector((float(x), 0.0, 0.0))
+        if args.visualization_mode == "rigged":
+            _build_rigged_body(
+                item["key"], item["label"], motion, offset, root, rigged_model
+            )
+        else:
+            _build_rig(
+                item["key"],
+                item["label"],
+                motion,
+                offset,
+                root,
+                args.sphere_radius,
+                args.bone_radius,
+            )
 
     span = args.rig_spacing * max(count - 1, 1) + 3.0
     caption = manifest.get("caption", {}).get("text", "")
@@ -372,7 +515,19 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
     fill_light.hide_set(True)
     fill_light.hide_render = False
 
-    bpy.ops.object.camera_add(location=(0.0, -18.0, 5.2))
+    horizontal_extent = max(
+        abs(float(motion[:, :, 0].min()) + float(x))
+        for (_, motion), x in zip(motions, offsets_x)
+    )
+    horizontal_extent = max(
+        horizontal_extent,
+        max(
+            abs(float(motion[:, :, 0].max()) + float(x))
+            for (_, motion), x in zip(motions, offsets_x)
+        ),
+    )
+    camera_distance = max(18.0, (horizontal_extent + 0.8) * 2.8)
+    bpy.ops.object.camera_add(location=(0.0, -camera_distance, 5.2))
     camera = bpy.context.object
     camera.name = "ComparisonCamera"
     camera.data.lens = 48
@@ -396,6 +551,7 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
     scene["comparison_manifest"] = str(manifest_path)
     scene["sample_id"] = manifest.get("sample_id", "")
     scene["text_description"] = caption
+    scene["visualization_mode"] = args.visualization_mode
     scene.frame_set(1)
     if args.save_blend:
         save_path = Path(args.save_blend)

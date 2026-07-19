@@ -248,6 +248,17 @@ def parse_args() -> argparse.Namespace:
         metavar="FILENAME",
     )
     parser.add_argument("--blender", default=None)
+    parser.add_argument(
+        "--visualization-mode",
+        choices=("skeleton", "rigged"),
+        default="skeleton",
+        help="Geometry used in the Blender comparison scene.",
+    )
+    parser.add_argument(
+        "--rigged-model",
+        default=None,
+        help="SMPL22 GLB used when --visualization-mode=rigged.",
+    )
     args = parser.parse_args()
     try:
         args.flow_python = _conda_env_python(
@@ -268,6 +279,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     workspace = WORKSPACE
+    default_rigged_model = workspace / "web_view" / "assets" / "smpl22_rigged_calibrated.glb"
+    if not default_rigged_model.is_file():
+        default_rigged_model = workspace / "web_view" / "assets" / "smpl22_rigged.glb"
+    rigged_model = Path(args.rigged_model) if args.rigged_model else default_rigged_model
+    if not rigged_model.is_absolute():
+        rigged_model = (workspace / rigged_model).resolve()
+    if args.visualization_mode == "rigged" and not rigged_model.is_file():
+        raise FileNotFoundError(f"Rigged SMPL22 model not found: {rigged_model}")
     if args.condition_frames < 1 or args.condition_frames > args.seq_len:
         raise ValueError("condition_frames must be within [1, seq_len]")
     if args.start < 0:
@@ -519,6 +538,7 @@ def main() -> None:
 
     manifest = {
         **initial_manifest,
+        "visualization_mode": args.visualization_mode,
         "status": "complete",
         "condition": {
             "method": "flowmimic_openpose",
@@ -572,6 +592,10 @@ def main() -> None:
         "--",
         "--manifest",
         str(manifest_path),
+        "--visualization-mode",
+        args.visualization_mode,
+        "--rigged-model",
+        str(rigged_model),
     ]
     print(f"Comparison bundle: {run_dir}")
     print(f"Blender: {shlex.join(blender_command)}")
@@ -586,6 +610,10 @@ def main() -> None:
             str(manifest_path),
             "--save-blend",
             args.save_blend,
+            "--visualization-mode",
+            args.visualization_mode,
+            "--rigged-model",
+            str(rigged_model),
         ]
         _run("blender", save_command, workspace, os.environ.copy(), run_dir / "blender.log")
     if args.launch_blender:

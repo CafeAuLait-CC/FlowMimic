@@ -1770,8 +1770,14 @@ def main():
             if completed_eval_update is not None:
                 last_eval_update = max(last_eval_update, completed_eval_update)
             if curriculum is not None:
+                pending_eval_update = (
+                    int(async_eval_job.get("optimizer_updates", 0))
+                    if async_eval_job is not None
+                    else 0
+                )
+                eval_schedule_update = max(last_eval_update, pending_eval_update)
                 eval_due = (
-                    optimizer_updates - last_eval_update
+                    optimizer_updates - eval_schedule_update
                     >= curriculum.eval_every_updates
                     or optimizer_updates >= curriculum.max_updates
                 )

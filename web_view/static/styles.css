@@ -20,9 +20,19 @@ body {
 }
 
 header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   border-bottom: 1px solid var(--line);
   padding: 12px 20px;
   background: #fff;
+}
+
+.app-icon {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  object-fit: contain;
 }
 
 h1 {

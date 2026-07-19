@@ -7,13 +7,52 @@ const EDGES = [
   [9, 14], [14, 17], [17, 19], [19, 21],
 ];
 
+const SMPL22_BONES = [
+  "pelvis", "left_hip", "right_hip", "spine1", "left_knee", "right_knee",
+  "spine2", "left_ankle", "right_ankle", "spine3", "left_foot", "right_foot",
+  "neck", "left_collar", "right_collar", "head", "left_shoulder", "right_shoulder",
+  "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+];
+
+const PRIMARY_CHILD = new Map([
+  [0, 3], [1, 4], [2, 5], [3, 6], [4, 7], [5, 8], [6, 9], [7, 10],
+  [8, 11], [9, 12], [12, 15], [13, 16], [14, 17], [16, 18], [17, 19],
+  [18, 20], [19, 21],
+]);
+
+const ORIENTATION_EDGE = new Map([
+  ...PRIMARY_CHILD.entries()].map(([joint, child]) => [joint, [joint, child]])
+);
+// The pelvis uses its hip triangle; pointing it at spine1 shears the waist.
+ORIENTATION_EDGE.delete(0);
+ORIENTATION_EDGE.set(15, [12, 15]);
+ORIENTATION_EDGE.set(20, [18, 20]);
+ORIENTATION_EDGE.set(21, [19, 21]);
+
 class NullViewport {
   setMotion(_motion) {}
+  setVisualizationMode(_mode) {}
   tick(_dt) {}
 }
 
-function buildSkeletonViewportClass(THREE, OrbitControls) {
-  return class SkeletonViewport {
+function buildMotionViewportClass(THREE, OrbitControls, rigTemplate, cloneRig) {
+  const unitScale = new THREE.Vector3(1, 1, 1);
+
+  function pelvisBasisQuaternion(points) {
+    const x = points[1].clone().sub(points[2]);
+    const hipCenter = points[1].clone().add(points[2]).multiplyScalar(0.5);
+    const y = points[0].clone().sub(hipCenter);
+    if (x.lengthSq() < 1e-10 || y.lengthSq() < 1e-10) return null;
+    x.normalize();
+    const z = x.clone().cross(y).normalize();
+    if (z.lengthSq() < 1e-10) return null;
+    y.copy(z).cross(x).normalize();
+    return new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(x, y, z)
+    );
+  }
+
+  return class MotionViewport {
     constructor(canvasId, jointColor = 0x0f5f94, boneColor = 0x264653) {
       this.canvas = document.getElementById(canvasId);
       this.scene = new THREE.Scene();
@@ -27,6 +66,7 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
 
       this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true });
       this.renderer.setPixelRatio(window.devicePixelRatio);
+      this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
       this.controls = new OrbitControls(this.camera, this.renderer.domElement);
       this.controls.enableDamping = true;
@@ -35,14 +75,19 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
 
       const hemi = new THREE.HemisphereLight(0xffffff, 0x98a1aa, 1.2);
       this.scene.add(hemi);
+      const key = new THREE.DirectionalLight(0xffffff, 1.4);
+      key.position.set(2.5, 4.0, 3.0);
+      this.scene.add(key);
       this.scene.add(new THREE.GridHelper(6, 18, 0xcad1ca, 0xe7ebe7));
 
+      this.skeletonGroup = new THREE.Group();
+      this.scene.add(this.skeletonGroup);
       this.joints = [];
       const sphereGeo = new THREE.SphereGeometry(0.025, 12, 12);
       const sphereMat = new THREE.MeshStandardMaterial({ color: jointColor });
       for (let i = 0; i < 22; i += 1) {
         const s = new THREE.Mesh(sphereGeo, sphereMat);
-        this.scene.add(s);
+        this.skeletonGroup.add(s);
         this.joints.push(s);
       }
 
@@ -53,7 +98,13 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
         boneGeo,
         new THREE.LineBasicMaterial({ color: boneColor, linewidth: 1 })
       );
-      this.scene.add(this.bones);
+      this.skeletonGroup.add(this.bones);
+
+      this.rigRoot = null;
+      this.rigBones = [];
+      this.rigRest = [];
+      this.rigRestBasis = null;
+      if (rigTemplate && cloneRig) this._initRig(rigTemplate, cloneRig);
 
       this.motion = null;
       this.frame = 0;
@@ -61,6 +112,45 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
       this.playing = true;
       this._resize();
       window.addEventListener("resize", () => this._resize());
+    }
+
+    _initRig(template, cloneRig) {
+      this.rigRoot = cloneRig(template);
+      const discard = [];
+      this.rigRoot.traverse((obj) => {
+        if (obj.isCamera || obj.isLight || (obj.isMesh && !obj.isSkinnedMesh)) {
+          discard.push(obj);
+        }
+      });
+      for (const obj of discard) obj.parent?.remove(obj);
+      this.scene.add(this.rigRoot);
+      this.rigRoot.updateMatrixWorld(true);
+      this.rigBones = SMPL22_BONES.map((name) => this.rigRoot.getObjectByName(name));
+      if (this.rigBones.some((bone) => !bone || !bone.isBone)) {
+        this.scene.remove(this.rigRoot);
+        this.rigRoot = null;
+        this.rigBones = [];
+        return;
+      }
+      const restPoints = this.rigBones.map((bone) => bone.getWorldPosition(new THREE.Vector3()));
+      this.rigRestBasis = pelvisBasisQuaternion(restPoints);
+      this.rigRest = this.rigBones.map((bone, index) => {
+        const edge = ORIENTATION_EDGE.get(index);
+        return {
+          quaternion: bone.getWorldQuaternion(new THREE.Quaternion()),
+          direction: edge == null
+            ? null
+            : restPoints[edge[1]].clone().sub(restPoints[edge[0]]).normalize(),
+        };
+      });
+      this.rigRoot.visible = false;
+    }
+
+    setVisualizationMode(mode) {
+      const useRig = mode === "rigged" && this.rigRoot != null;
+      this.skeletonGroup.visible = !useRig;
+      if (this.rigRoot) this.rigRoot.visible = useRig;
+      if (this.motion) this._renderFrame();
     }
 
     _resize() {
@@ -126,6 +216,43 @@ function buildSkeletonViewportClass(THREE, OrbitControls) {
         this.bonePos[base + 5] = pb[2];
       }
       this.bones.geometry.attributes.position.needsUpdate = true;
+      if (this.rigRoot?.visible) this._setRigPose(f);
+    }
+
+    _setRigPose(frame) {
+      if (!this.rigRestBasis) return;
+      const points = frame.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+      const targetBasis = pelvisBasisQuaternion(points);
+      if (!targetBasis) return;
+      const basisDelta = targetBasis.clone().multiply(this.rigRestBasis.clone().invert());
+      const desiredWorld = new Map();
+      const inverseParent = new THREE.Matrix4();
+      const localMatrix = new THREE.Matrix4();
+      for (let index = 0; index < this.rigBones.length; index += 1) {
+        const bone = this.rigBones[index];
+        const rest = this.rigRest[index];
+        const worldQuaternion = basisDelta.clone().multiply(rest.quaternion);
+        const edge = ORIENTATION_EDGE.get(index);
+        if (edge && rest.direction) {
+          const source = rest.direction.clone().applyQuaternion(basisDelta).normalize();
+          const target = points[edge[1]].clone().sub(points[edge[0]]);
+          if (target.lengthSq() > 1e-10) {
+            const align = new THREE.Quaternion().setFromUnitVectors(source, target.normalize());
+            worldQuaternion.premultiply(align);
+          }
+        }
+        const worldMatrix = new THREE.Matrix4().compose(
+          points[index], worldQuaternion, unitScale
+        );
+        desiredWorld.set(bone, worldMatrix);
+        const parentWorld = desiredWorld.get(bone.parent) || bone.parent.matrixWorld;
+        inverseParent.copy(parentWorld).invert();
+        localMatrix.multiplyMatrices(inverseParent, worldMatrix);
+        localMatrix.decompose(bone.position, bone.quaternion, bone.scale);
+        bone.updateMatrix();
+        bone.updateMatrixWorld(true);
+      }
+      this.rigRoot.updateMatrixWorld(true);
     }
 
     tick(dt) {
@@ -179,8 +306,11 @@ const els = {
   lightboxIndex: document.getElementById("lightboxIndex"),
   genTitle: document.getElementById("genTitle"),
   condTitle: document.getElementById("condTitle"),
+  visualizationModes: [...document.querySelectorAll('input[name="visualizationMode"]')],
+  riggedMode: document.getElementById("visualizationRigged"),
   openBlendBtn: document.getElementById("openBlendBtn"),
   comparisonHeaderSpinner: document.getElementById("comparisonHeaderSpinner"),
+  comparisonHeaderStatus: document.getElementById("comparisonHeaderStatus"),
   blendDialog: document.getElementById("blendDialog"),
   closeBlendDialog: document.getElementById("closeBlendDialog"),
   blendSampleMeta: document.getElementById("blendSampleMeta"),
@@ -206,7 +336,8 @@ let genView = new NullViewport();
 let condView = new NullViewport();
 let mldView = new NullViewport();
 let stickmotionView = new NullViewport();
-let SkeletonViewportType = null;
+let MotionViewportType = null;
+let currentVisualizationMode = "skeleton";
 let currentReplicateCommand = "";
 let styleNameById = new Map([[0, "Unknown"]]);
 let currentFrameUrls = [];
@@ -224,14 +355,16 @@ let latestResultAvailable = false;
 let resultRequestBusy = false;
 let viewportsReady = false;
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
+const FORM_STATE_VERSION = 3;
 let defaultsCache = {
   default_steps: 8,
   default_solver: "heun",
-  default_dataset: "auto",
+  default_dataset: "aist",
   default_style_id: null,
   default_device: "",
   default_vae_checkpoint: "",
   configured_vae_checkpoint: "",
+  rigged_model_url: "./assets/smpl22_rigged_calibrated.glb",
 };
 
 function appendLog(text) {
@@ -291,7 +424,7 @@ function updateComparisonControls() {
   els.comparisonText.disabled = comparisonBusy || comparisonCaptionLoading;
   els.randomizeCaptionBtn.disabled =
     comparisonBusy || comparisonCaptionLoading || !currentComparisonSource;
-  els.openBlendBtn.disabled = comparisonBusy || !currentComparisonSource;
+  els.openBlendBtn.disabled = !currentComparisonSource;
   els.blendSpinner.style.display = comparisonBusy ? "inline-block" : "none";
   els.comparisonHeaderSpinner.style.display = comparisonBusy ? "inline-block" : "none";
 }
@@ -299,6 +432,23 @@ function updateComparisonControls() {
 function setComparisonBusy(busy) {
   comparisonBusy = busy;
   updateComparisonControls();
+}
+
+function setComparisonJobStage(message = "", state = "working") {
+  els.comparisonHeaderStatus.textContent = message;
+  els.comparisonHeaderStatus.dataset.state = message ? state : "";
+}
+
+function setBlendDownloadPending(pending) {
+  els.blendDownload.hidden = !pending;
+  els.blendDownload.removeAttribute("href");
+  if (pending) {
+    els.blendDownload.setAttribute("aria-disabled", "true");
+    els.blendDownload.setAttribute("tabindex", "-1");
+  } else {
+    els.blendDownload.removeAttribute("aria-disabled");
+    els.blendDownload.removeAttribute("tabindex");
+  }
 }
 
 async function loadRandomComparisonCaption(excludeCurrent = false) {
@@ -394,7 +544,10 @@ function resetComparisonExport() {
   els.openBlendBtn.disabled = true;
   els.blendDownload.hidden = true;
   els.blendDownload.removeAttribute("href");
+  els.blendDownload.removeAttribute("aria-disabled");
+  els.blendDownload.removeAttribute("tabindex");
   els.blendStatus.textContent = "Ready";
+  setComparisonJobStage();
   els.blendSampleMeta.textContent = "";
   els.comparisonText.value = "";
   els.comparisonText.placeholder = "Loading a description for this sample...";
@@ -437,6 +590,7 @@ function setComparisonSource(data) {
 
 function getFormState() {
   return {
+    version: FORM_STATE_VERSION,
     modelName: els.modelName.value,
     modelFilename: els.modelFilename.value,
     vaeCheckpoint: els.vaeCheckpoint.value,
@@ -452,6 +606,7 @@ function getFormState() {
     device: els.device.value,
     outName: els.outName.value,
     useEma: els.useEma.checked,
+    visualizationMode: currentVisualizationMode,
   };
 }
 
@@ -460,7 +615,11 @@ function applyFormState(state) {
   if (typeof state.modelName === "string") els.modelName.value = state.modelName;
   if (typeof state.modelFilename === "string") els.modelFilename.value = state.modelFilename;
   if (typeof state.vaeCheckpoint === "string") els.vaeCheckpoint.value = state.vaeCheckpoint;
-  if (typeof state.dataset === "string") els.dataset.value = state.dataset;
+  if (typeof state.dataset === "string") {
+    els.dataset.value = state.version === FORM_STATE_VERSION
+      ? state.dataset
+      : (state.dataset === "auto" ? "aist" : state.dataset);
+  }
   if (typeof state.samplePath === "string") els.samplePath.value = state.samplePath;
   if (typeof state.camera === "string") els.camera.value = state.camera;
   if (typeof state.conditionFrames === "string") els.conditionFrames.value = state.conditionFrames;
@@ -471,7 +630,14 @@ function applyFormState(state) {
   if (typeof state.start === "string") els.start.value = state.start;
   if (typeof state.device === "string") els.device.value = state.device;
   if (typeof state.outName === "string") els.outName.value = state.outName;
-  if (typeof state.useEma === "boolean") els.useEma.checked = state.useEma;
+  if (typeof state.useEma === "boolean") {
+    els.useEma.checked = state.version === FORM_STATE_VERSION ? state.useEma : true;
+  }
+  if (state.visualizationMode === "skeleton" || state.visualizationMode === "rigged") {
+    currentVisualizationMode = state.visualizationMode;
+    const input = els.visualizationModes.find((item) => item.value === state.visualizationMode);
+    if (input) input.checked = true;
+  }
 }
 
 function saveFormState() {
@@ -486,7 +652,9 @@ function loadFormState() {
   try {
     const raw = window.localStorage.getItem(FORM_STATE_KEY);
     if (!raw) return;
-    applyFormState(JSON.parse(raw));
+    const state = JSON.parse(raw);
+    applyFormState(state);
+    if (state.version !== FORM_STATE_VERSION) saveFormState();
   } catch (_err) {
     // Ignore malformed storage payloads.
   }
@@ -606,7 +774,7 @@ function applyReplicateCommand(cmd) {
     }
   }
   els.vaeCheckpoint.value = a["vae-checkpoint"] || "";
-  els.dataset.value = a.dataset || "auto";
+  els.dataset.value = a.dataset || "aist";
   els.samplePath.value = a["sample-path"] || "";
   els.camera.value = a.camera || "";
   els.conditionFrames.value = a["cond-frames"] || "";
@@ -623,22 +791,53 @@ function applyReplicateCommand(cmd) {
 async function initViewports() {
   try {
     const THREE = await import("three");
-    const { OrbitControls } = await import(
-      "https://unpkg.com/three@0.164.1/examples/jsm/controls/OrbitControls.js"
+    const [{ OrbitControls }, { GLTFLoader }, SkeletonUtils] = await Promise.all([
+      import("three/addons/controls/OrbitControls.js"),
+      import("three/addons/loaders/GLTFLoader.js"),
+      import("three/addons/utils/SkeletonUtils.js"),
+    ]);
+    let rigTemplate = null;
+    try {
+      const gltf = await new GLTFLoader().loadAsync(defaultsCache.rigged_model_url);
+      rigTemplate = gltf.scene;
+    } catch (err) {
+      if (els.riggedMode) els.riggedMode.disabled = true;
+      currentVisualizationMode = "skeleton";
+      els.visualizationModes.find((item) => item.value === "skeleton").checked = true;
+      appendLog(`Rigged model unavailable; using skeleton view: ${err}`);
+    }
+    const MotionViewport = buildMotionViewportClass(
+      THREE,
+      OrbitControls,
+      rigTemplate,
+      rigTemplate ? SkeletonUtils.clone : null
     );
-    const SkeletonViewport = buildSkeletonViewportClass(THREE, OrbitControls);
-    SkeletonViewportType = SkeletonViewport;
-    genView = new SkeletonViewport("genCanvas", 0x0f5f94, 0x264653);
-    condView = new SkeletonViewport("condCanvas", 0x2d7a64, 0x28594d);
-    appendLog("3D viewer ready.");
+    MotionViewportType = MotionViewport;
+    genView = new MotionViewport("genCanvas", 0x0f5f94, 0x264653);
+    condView = new MotionViewport("condCanvas", 0x2d7a64, 0x28594d);
+    setVisualizationMode(currentVisualizationMode, false);
+    appendLog(rigTemplate ? "3D viewer ready with skeleton and rigged models." : "3D skeleton viewer ready.");
   } catch (err) {
     genView = new NullViewport();
     condView = new NullViewport();
     mldView = new NullViewport();
     stickmotionView = new NullViewport();
-    SkeletonViewportType = null;
+    MotionViewportType = null;
     appendLog(`3D viewer disabled (failed to load three.js): ${err}`);
   }
+}
+
+function setVisualizationMode(mode, persist = true) {
+  currentVisualizationMode = mode === "rigged" && !els.riggedMode?.disabled
+    ? "rigged"
+    : "skeleton";
+  for (const input of els.visualizationModes) {
+    input.checked = input.value === currentVisualizationMode;
+  }
+  for (const viewport of [genView, condView, mldView, stickmotionView]) {
+    viewport.setVisualizationMode(currentVisualizationMode);
+  }
+  if (persist) saveFormState();
 }
 
 async function loadDefaults() {
@@ -654,7 +853,7 @@ async function loadDefaults() {
   els.vaeCheckpoint.value = data.default_vae_checkpoint || "";
   els.steps.value = data.default_steps || 8;
   els.solver.value = data.default_solver || "heun";
-  els.dataset.value = data.default_dataset || "auto";
+  els.dataset.value = data.default_dataset || "aist";
   if (Array.isArray(data.style_options) && els.styleId) {
     styleNameById = new Map([[0, "Unknown"]]);
     els.styleId.innerHTML = "";
@@ -685,7 +884,7 @@ async function loadDefaults() {
 }
 
 function resetArgsKeepCheckpoints() {
-  els.dataset.value = defaultsCache.default_dataset || "auto";
+  els.dataset.value = defaultsCache.default_dataset || "aist";
   els.samplePath.value = "";
   els.camera.value = "";
   els.conditionFrames.value = defaultsCache.default_condition_frames == null
@@ -698,7 +897,7 @@ function resetArgsKeepCheckpoints() {
   els.start.value = "";
   els.device.value = defaultsCache.default_device || "";
   els.outName.value = "result_smpl22.npy";
-  els.useEma.checked = false;
+  els.useEma.checked = true;
 
   currentReplicateCommand = "";
   els.replicateBtn.disabled = true;
@@ -932,9 +1131,11 @@ async function loadComparisonResults(resultsUrl) {
     throw new Error(comparisonErrorText(data, `Result request failed (${res.status})`));
   }
   els.baselinePanel.hidden = false;
-  if (SkeletonViewportType && mldView instanceof NullViewport) {
-    mldView = new SkeletonViewportType("mldCanvas", 0xe36b32, 0x9e3f1e);
-    stickmotionView = new SkeletonViewportType("stickmotionCanvas", 0x9a67b2, 0x633974);
+  if (MotionViewportType && mldView instanceof NullViewport) {
+    mldView = new MotionViewportType("mldCanvas", 0xe36b32, 0x9e3f1e);
+    stickmotionView = new MotionViewportType("stickmotionCanvas", 0x9a67b2, 0x633974);
+    mldView.setVisualizationMode(currentVisualizationMode);
+    stickmotionView.setVisualizationMode(currentVisualizationMode);
   }
   els.baselineSampleMeta.textContent = `${data.sample_id} | start ${data.clip_start}`;
   els.baselineCaption.textContent = data.mld_text === data.stickmotion_text
@@ -955,11 +1156,16 @@ async function pollComparisonJob(jobId, statusUrl) {
       throw new Error(comparisonErrorText(data, `Status request failed (${res.status})`));
     }
     if (activeComparisonJobId !== jobId) return;
-    els.blendStatus.textContent = data.stage || data.status || "Working";
+    const stage = data.stage || data.status || "Working";
+    els.blendStatus.textContent = stage;
+    setComparisonJobStage(stage);
     if (data.status === "complete") {
       setComparisonBusy(false);
+      setComparisonJobStage("Comparison ready", "complete");
       els.blendDownload.href = data.download_url;
       els.blendDownload.hidden = false;
+      els.blendDownload.removeAttribute("aria-disabled");
+      els.blendDownload.removeAttribute("tabindex");
       els.baselineBlendDownload.href = data.download_url;
       els.baselineBlendDownload.hidden = false;
       appendLog(`Comparison blend ready: ${data.download_url}`);
@@ -975,6 +1181,8 @@ async function pollComparisonJob(jobId, statusUrl) {
       setComparisonBusy(false);
       const message = data.error || "Comparison blend failed.";
       els.blendStatus.textContent = message;
+      setBlendDownloadPending(false);
+      setComparisonJobStage(`Comparison failed: ${message}`, "error");
       appendLog(`Comparison blend failed: ${message}`);
       if (data.log_url) appendLog(`build log: ${data.log_url}`);
       comparisonPollTimer = null;
@@ -987,6 +1195,7 @@ async function pollComparisonJob(jobId, statusUrl) {
   } catch (err) {
     if (activeComparisonJobId !== jobId) return;
     els.blendStatus.textContent = `Status check failed: ${err}`;
+    setComparisonJobStage("Status unavailable; retrying...", "error");
     comparisonPollTimer = window.setTimeout(
       () => pollComparisonJob(jobId, statusUrl),
       3000
@@ -1015,10 +1224,10 @@ async function onBuildBlend() {
     comparisonPollTimer = null;
   }
   activeComparisonJobId = null;
-  els.blendDownload.hidden = true;
-  els.blendDownload.removeAttribute("href");
+  setBlendDownloadPending(true);
   setComparisonBusy(true);
   els.blendStatus.textContent = "Submitting build";
+  setComparisonJobStage("Submitting comparison...");
   try {
     const res = await fetch("./api/comparison-jobs", {
       method: "POST",
@@ -1029,6 +1238,7 @@ async function onBuildBlend() {
         stickmotion_sketch_frames: frames,
         caption_index: currentComparisonCaption.index,
         caption_text: captionText,
+        visualization_mode: currentVisualizationMode,
       }),
     });
     const data = await res.json();
@@ -1037,13 +1247,16 @@ async function onBuildBlend() {
     }
     activeComparisonJobId = data.job_id;
     els.blendStatus.textContent = data.stage || "Queued";
+    setComparisonJobStage(data.stage || "Queued");
     appendLog(
       `Comparison blend queued: description ${currentComparisonCaption.index + 1}/${currentComparisonCaption.count}, sketches [${frames.join(", ")}], job ${data.job_id}`
     );
     pollComparisonJob(data.job_id, data.status_url);
   } catch (err) {
     setComparisonBusy(false);
+    setBlendDownloadPending(false);
     els.blendStatus.textContent = `Build failed: ${err}`;
+    setComparisonJobStage(`Comparison failed: ${err}`, "error");
     appendLog(`Comparison build request failed: ${err}`);
   }
 }
@@ -1199,6 +1412,11 @@ els.blendDialog.addEventListener("click", (ev) => {
   if (ev.target === els.blendDialog) els.blendDialog.close();
 });
 els.buildBlendBtn.addEventListener("click", onBuildBlend);
+els.visualizationModes.forEach((input) => {
+  input.addEventListener("change", () => {
+    if (input.checked) setVisualizationMode(input.value);
+  });
+});
 els.randomizeCaptionBtn.addEventListener("click", () => {
   loadRandomComparisonCaption(true);
 });

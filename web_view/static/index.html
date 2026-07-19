@@ -4,10 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>FlowMimic Web View</title>
+  <link rel="icon" href="./assets/favicon.ico" sizes="any" />
   <script type="importmap">
     {
       "imports": {
-        "three": "https://unpkg.com/three@0.164.1/build/three.module.js"
+        "three": "https://unpkg.com/three@0.164.1/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.164.1/examples/jsm/"
       }
     }
   </script>
@@ -31,24 +33,8 @@
           <input id="modelFilename" value="flow_round0_last.pt" placeholder="flow_round0_last.pt" />
         </label>
 
-        <label>VAE Checkpoint (optional)
-          <input id="vaeCheckpoint" placeholder="checkpoints/vae/.../motion_vae_best.pt" />
-        </label>
-
-        <label>Dataset
-          <select id="dataset">
-            <option value="auto">auto</option>
-            <option value="aist">aist</option>
-            <option value="mvh">mvh</option>
-          </select>
-        </label>
-
         <label>Sample Path (optional)
           <input id="samplePath" placeholder="AIST .pkl or MVH sequence dir" />
-        </label>
-
-        <label>Camera (optional)
-          <input id="camera" placeholder="01 / 22327091 ..." />
         </label>
 
         <label>Condition Frames
@@ -67,40 +53,62 @@
           <input id="steps" type="number" min="1" value="8" />
         </label>
 
-        <label>Solver
-          <select id="solver">
-            <option value="heun">heun</option>
-            <option value="euler">euler</option>
-          </select>
-        </label>
-
-        <label>Style ID
-          <select id="styleId">
-            <option value="">Default</option>
-          </select>
-        </label>
-
-        <label>Seed (optional)
-          <input id="seed" type="number" />
-        </label>
-
-        <label>Clip Start (optional)
-          <input id="start" type="number" min="0" />
-        </label>
-
         <label>Device (optional)
           <input id="device" placeholder="cpu / cuda:0" />
         </label>
 
-        <label>Output Name
-          <input id="outName" value="result_smpl22.npy" />
-        </label>
-
-        <label class="checkbox">
-          <input id="useEma" type="checkbox" />
-          use EMA
-        </label>
       </div>
+
+      <details class="advanced-options">
+        <summary>Advanced options</summary>
+        <div class="form-grid advanced-grid">
+          <label>VAE Checkpoint (optional)
+            <input id="vaeCheckpoint" placeholder="checkpoints/vae/.../motion_vae_best.pt" />
+          </label>
+
+          <label>Dataset
+            <select id="dataset">
+              <option value="aist" selected>AIST++</option>
+              <option value="auto">Auto detect</option>
+              <option value="mvh">MVHumanNet</option>
+            </select>
+          </label>
+
+          <label>Camera (optional)
+            <input id="camera" placeholder="01 / 22327091 ..." />
+          </label>
+
+          <label>Solver
+            <select id="solver">
+              <option value="heun">heun</option>
+              <option value="euler">euler</option>
+            </select>
+          </label>
+
+          <label>Style ID
+            <select id="styleId">
+              <option value="">Default</option>
+            </select>
+          </label>
+
+          <label>Seed (optional)
+            <input id="seed" type="number" />
+          </label>
+
+          <label>Clip Start (optional)
+            <input id="start" type="number" min="0" />
+          </label>
+
+          <label>Output Name
+            <input id="outName" value="result_smpl22.npy" />
+          </label>
+
+          <label class="checkbox">
+            <input id="useEma" type="checkbox" checked />
+            use EMA
+          </label>
+        </div>
+      </details>
 
       <div class="actions">
         <button id="loadLatestBtn" type="button" class="secondary-btn" disabled>Load Last</button>
@@ -115,17 +123,34 @@
       <div class="panel-heading">
         <h2>3D Motion</h2>
         <div class="panel-heading-action">
-          <span id="comparisonHeaderSpinner" class="spinner" aria-hidden="true"></span>
-          <button id="openBlendBtn" class="secondary-btn" type="button" disabled>Generate Comparison</button>
+          <fieldset class="view-mode-control" aria-label="Motion visualization">
+            <label>
+              <input type="radio" name="visualizationMode" value="skeleton" checked />
+              <span>Skeleton</span>
+            </label>
+            <label>
+              <input id="visualizationRigged" type="radio" name="visualizationMode" value="rigged" />
+              <span>Model</span>
+            </label>
+          </fieldset>
+          <div class="comparison-header-command">
+            <span id="comparisonHeaderSpinner" class="spinner" aria-hidden="true"></span>
+            <button id="openBlendBtn" class="secondary-btn" type="button" disabled>Generate Comparison</button>
+          </div>
         </div>
       </div>
       <div class="view-grid">
         <div class="view-card">
-          <h3 id="genTitle">Generated</h3>
+          <div class="view-card-heading">
+            <h3 id="genTitle">Generated</h3>
+          </div>
           <canvas id="genCanvas"></canvas>
         </div>
         <div class="view-card">
-          <h3 id="condTitle">Condition Reference</h3>
+          <div class="view-card-heading">
+            <h3 id="condTitle">Condition Reference</h3>
+            <div id="comparisonHeaderStatus" class="comparison-header-status" aria-live="polite"></div>
+          </div>
           <canvas id="condCanvas"></canvas>
         </div>
       </div>
@@ -232,6 +257,6 @@
     </div>
   </div>
 
-  <script type="module" src="./static/app.js?v=20260716-comparison-spinner"></script>
+  <script type="module" src="./static/app.js?v=20260718-comparison-compact-header"></script>
 </body>
 </html>

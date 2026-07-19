@@ -27,6 +27,19 @@ from flowmimic.src.config.config import load_config
 ROOT_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = WEB_DIR / "static"
+ASSET_DIR = WEB_DIR / "assets"
+RIGGED_MODEL_SOURCE_PATH = ASSET_DIR / "smpl22_rigged.glb"
+RIGGED_MODEL_CALIBRATED_PATH = ASSET_DIR / "smpl22_rigged_calibrated.glb"
+RIGGED_MODEL_PATH = Path(
+    os.environ.get(
+        "FLOWMIMIC_RIGGED_MODEL",
+        str(
+            RIGGED_MODEL_CALIBRATED_PATH
+            if RIGGED_MODEL_CALIBRATED_PATH.is_file()
+            else RIGGED_MODEL_SOURCE_PATH
+        ),
+    )
+).resolve()
 OUTPUT_ROOT = (ROOT_DIR / "output" / "flow").resolve()
 SAMPLE_SCRIPT = ROOT_DIR / "flowmimic" / "scripts" / "sample_flow.py"
 EXTRACT_SCRIPT = ROOT_DIR / "flowmimic" / "tools" / "extract_cond_media.py"
@@ -118,6 +131,7 @@ def _prefix(path: str) -> str:
 
 
 app.mount(_prefix("/static"), StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount(_prefix("/assets"), StaticFiles(directory=str(ASSET_DIR)), name="assets")
 app.mount(_prefix("/files"), StaticFiles(directory=str(OUTPUT_ROOT)), name="files")
 
 
@@ -134,12 +148,12 @@ class GenerateRequest(BaseModel):
     k2d_npy: str | None = None
     tau_cond_npy: str | None = None
     sample_path: str | None = None
-    dataset: Literal["auto", "aist", "mvh"] = "auto"
+    dataset: Literal["auto", "aist", "mvh"] = "aist"
     camera: str | None = None
     seed: int | None = None
     start: int | None = None
     out: str = "result_smpl22.npy"
-    use_ema: bool = False
+    use_ema: bool = True
     src_fps: int | None = None
     target_fps: int | None = None
     out_dir: str = "output/flow"
@@ -152,6 +166,7 @@ class ComparisonBlendRequest(BaseModel):
     stickmotion_sketch_frames: list[int]
     caption_index: int
     caption_text: str
+    visualization_mode: Literal["skeleton", "rigged"] = "skeleton"
 
 
 class ComparisonCaptionRequest(BaseModel):
@@ -293,11 +308,14 @@ def _comparison_command(
     sketch_frames: list[int],
     caption_index: int,
     caption_text: str,
+    visualization_mode: Literal["skeleton", "rigged"],
 ) -> tuple[list[str], dict]:
     if COMPARISON_BLENDER is None:
         raise ValueError(
             "Blender was not found in PATH. Install Blender or set FLOWMIMIC_BLENDER."
         )
+    if visualization_mode == "rigged" and not RIGGED_MODEL_PATH.is_file():
+        raise ValueError(f"Rigged SMPL22 model not found: {RIGGED_MODEL_PATH}")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if meta.get("dataset") != "aist":
         raise ValueError("Comparison blends require an AIST++ web generation")
@@ -371,7 +389,11 @@ def _comparison_command(
         "comparison.blend",
         "--blender",
         COMPARISON_BLENDER,
+        "--visualization-mode",
+        visualization_mode,
     ]
+    if visualization_mode == "rigged":
+        command.extend(["--rigged-model", str(RIGGED_MODEL_PATH)])
     if use_ema:
         command.append("--flow-use-ema")
     return command, {
@@ -385,6 +407,7 @@ def _comparison_command(
         "caption_text": caption_text,
         "stickmotion_sketch_frames": sketch_frames,
         "stickmotion_source_frames": [start + index for index in sketch_frames],
+        "visualization_mode": visualization_mode,
         "source_result": str(result_dir.relative_to(OUTPUT_ROOT)),
     }
 
@@ -397,6 +420,7 @@ def _run_comparison_job(
     sketch_frames: list[int],
     caption_index: int,
     caption_text: str,
+    visualization_mode: Literal["skeleton", "rigged"],
 ) -> None:
     job_dir = COMPARISON_JOB_ROOT / job_id
     bundle_dir = job_dir / "bundle"
@@ -411,6 +435,7 @@ def _run_comparison_job(
             sketch_frames,
             caption_index,
             caption_text,
+            visualization_mode,
         )
         status.update(
             {
@@ -736,12 +761,14 @@ def defaults() -> dict:
         "default_condition_frames": None,
         "default_steps": 8,
         "default_solver": "heun",
-        "default_dataset": "auto",
+        "default_dataset": "aist",
         "default_device": "",
         "default_style_id": None,
         "style_options": _build_style_options(),
         "output_root": str(OUTPUT_ROOT.relative_to(ROOT_DIR)),
         "last_meta_exists": (OUTPUT_ROOT / "last" / "result_meta.json").exists(),
+        "rigged_model_available": RIGGED_MODEL_PATH.is_file(),
+        "rigged_model_url": _prefix(f"/assets/{quote(RIGGED_MODEL_PATH.name)}"),
     }
 
 
@@ -830,6 +857,7 @@ def create_comparison_job(
             frames,
             req.caption_index,
             caption_text,
+            req.visualization_mode,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -849,6 +877,7 @@ def create_comparison_job(
         frames,
         req.caption_index,
         caption_text,
+        req.visualization_mode,
     )
     return _comparison_response(job_id, status)
 

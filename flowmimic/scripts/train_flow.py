@@ -24,6 +24,7 @@ from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.teacher import EMA, Teacher
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
+from flowmimic.src.model.vae.datasets.condition_sampling import CONDITION_PATTERNS
 from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
 from flowmimic.src.model.vae.backend import (
     decode_motion_latent,
@@ -41,7 +42,10 @@ from flowmimic.src.data.openpose import (
     load_mvh_openpose,
 )
 from flowmimic.src.metrics import T2MMotionFeatureExtractor
-from flowmimic.src.training.flow_curriculum import UnifiedRound0Curriculum
+from flowmimic.src.training.flow_curriculum import (
+    SparsePatternPhase1Curriculum,
+    UnifiedRound0Curriculum,
+)
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
 
@@ -271,7 +275,13 @@ def main():
     )
     parser.add_argument(
         "--curriculum",
-        choices=("unified_round0",),
+        choices=(
+            "unified_round0",
+            "sparse_pattern_phase1",
+            "sparse_pattern_phase1_control",
+            "sparse_pattern_phase1a_target",
+            "sparse_pattern_phase1a_control",
+        ),
         default=None,
         help="Use a named update-based training curriculum from config.json.",
     )
@@ -380,6 +390,23 @@ def main():
         default=None,
         help="Fixed condition count for periodic evaluation.",
     )
+    parser.add_argument(
+        "--eval-cond-pattern",
+        choices=CONDITION_PATTERNS,
+        default=flow_eval_cfg.get("cond_pattern", "even"),
+        help="Timestamp pattern used by periodic AIST evaluation.",
+    )
+    parser.add_argument(
+        "--eval-cond-pattern-seed",
+        type=int,
+        default=int(flow_eval_cfg.get("cond_pattern_seed", 42)),
+    )
+    parser.add_argument(
+        "--eval-condition-manifest",
+        type=str,
+        default=None,
+        help="Optional fixed eval clip/condition manifest passed to eval_flow.py.",
+    )
     parser.add_argument("--eval-no-dist", action="store_true")
     parser.add_argument(
         "--async-cpu-eval",
@@ -406,9 +433,43 @@ def main():
         args.cond_frame_choices = list(
             initial_curriculum_state.condition_choices
         )
-        args.cond_frame_choice_probs = list(
-            initial_curriculum_state.condition_probs
+        # The dataset emits dense condition tensors; the update curriculum
+        # selects both K and timestamp pattern after batching.
+        dense_count = max(initial_curriculum_state.condition_choices)
+        args.cond_frame_choice_probs = [
+            1.0 if value == dense_count else 0.0
+            for value in initial_curriculum_state.condition_choices
+        ]
+        args.cond_frames_min = min(initial_curriculum_state.condition_choices)
+        args.cond_frames_max = max(initial_curriculum_state.condition_choices)
+        args.lr = curriculum.lr_peak
+        args.lr_decay_epoch = 999999
+    elif args.curriculum in (
+        "sparse_pattern_phase1",
+        "sparse_pattern_phase1_control",
+        "sparse_pattern_phase1a_target",
+        "sparse_pattern_phase1a_control",
+    ):
+        curriculum_config = (
+            config.get("flow", {}).get("curriculum", {}).get(args.curriculum)
         )
+        if not curriculum_config:
+            raise ValueError(f"Missing flow.curriculum.{args.curriculum} config")
+        curriculum = SparsePatternPhase1Curriculum(
+            curriculum_config,
+            max_updates=args.max_updates,
+        )
+        initial_curriculum_state = curriculum.state(
+            curriculum.source_updates
+        )
+        args.cond_frame_choices = list(
+            initial_curriculum_state.condition_choices
+        )
+        dense_count = max(initial_curriculum_state.condition_choices)
+        args.cond_frame_choice_probs = [
+            1.0 if value == dense_count else 0.0
+            for value in initial_curriculum_state.condition_choices
+        ]
         args.cond_frames_min = min(initial_curriculum_state.condition_choices)
         args.cond_frames_max = max(initial_curriculum_state.condition_choices)
         args.lr = curriculum.lr_peak
@@ -491,6 +552,10 @@ def main():
                     "vae_type": args.vae_type,
                     "eval_steps": args.eval_steps,
                     "eval_guidance_scale": args.eval_guidance_scale,
+                    "eval_cond_frames": args.eval_cond_frames,
+                    "eval_cond_pattern": args.eval_cond_pattern,
+                    "eval_cond_pattern_seed": args.eval_cond_pattern_seed,
+                    "eval_condition_manifest": args.eval_condition_manifest,
                     "cond_lr_scale": args.cond_lr_scale,
                     "reflow_round": args.reflow_round,
                     "teacher_mode": args.teacher_mode,
@@ -840,6 +905,24 @@ def main():
         start_epoch = int(resume_state.get("epoch", 0))
         optimizer_updates = int(resume_state.get("optimizer_updates", 0))
         last_eval_update = int(resume_state.get("last_eval_update", 0))
+        source_curriculum = (
+            resume_state.get("metadata", {}).get("curriculum") or {}
+        ).get("name")
+        if (
+            curriculum is not None
+            and source_curriculum
+            and source_curriculum != args.curriculum
+        ):
+            last_eval_update = optimizer_updates
+            if is_main:
+                print(
+                    "Starting new curriculum {} from {} at update {}; "
+                    "reset evaluation schedule position".format(
+                        args.curriculum,
+                        source_curriculum,
+                        optimizer_updates,
+                    )
+                )
         lr_halved = bool(resume_state.get("lr_halved", start_epoch >= lr_decay_epoch))
         if curriculum is not None:
             resume_lr = curriculum.state(optimizer_updates).learning_rate
@@ -1116,7 +1199,7 @@ def main():
         if is_main and curriculum_epoch_state is not None:
             print(
                 "Epoch {} curriculum={} updates={} lr={:.6g} cond_weight={:.4f} "
-                "condition_probs={}".format(
+                "condition_probs={} pattern_probs={} joint_quotas={}".format(
                     epoch_num,
                     curriculum_epoch_state.phase,
                     optimizer_updates,
@@ -1126,6 +1209,17 @@ def main():
                         f"{value:.4f}"
                         for value in curriculum_epoch_state.condition_probs
                     ),
+                    ",".join(
+                        f"{value:.4f}"
+                        for value in curriculum_epoch_state.condition_pattern_probs
+                    ),
+                    ",".join(
+                        f"{pattern}:k{count}:{fraction:.4f}"
+                        for pattern, count, fraction in (
+                            curriculum_epoch_state.condition_joint_quotas
+                        )
+                    )
+                    or "none",
                 )
             )
         w_cond_epoch = (
@@ -1281,6 +1375,9 @@ def main():
                             mask_cond,
                             curriculum_step_state.condition_choices,
                             curriculum_step_state.condition_probs,
+                            curriculum_step_state.condition_pattern_choices,
+                            curriculum_step_state.condition_pattern_probs,
+                            curriculum_step_state.condition_joint_quotas,
                         )
                     if not torch.isfinite(k2d_batch).all():
                         if args.debug:
@@ -1840,6 +1937,19 @@ def main():
                         curriculum_end_state.condition_probs,
                     ):
                         wandb_metrics[f"schedule/condition_k{choice}"] = probability
+                    for pattern, probability in zip(
+                        curriculum_end_state.condition_pattern_choices,
+                        curriculum_end_state.condition_pattern_probs,
+                    ):
+                        wandb_metrics[
+                            f"schedule/condition_pattern_{pattern}"
+                        ] = probability
+                    for pattern, count, fraction in (
+                        curriculum_end_state.condition_joint_quotas
+                    ):
+                        wandb_metrics[
+                            f"schedule/joint_quota_{pattern}_k{count}"
+                        ] = fraction
                 wandb_run.log(
                     wandb_metrics,
                     step=epoch + 1,
@@ -2124,6 +2234,10 @@ def _make_checkpoint_metadata(
             "aist_cameras": args.eval_aist_cameras,
             "aist_crop_mode": args.eval_aist_crop_mode,
             "replications": args.eval_replications,
+            "cond_frames": int(eval_cond_frames),
+            "cond_pattern": args.eval_cond_pattern,
+            "cond_pattern_seed": args.eval_cond_pattern_seed,
+            "condition_manifest": args.eval_condition_manifest,
             "t2m_motion_encoder_ckpt": config.get("t2m_motion_encoder_ckpt"),
             "t2m_eval_mean_path": config.get("t2m_eval_mean_path"),
             "t2m_eval_std_path": config.get("t2m_eval_std_path"),
@@ -2241,7 +2355,16 @@ def _launch_async_cpu_eval(
     log_dir = args.async_eval_log_dir or os.path.join(args.checkpoint_dir, "async_eval")
     os.makedirs(log_dir, exist_ok=True)
     steps_tag = str(args.eval_steps).replace(",", "-")
-    base = f"epoch{epoch:04d}_steps{steps_tag}_rep{args.eval_replications}"
+    cond_frames = int(
+        args.eval_cond_frames
+        or args.cond_frames_min
+        or config.get("flow", {}).get("cond_frames_min", 7)
+    )
+    pattern_tag = str(args.eval_cond_pattern).replace("_", "-")
+    base = (
+        f"epoch{epoch:04d}_{pattern_tag}_k{cond_frames}_"
+        f"steps{steps_tag}_rep{args.eval_replications}"
+    )
     json_path = os.path.join(log_dir, f"{base}.json")
     csv_path = os.path.join(log_dir, f"{base}.csv")
     plot_path = os.path.join(log_dir, f"{base}.png")
@@ -2270,11 +2393,11 @@ def _launch_async_cpu_eval(
         "--aist-cameras",
         args.eval_aist_cameras,
         "--cond-frames",
-        str(
-            args.eval_cond_frames
-            or args.cond_frames_min
-            or config.get("flow", {}).get("cond_frames_min", 7)
-        ),
+        str(cond_frames),
+        "--cond-pattern",
+        args.eval_cond_pattern,
+        "--cond-pattern-seed",
+        str(args.eval_cond_pattern_seed),
         "--guidance-scale",
         str(args.eval_guidance_scale),
         "--steps",
@@ -2292,6 +2415,8 @@ def _launch_async_cpu_eval(
         "--save-plot",
         plot_path,
     ]
+    if args.eval_condition_manifest:
+        cmd.extend(["--condition-manifest", args.eval_condition_manifest])
     if args.eval_use_ema:
         cmd.append("--use-ema")
     else:
@@ -2698,8 +2823,11 @@ def _apply_condition_count_schedule(
     mask_cond,
     condition_choices,
     condition_probs,
+    condition_pattern_choices=("even",),
+    condition_pattern_probs=(1.0,),
+    condition_joint_quotas=(),
 ):
-    """Apply an update-specific K mixture to a padded dense condition batch."""
+    """Apply update-specific K and timestamp-pattern mixtures."""
     if k2d.ndim < 2 or mask_cond.ndim != 2:
         raise ValueError("Expected batched condition tensors")
     batch_size, frame_budget = mask_cond.shape
@@ -2707,24 +2835,127 @@ def _apply_condition_count_schedule(
     probs = probs / probs.sum()
     sampled = torch.multinomial(probs, batch_size, replacement=True)
     counts = torch.as_tensor(condition_choices, device=k2d.device)[sampled]
+    pattern_probs = torch.as_tensor(
+        condition_pattern_probs,
+        device=k2d.device,
+        dtype=torch.float32,
+    )
+    pattern_probs = pattern_probs / pattern_probs.sum()
+    pattern_ids = torch.multinomial(
+        pattern_probs,
+        batch_size,
+        replacement=True,
+    )
+    if condition_joint_quotas:
+        quota_total = sum(float(item[2]) for item in condition_joint_quotas)
+        if quota_total > 1.0 + 1e-8:
+            raise ValueError("Joint condition quotas cannot sum above one")
+        permutation = torch.randperm(batch_size, device=k2d.device)
+        cursor = 0
+        for pattern, count, fraction in condition_joint_quotas:
+            quota_size = int(round(batch_size * float(fraction)))
+            rows = permutation[cursor : cursor + quota_size]
+            cursor += quota_size
+            if rows.numel() == 0:
+                continue
+            try:
+                pattern_id = condition_pattern_choices.index(pattern)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Joint-quota pattern is not scheduled: {pattern}"
+                ) from exc
+            counts[rows] = int(count)
+            pattern_ids[rows] = pattern_id
     keep = torch.zeros_like(mask_cond, dtype=torch.bool)
-    for count in torch.unique(counts).tolist():
-        rows = torch.nonzero(counts == count, as_tuple=False).flatten()
-        if rows.numel() == 0:
-            continue
-        count = max(1, min(int(count), frame_budget))
-        indices = torch.linspace(
-            0,
-            frame_budget - 1,
-            steps=count,
-            device=k2d.device,
-        ).round().long().unique()
-        keep[rows[:, None], indices[None, :]] = True
+    positions = torch.arange(frame_budget, device=k2d.device).unsqueeze(0)
+    for pattern_id, pattern in enumerate(condition_pattern_choices):
+        if pattern not in ("even", "random", "boundary_gap"):
+            raise ValueError(f"Unsupported condition pattern: {pattern}")
+        for count_value in torch.unique(counts).tolist():
+            rows = torch.nonzero(
+                (counts == count_value) & (pattern_ids == pattern_id),
+                as_tuple=False,
+            ).flatten()
+            if rows.numel() == 0:
+                continue
+            count = max(1, min(int(count_value), frame_budget))
+            if count == frame_budget:
+                keep[rows] = True
+            elif pattern == "even":
+                indices = torch.linspace(
+                    0,
+                    frame_budget - 1,
+                    steps=count,
+                    device=k2d.device,
+                ).round().long().unique()
+                keep[rows[:, None], indices[None, :]] = True
+            elif pattern == "random":
+                scores = torch.rand(
+                    rows.numel(), frame_budget, device=k2d.device
+                )
+                indices = scores.topk(count, dim=1, largest=False).indices
+                keep[rows[:, None], indices] = True
+            else:
+                _apply_boundary_gap_keep_mask(
+                    keep,
+                    rows,
+                    count,
+                    positions,
+                    frame_budget,
+                )
     mask_cond = mask_cond.bool() & keep
     k2d = k2d * mask_cond[..., None, None].to(k2d.dtype)
     vis = vis * mask_cond[..., None].to(vis.dtype)
     conf = conf * mask_cond[..., None].to(conf.dtype)
     return k2d, vis, conf, mask_cond
+
+
+def _apply_boundary_gap_keep_mask(
+    keep,
+    rows,
+    count,
+    positions,
+    frame_budget,
+):
+    if count <= 1:
+        keep[rows, 0] = True
+        return
+    available_gap = frame_budget - count
+    preferred_min = max(1, int(round(0.25 * frame_budget)))
+    preferred_max = max(preferred_min, int(round(0.50 * frame_budget)))
+    gap_max = min(available_gap, preferred_max, max(1, frame_budget - 2))
+    gap_min = min(preferred_min, gap_max)
+    if gap_max > gap_min:
+        gap_len = torch.randint(
+            gap_min,
+            gap_max + 1,
+            (rows.numel(), 1),
+            device=keep.device,
+        )
+    else:
+        gap_len = torch.full(
+            (rows.numel(), 1),
+            gap_min,
+            device=keep.device,
+            dtype=torch.long,
+        )
+    start_span = frame_budget - gap_len - 1
+    gap_start = (
+        torch.floor(torch.rand_like(gap_len, dtype=torch.float32) * start_span)
+        .long()
+        .add_(1)
+    )
+    gap_end = gap_start + gap_len
+    forbidden = (positions >= gap_start) & (positions < gap_end)
+    scores = torch.rand(rows.numel(), frame_budget, device=keep.device)
+    scores.masked_fill_(forbidden, float("inf"))
+    scores[:, 0] = float("inf")
+    scores[:, -1] = float("inf")
+    if count > 2:
+        interior = scores.topk(count - 2, dim=1, largest=False).indices
+        keep[rows[:, None], interior] = True
+    keep[rows, 0] = True
+    keep[rows, frame_budget - 1] = True
 
 
 def _pick_solver_steps(epoch, early, mid, late, mid_epoch, late_epoch):

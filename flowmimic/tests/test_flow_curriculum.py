@@ -1,6 +1,9 @@
 import unittest
 
-from flowmimic.src.training.flow_curriculum import UnifiedRound0Curriculum
+from flowmimic.src.training.flow_curriculum import (
+    SparsePatternPhase1Curriculum,
+    UnifiedRound0Curriculum,
+)
 
 
 CONFIG = {
@@ -23,6 +26,24 @@ CONFIG = {
     "final_probs": [0.30, 0.15, 0.20, 0.15, 0.12, 0.08],
     "solver_steps_dense": [16],
     "solver_steps_sparse": [8, 16],
+}
+
+PHASE1_CONFIG = {
+    "name": "sparse_pattern_phase1",
+    "source_optimizer_updates": 1000,
+    "reference_updates_per_epoch": 10,
+    "pattern_ramp_updates": 100,
+    "relative_max_updates": 300,
+    "relative_optional_max_updates": 400,
+    "eval_every_updates": 50,
+    "learning_rate": 5e-5,
+    "condition_weight_scale": 1.0,
+    "condition_choices": [196, 98, 49, 28, 14, 7],
+    "condition_probs": [0.30, 0.15, 0.20, 0.15, 0.12, 0.08],
+    "condition_pattern_choices": ["even", "random", "boundary_gap"],
+    "pattern_start_probs": [1.0, 0.0, 0.0],
+    "pattern_final_probs": [0.50, 0.30, 0.20],
+    "solver_steps": [8, 16],
 }
 
 
@@ -58,6 +79,58 @@ class UnifiedRound0CurriculumTest(unittest.TestCase):
         for actual, expected in zip(final.condition_probs, CONFIG["final_probs"]):
             self.assertAlmostEqual(actual, expected)
         self.assertAlmostEqual(sum(final.condition_probs), 1.0)
+
+
+class SparsePatternPhase1CurriculumTest(unittest.TestCase):
+    def setUp(self):
+        self.curriculum = SparsePatternPhase1Curriculum(PHASE1_CONFIG)
+
+    def test_absolute_update_bounds(self):
+        self.assertEqual(self.curriculum.max_updates, 1300)
+        self.assertEqual(self.curriculum.optional_max_updates, 1400)
+
+    def test_pattern_ramp_is_relative_to_source_checkpoint(self):
+        start = self.curriculum.state(1000)
+        self.assertEqual(start.phase, "pattern_ramp")
+        self.assertEqual(start.condition_pattern_probs, (1.0, 0.0, 0.0))
+
+        midpoint = self.curriculum.state(1050)
+        for actual, expected in zip(
+            midpoint.condition_pattern_probs,
+            (0.75, 0.15, 0.10),
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+        final = self.curriculum.state(1100)
+        self.assertEqual(final.phase, "pattern_hold")
+        for actual, expected in zip(
+            final.condition_pattern_probs,
+            (0.50, 0.30, 0.20),
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_phase1_keeps_density_lr_and_regularization_fixed(self):
+        state = self.curriculum.state(1250)
+        for actual, expected in zip(
+            state.condition_probs,
+            PHASE1_CONFIG["condition_probs"],
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(state.learning_rate, 5e-5)
+        self.assertEqual(state.condition_weight_scale, 1.0)
+        self.assertEqual(state.solver_steps, (8, 16))
+
+    def test_joint_condition_quotas_are_exposed_in_state(self):
+        config = dict(PHASE1_CONFIG)
+        config["condition_joint_quotas"] = [
+            {"pattern": "boundary_gap", "count": 7, "fraction": 0.10},
+            {"pattern": "boundary_gap", "count": 14, "fraction": 0.05},
+        ]
+        state = SparsePatternPhase1Curriculum(config).state(1250)
+        self.assertEqual(
+            state.condition_joint_quotas,
+            (("boundary_gap", 7, 0.10), ("boundary_gap", 14, 0.05)),
+        )
 
 
 if __name__ == "__main__":

@@ -26,7 +26,10 @@ class UnifiedRound0State:
     condition_weight_scale: float
     condition_choices: tuple
     condition_probs: tuple
+    condition_pattern_choices: tuple
+    condition_pattern_probs: tuple
     solver_steps: tuple
+    condition_joint_quotas: tuple = ()
 
 
 class UnifiedRound0Curriculum:
@@ -160,12 +163,135 @@ class UnifiedRound0Curriculum:
             condition_weight_scale=float(condition_weight_scale),
             condition_choices=self.condition_choices,
             condition_probs=tuple(float(value) for value in probs),
+            condition_pattern_choices=("even",),
+            condition_pattern_probs=(1.0,),
             solver_steps=solver_steps,
         )
 
     def metadata(self):
         return {
             "name": "unified_round0",
+            "max_updates": self.max_updates,
+            "optional_max_updates": self.optional_max_updates,
+            "reference_updates_per_epoch": self.reference_updates_per_epoch,
+            "eval_every_updates": self.eval_every_updates,
+            "config": dict(self.config),
+        }
+
+
+class SparsePatternPhase1Curriculum:
+    """Update-based sparse-pattern fine-tuning after unified Round 0."""
+
+    def __init__(self, config, max_updates=None):
+        self.config = dict(config)
+        self.source_updates = int(self.config["source_optimizer_updates"])
+        self.reference_updates_per_epoch = int(
+            self.config["reference_updates_per_epoch"]
+        )
+        self.pattern_ramp_updates = int(self.config["pattern_ramp_updates"])
+        self.relative_max_updates = int(self.config["relative_max_updates"])
+        self.relative_optional_max_updates = int(
+            self.config.get("relative_optional_max_updates", self.relative_max_updates)
+        )
+        self.max_updates = int(
+            max_updates
+            if max_updates is not None
+            else self.source_updates + self.relative_max_updates
+        )
+        self.optional_max_updates = self.source_updates + self.relative_optional_max_updates
+        self.eval_every_updates = int(self.config["eval_every_updates"])
+        self.lr_peak = float(self.config["learning_rate"])
+        self.condition_weight_scale = float(
+            self.config.get("condition_weight_scale", 1.0)
+        )
+        self.condition_choices = tuple(
+            int(value) for value in self.config["condition_choices"]
+        )
+        self.condition_probs = self._probabilities("condition_probs")
+        self.condition_pattern_choices = tuple(
+            str(value) for value in self.config["condition_pattern_choices"]
+        )
+        self.pattern_start_probs = self._probabilities("pattern_start_probs")
+        self.pattern_final_probs = self._probabilities("pattern_final_probs")
+        self.condition_joint_quotas = tuple(
+            (
+                str(item["pattern"]),
+                int(item["count"]),
+                float(item["fraction"]),
+            )
+            for item in self.config.get("condition_joint_quotas", [])
+        )
+        self.solver_steps = tuple(
+            int(value) for value in self.config.get("solver_steps", [8, 16])
+        )
+        self._validate()
+
+    def _probabilities(self, key):
+        values = tuple(float(value) for value in self.config[key])
+        total = sum(values)
+        if total <= 0.0:
+            raise ValueError(f"{key} must have a positive sum")
+        return tuple(value / total for value in values)
+
+    def _validate(self):
+        if self.source_updates < 0 or self.reference_updates_per_epoch <= 0:
+            raise ValueError("Invalid Phase 1 source/reference updates")
+        if not (0 < self.pattern_ramp_updates <= self.relative_max_updates):
+            raise ValueError("Invalid Phase 1 pattern-ramp duration")
+        if self.max_updates <= self.source_updates:
+            raise ValueError("Phase 1 max_updates must exceed source updates")
+        if self.eval_every_updates <= 0 or not self.solver_steps:
+            raise ValueError("Invalid Phase 1 eval or solver schedule")
+        if len(self.condition_probs) != len(self.condition_choices):
+            raise ValueError("Condition choices/probabilities must match")
+        expected_patterns = len(self.condition_pattern_choices)
+        if len(self.pattern_start_probs) != expected_patterns:
+            raise ValueError("Pattern start probabilities must match choices")
+        if len(self.pattern_final_probs) != expected_patterns:
+            raise ValueError("Pattern final probabilities must match choices")
+        quota_total = 0.0
+        for pattern, count, fraction in self.condition_joint_quotas:
+            if pattern not in self.condition_pattern_choices:
+                raise ValueError(f"Unknown joint-quota pattern: {pattern}")
+            if count not in self.condition_choices:
+                raise ValueError(f"Unknown joint-quota condition count: {count}")
+            if fraction < 0.0:
+                raise ValueError("Joint-quota fractions cannot be negative")
+            quota_total += fraction
+        if quota_total > 1.0 + 1e-8:
+            raise ValueError("Joint-quota fractions cannot sum above one")
+
+    def state(self, completed_updates):
+        updates = max(0, int(completed_updates))
+        relative_updates = max(0, updates - self.source_updates)
+        if relative_updates < self.pattern_ramp_updates:
+            phase = "pattern_ramp"
+            fraction = relative_updates / max(self.pattern_ramp_updates, 1)
+            pattern_probs = _interpolate_probs(
+                self.pattern_start_probs,
+                self.pattern_final_probs,
+                fraction,
+            )
+        else:
+            phase = "pattern_hold"
+            pattern_probs = self.pattern_final_probs
+        return UnifiedRound0State(
+            completed_updates=updates,
+            phase=phase,
+            learning_rate=self.lr_peak,
+            condition_weight_scale=self.condition_weight_scale,
+            condition_choices=self.condition_choices,
+            condition_probs=self.condition_probs,
+            condition_pattern_choices=self.condition_pattern_choices,
+            condition_pattern_probs=tuple(float(value) for value in pattern_probs),
+            solver_steps=self.solver_steps,
+            condition_joint_quotas=self.condition_joint_quotas,
+        )
+
+    def metadata(self):
+        return {
+            "name": self.config.get("name", "sparse_pattern_phase1"),
+            "source_optimizer_updates": self.source_updates,
             "max_updates": self.max_updates,
             "optional_max_updates": self.optional_max_updates,
             "reference_updates_per_epoch": self.reference_updates_per_epoch,

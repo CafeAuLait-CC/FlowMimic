@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -35,6 +36,11 @@ from flowmimic.src.model.vae.backend import decode_motion_latent, load_vae_backe
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
 from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
+from flowmimic.src.model.vae.datasets.condition_sampling import (
+    CONDITION_PATTERNS,
+    condition_sample_key,
+    deterministic_condition_indices,
+)
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 from flowmimic.src.motion.process_motion import ik263_to_smpl22
 from flowmimic.src.motion.ik.utils.paramUtil import t2m_kinematic_chain
@@ -82,6 +88,91 @@ def _aist_paths_for_splits(cfg, split_names):
 
 def _parse_csv(value):
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _build_aist_condition_manifest(
+    paths,
+    cameras,
+    seq_len,
+    cond_frames,
+    pattern,
+    seed,
+):
+    entries = {}
+    for path in paths:
+        for camera in cameras:
+            key = condition_sample_key(path, camera, 0, seq_len)
+            entries[key] = deterministic_condition_indices(
+                seq_len,
+                cond_frames,
+                pattern,
+                seed,
+                key,
+            ).tolist()
+    return {
+        "protocol": {
+            "dataset": "AIST",
+            "seq_len": int(seq_len),
+            "cond_frames": int(cond_frames),
+            "cond_pattern": pattern,
+            "cond_pattern_seed": int(seed),
+            "crop_mode": "first",
+            "cameras": list(cameras),
+        },
+        "entries": entries,
+    }
+
+
+def _load_condition_manifest(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest.get("entries"), dict):
+        raise ValueError(f"Condition manifest has no entries mapping: {path}")
+    return manifest
+
+
+def _validate_condition_manifest(
+    manifest,
+    seq_len,
+    cond_frames,
+    pattern,
+    seed,
+    cameras,
+):
+    protocol = manifest.get("protocol", {})
+    expected = {
+        "dataset": "AIST",
+        "seq_len": int(seq_len),
+        "cond_frames": int(cond_frames),
+        "cond_pattern": pattern,
+        "cond_pattern_seed": int(seed),
+        "crop_mode": "first",
+        "cameras": list(cameras),
+    }
+    mismatches = {
+        key: (protocol.get(key), value)
+        for key, value in expected.items()
+        if protocol.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"Condition manifest protocol mismatch: {mismatches}")
+
+
+def _write_condition_manifest(path, manifest):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _set_eval_seed(seed, device):
@@ -817,6 +908,7 @@ def evaluate_dataset(
         conf_np = conf_batch.cpu().numpy()
         tau_np = tau_cond.cpu().numpy()
         mask_np = mask_cond.cpu().numpy()
+        batch_records = []
         for i in range(batch_size):
             valid_mask = mask_np[i].astype(bool)
             k2d_i = k2d_np[i][valid_mask]
@@ -834,6 +926,7 @@ def evaluate_dataset(
                 computed,
             )
             if err is None:
+                batch_records.append(None)
                 continue
             skate = _foot_skate(joints[i], contact_logits[i], cfg.fps)
             bone = _bone_var(joints[i], edges)
@@ -866,6 +959,7 @@ def evaluate_dataset(
                 / max(smooth_ref["jerk_p90"], 1e-8),
             }
             results.append(record)
+            batch_records.append(record)
 
         if compute_dist and metric_extractor is not None:
             lengths = _infer_motion_lengths(batch, batch_size, cfg.seq_len, device)
@@ -885,6 +979,7 @@ def evaluate_dataset(
             )
             if multimodality_repeats > 1:
                 mm_batch = [feats_gen_list[-1]]
+                mm_joints = [np.asarray(joints)]
                 for _ in range(multimodality_repeats - 1):
                     (
                         x_hat_mm_norm_np,
@@ -929,7 +1024,42 @@ def evaluate_dataset(
                             device,
                         )
                     )
+                    mm_joints.append(np.asarray(_joints_mm))
                 feats_mm.append(np.stack(mm_batch, axis=1))
+                joints_by_repeat = np.stack(mm_joints, axis=1)
+                pair_left, pair_right = np.triu_indices(
+                    multimodality_repeats, k=1
+                )
+                pair_distance = np.linalg.norm(
+                    joints_by_repeat[:, pair_left]
+                    - joints_by_repeat[:, pair_right],
+                    axis=-1,
+                )
+                root_pair_distance = pair_distance[..., 0]
+                for sample_idx, record in enumerate(batch_records):
+                    if record is None:
+                        continue
+                    observed = np.zeros((cfg.seq_len,), dtype=bool)
+                    valid = mask_np[sample_idx].astype(bool)
+                    observed_idx = np.clip(
+                        np.round(tau_np[sample_idx][valid] * (cfg.seq_len - 1)).astype(int),
+                        0,
+                        cfg.seq_len - 1,
+                    )
+                    observed[observed_idx] = True
+                    unobserved = ~observed
+                    record["repeat_joint_l2_observed"] = float(
+                        pair_distance[sample_idx, :, observed].mean()
+                    )
+                    record["repeat_joint_l2_unobserved"] = float(
+                        pair_distance[sample_idx, :, unobserved].mean()
+                    )
+                    record["repeat_root_l2_observed"] = float(
+                        root_pair_distance[sample_idx, :, observed].mean()
+                    )
+                    record["repeat_root_l2_unobserved"] = float(
+                        root_pair_distance[sample_idx, :, unobserved].mean()
+                    )
 
         seen += batch_size
 
@@ -1001,6 +1131,18 @@ def main():
         "--cond-frames", type=int, default=flow_eval_cfg.get("cond_frames")
     )
     parser.add_argument(
+        "--cond-pattern",
+        choices=CONDITION_PATTERNS,
+        default=flow_eval_cfg.get("cond_pattern", "even"),
+    )
+    parser.add_argument(
+        "--cond-pattern-seed",
+        type=int,
+        default=flow_eval_cfg.get("cond_pattern_seed", 42),
+    )
+    parser.add_argument("--condition-manifest", type=str, default=None)
+    parser.add_argument("--save-condition-manifest", type=str, default=None)
+    parser.add_argument(
         "--guidance-scale",
         type=float,
         default=flow_eval_cfg.get("guidance_scale", 1.0),
@@ -1026,6 +1168,8 @@ def main():
     parser.add_argument(
         "--replications", type=int, default=flow_eval_cfg.get("replications", 1)
     )
+    parser.add_argument("--multimodality-repeats", type=int, default=None)
+    parser.add_argument("--multimodality-times", type=int, default=None)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-csv", type=str, default=None)
     parser.add_argument("--save-plot", type=str, default=None)
@@ -1038,9 +1182,22 @@ def main():
     eval_slack_seconds = float(flow_eval_cfg.get("slack_seconds", 0.1))
     eval_diversity_times = int(flow_eval_cfg.get("diversity_times", 300))
     eval_multimodality_repeats = int(
-        flow_eval_cfg.get("multimodality_repeats", 1)
+        args.multimodality_repeats
+        if args.multimodality_repeats is not None
+        else flow_eval_cfg.get("multimodality_repeats", 1)
     )
-    eval_multimodality_times = int(flow_eval_cfg.get("multimodality_times", 20))
+    eval_multimodality_times = int(
+        args.multimodality_times
+        if args.multimodality_times is not None
+        else flow_eval_cfg.get("multimodality_times", 20)
+    )
+    if (
+        eval_multimodality_repeats > 1
+        and eval_multimodality_times >= eval_multimodality_repeats
+    ):
+        raise ValueError(
+            "multimodality_times must be smaller than multimodality_repeats"
+        )
     eval_save_per_sample = bool(flow_eval_cfg.get("save_per_sample", False))
 
     print(f"Loading flow checkpoint metadata: {args.flow_ckpt}")
@@ -1173,12 +1330,70 @@ def main():
     mvh_dirs = _read_lines(cfg["mvh_split_val"]) if "MVH" in requested_datasets else []
     genre_to_id = build_genre_to_id(cfg.get("aist_genres", []))
     loaders = []
+    condition_manifest_path = None
+    condition_manifest_sha256 = None
     if "AIST" in requested_datasets:
         aist_cameras = (
             _parse_csv(args.aist_cameras)
             if args.aist_cameras is not None
             else cfg.get("aist_cameras", ["01", "02", "08", "09"])
         )
+        aist_cond_frames = args.cond_frames or flow_cfg.get("cond_frames_min", 7)
+        condition_manifest_entries = None
+        if args.condition_manifest and args.save_condition_manifest:
+            raise ValueError(
+                "Use either --condition-manifest or --save-condition-manifest, not both"
+            )
+        requested_manifest_path = (
+            args.condition_manifest or args.save_condition_manifest
+        )
+        if requested_manifest_path:
+            if args.cond_frames is None:
+                raise ValueError(
+                    "--cond-frames is required with a condition manifest"
+                )
+            if args.aist_crop_mode != "first":
+                raise ValueError(
+                    "Condition manifests currently require --aist-crop-mode first"
+                )
+            if os.path.exists(requested_manifest_path):
+                condition_manifest = _load_condition_manifest(
+                    requested_manifest_path
+                )
+            elif args.condition_manifest:
+                raise FileNotFoundError(
+                    f"Condition manifest not found: {requested_manifest_path}"
+                )
+            else:
+                condition_manifest = _build_aist_condition_manifest(
+                    aist_paths,
+                    aist_cameras,
+                    seq_len,
+                    aist_cond_frames,
+                    args.cond_pattern,
+                    args.cond_pattern_seed,
+                )
+                _write_condition_manifest(
+                    requested_manifest_path,
+                    condition_manifest,
+                )
+            _validate_condition_manifest(
+                condition_manifest,
+                seq_len,
+                aist_cond_frames,
+                args.cond_pattern,
+                args.cond_pattern_seed,
+                aist_cameras,
+            )
+            expected_entries = len(aist_paths) * len(aist_cameras)
+            if len(condition_manifest["entries"]) != expected_entries:
+                raise ValueError(
+                    f"Condition manifest has {len(condition_manifest['entries'])} "
+                    f"entries, expected {expected_entries}"
+                )
+            condition_manifest_entries = condition_manifest["entries"]
+            condition_manifest_path = requested_manifest_path
+            condition_manifest_sha256 = _file_sha256(requested_manifest_path)
         aist_ds = AISTDataset(
             cfg["aist_motions_dir"],
             genre_to_id,
@@ -1194,9 +1409,12 @@ def main():
             include_cond=True,
             openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
-            cond_frames_min=args.cond_frames or flow_cfg.get("cond_frames_min", 7),
-            cond_frames_max=args.cond_frames or flow_cfg.get("cond_frames_max", 7),
+            cond_frames_min=aist_cond_frames,
+            cond_frames_max=aist_cond_frames,
             cond_drop_prob=eval_cond_drop_prob,
+            cond_pattern=args.cond_pattern,
+            cond_pattern_seed=args.cond_pattern_seed,
+            cond_index_manifest=condition_manifest_entries,
             crop_mode=args.aist_crop_mode,
         )
         loaders.append((
@@ -1348,9 +1566,19 @@ def main():
             "aist_crop_mode": args.aist_crop_mode,
             "num_samples": args.num_samples,
             "replications": replications,
+            "multimodality_repeats": eval_multimodality_repeats,
+            "multimodality_times": eval_multimodality_times,
             "steps": steps_list,
+            "solver": args.solver,
             "seed": args.seed,
             "device": args.device,
+            "cond_frames": args.cond_frames,
+            "cond_pattern": args.cond_pattern,
+            "cond_pattern_seed": args.cond_pattern_seed,
+            "condition_manifest": condition_manifest_path,
+            "condition_manifest_sha256": condition_manifest_sha256,
+            "guidance_scale": args.guidance_scale,
+            "use_ema": args.use_ema,
             "flow_checkpoint": args.flow_ckpt,
             "vae_checkpoint": vae_ckpt,
             "stats_path": stats_path,

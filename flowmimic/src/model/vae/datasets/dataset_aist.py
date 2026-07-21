@@ -12,6 +12,11 @@ from flowmimic.src.model.vae.datasets.condition_masking import (
     make_condition_frame_drop_mask,
     sample_condition_frame_count,
 )
+from flowmimic.src.model.vae.datasets.condition_sampling import (
+    condition_sample_key,
+    deterministic_condition_indices,
+    sample_condition_indices,
+)
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.motion.process_motion import smpl_to_ik263
 
@@ -74,6 +79,9 @@ class AISTDataset(Dataset):
         cond_frame_drop_prob=0.0,
         cond_frame_drop_mode="random",
         cond_frame_drop_max_block_frac=0.25,
+        cond_pattern="even",
+        cond_pattern_seed=None,
+        cond_index_manifest=None,
         crop_mode="random",
         clip_repeat=1,
     ):
@@ -104,6 +112,9 @@ class AISTDataset(Dataset):
         self.cond_frame_drop_prob = cond_frame_drop_prob
         self.cond_frame_drop_mode = cond_frame_drop_mode
         self.cond_frame_drop_max_block_frac = cond_frame_drop_max_block_frac
+        self.cond_pattern = cond_pattern
+        self.cond_pattern_seed = cond_pattern_seed
+        self.cond_index_manifest = cond_index_manifest
         self.crop_mode = crop_mode
         self.clip_repeat = max(1, int(clip_repeat))
         self._clip_counts = None
@@ -230,11 +241,46 @@ class AISTDataset(Dataset):
                 )
             t_len = k2d.shape[0]
             k_frames, frame_budget = self._condition_frame_counts()
-            if t_len <= k_frames:
-                idxs = np.arange(t_len)
+            sample_key = condition_sample_key(path, camera, start, self.seq_len)
+            if self.cond_index_manifest is not None:
+                if sample_key not in self.cond_index_manifest:
+                    raise KeyError(
+                        f"Condition manifest has no entry for {sample_key}"
+                    )
+                idxs = np.asarray(
+                    self.cond_index_manifest[sample_key], dtype=np.int64
+                )
+                if idxs.size != k_frames:
+                    raise ValueError(
+                        f"Condition manifest entry {sample_key} has {idxs.size} "
+                        f"indices, expected {k_frames}"
+                    )
+                if idxs.size and (idxs.min() < 0 or idxs.max() >= t_len):
+                    raise ValueError(
+                        f"Condition manifest entry {sample_key} is outside "
+                        f"[0, {t_len})"
+                    )
+                if np.unique(idxs).size != idxs.size:
+                    raise ValueError(
+                        f"Condition manifest entry {sample_key} contains duplicates"
+                    )
+                idxs = np.sort(idxs)
+            elif t_len <= k_frames:
+                idxs = np.arange(t_len, dtype=np.int64)
+            elif self.cond_pattern_seed is not None:
+                idxs = deterministic_condition_indices(
+                    t_len,
+                    k_frames,
+                    self.cond_pattern,
+                    self.cond_pattern_seed,
+                    sample_key,
+                )
             else:
-                idxs = np.linspace(0, t_len - 1, k_frames)
-                idxs = np.unique(np.round(idxs).astype(int))
+                idxs = sample_condition_indices(
+                    t_len,
+                    k_frames,
+                    pattern=self.cond_pattern,
+                )
             k2d_sparse = k2d[idxs]
             vis_sparse = vis[idxs]
             conf_sparse = conf[idxs]
@@ -283,6 +329,13 @@ class AISTDataset(Dataset):
             sample["conf"] = torch.from_numpy(conf_sparse).float()
             sample["tau_cond"] = torch.from_numpy(tau_cond).float()
             sample["mask_cond"] = torch.from_numpy(mask_cond)
+            if pad > 0:
+                cond_indices = np.concatenate(
+                    [idxs, np.full((pad,), -1, dtype=np.int64)]
+                )
+            else:
+                cond_indices = idxs
+            sample["cond_indices"] = torch.from_numpy(cond_indices).long()
         return sample
 
     def _build_index_map(self):

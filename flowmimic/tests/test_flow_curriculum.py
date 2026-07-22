@@ -80,6 +80,64 @@ class UnifiedRound0CurriculumTest(unittest.TestCase):
             self.assertAlmostEqual(actual, expected)
         self.assertAlmostEqual(sum(final.condition_probs), 1.0)
 
+    def test_integrated_pattern_and_joint_quota_ramps(self):
+        config = dict(CONFIG)
+        config.update(
+            {
+                "name": "unified_round0_phase1d",
+                "max_updates": 1800,
+                "optional_max_updates": 2000,
+                "condition_pattern_choices": ["even", "random", "boundary_gap"],
+                "pattern_start_probs": [1.0, 0.0, 0.0],
+                "pattern_final_probs": [0.50, 0.30, 0.20],
+                "pattern_ramp_start_update": 400,
+                "pattern_ramp_end_update": 800,
+                "joint_quota_start_update": 800,
+                "joint_quota_full_update": 1200,
+                "condition_joint_quotas": [
+                    {"pattern": "boundary_gap", "count": 7, "fraction": 0.08},
+                    {"pattern": "random", "count": 7, "fraction": 0.05},
+                    {"pattern": "boundary_gap", "count": 14, "fraction": 0.04},
+                ],
+            }
+        )
+        curriculum = UnifiedRound0Curriculum(config)
+
+        start = curriculum.state(400)
+        self.assertEqual(start.condition_pattern_probs, (1.0, 0.0, 0.0))
+        self.assertEqual(start.condition_joint_quotas, ())
+
+        pattern_mid = curriculum.state(600)
+        for actual, expected in zip(
+            pattern_mid.condition_pattern_probs,
+            (0.75, 0.15, 0.10),
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+        quota_mid = curriculum.state(1000)
+        self.assertEqual(quota_mid.condition_pattern_probs, (0.50, 0.30, 0.20))
+        for actual, expected in zip(
+            quota_mid.condition_joint_quotas,
+            (
+                ("boundary_gap", 7, 0.04),
+                ("random", 7, 0.025),
+                ("boundary_gap", 14, 0.02),
+            ),
+        ):
+            self.assertEqual(actual[:2], expected[:2])
+            self.assertAlmostEqual(actual[2], expected[2])
+
+        final = curriculum.state(1400)
+        self.assertEqual(
+            final.condition_joint_quotas,
+            (
+                ("boundary_gap", 7, 0.08),
+                ("random", 7, 0.05),
+                ("boundary_gap", 14, 0.04),
+            ),
+        )
+        self.assertEqual(curriculum.metadata()["name"], "unified_round0_phase1d")
+
 
 class SparsePatternPhase1CurriculumTest(unittest.TestCase):
     def setUp(self):

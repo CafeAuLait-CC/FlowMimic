@@ -64,6 +64,38 @@ class UnifiedRound0Curriculum:
         self.dense_probs = self._probabilities("dense_probs")
         self.mid_probs = self._probabilities("mid_probs")
         self.final_probs = self._probabilities("final_probs")
+        self.condition_pattern_choices = tuple(
+            str(value)
+            for value in self.config.get("condition_pattern_choices", ["even"])
+        )
+        self.pattern_start_probs = self._probabilities(
+            "pattern_start_probs",
+            default=[1.0],
+        )
+        self.pattern_final_probs = self._probabilities(
+            "pattern_final_probs",
+            default=[1.0],
+        )
+        self.pattern_ramp_start = int(
+            self.config.get("pattern_ramp_start_update", self.dense_end)
+        )
+        self.pattern_ramp_end = int(
+            self.config.get("pattern_ramp_end_update", self.mid_end)
+        )
+        self.condition_joint_quotas = tuple(
+            (
+                str(item["pattern"]),
+                int(item["count"]),
+                float(item["fraction"]),
+            )
+            for item in self.config.get("condition_joint_quotas", [])
+        )
+        self.joint_quota_start = int(
+            self.config.get("joint_quota_start_update", self.mid_end)
+        )
+        self.joint_quota_full = int(
+            self.config.get("joint_quota_full_update", self.sparse_end)
+        )
         self.solver_steps_dense = tuple(
             int(value) for value in self.config.get("solver_steps_dense", [16])
         )
@@ -73,8 +105,8 @@ class UnifiedRound0Curriculum:
         )
         self._validate()
 
-    def _probabilities(self, key):
-        values = tuple(float(value) for value in self.config[key])
+    def _probabilities(self, key, default=None):
+        values = tuple(float(value) for value in self.config.get(key, default))
         total = sum(values)
         if total <= 0.0:
             raise ValueError(f"{key} must have a positive sum")
@@ -113,6 +145,30 @@ class UnifiedRound0Curriculum:
                 raise ValueError(f"{name} cannot contain negative probabilities")
         if not self.solver_steps_dense or not self.solver_steps_sparse:
             raise ValueError("Solver-step schedules cannot be empty")
+        expected_patterns = len(self.condition_pattern_choices)
+        if len(self.pattern_start_probs) != expected_patterns:
+            raise ValueError("Pattern start probabilities must match choices")
+        if len(self.pattern_final_probs) != expected_patterns:
+            raise ValueError("Pattern final probabilities must match choices")
+        if not (
+            0 <= self.pattern_ramp_start < self.pattern_ramp_end <= self.max_updates
+        ):
+            raise ValueError("Invalid unified pattern-ramp milestones")
+        if not (
+            0 <= self.joint_quota_start < self.joint_quota_full <= self.max_updates
+        ):
+            raise ValueError("Invalid unified joint-quota milestones")
+        quota_total = 0.0
+        for pattern, count, fraction in self.condition_joint_quotas:
+            if pattern not in self.condition_pattern_choices:
+                raise ValueError(f"Unknown joint-quota pattern: {pattern}")
+            if count not in self.condition_choices:
+                raise ValueError(f"Unknown joint-quota condition count: {count}")
+            if fraction < 0.0:
+                raise ValueError("Joint-quota fractions cannot be negative")
+            quota_total += fraction
+        if quota_total > 1.0 + 1e-8:
+            raise ValueError("Joint-quota fractions cannot sum above one")
 
     def state(self, completed_updates):
         updates = max(0, int(completed_updates))
@@ -156,6 +212,34 @@ class UnifiedRound0Curriculum:
             if updates < self.mid_end
             else self.solver_steps_sparse
         )
+        if updates <= self.pattern_ramp_start:
+            pattern_probs = self.pattern_start_probs
+        elif updates >= self.pattern_ramp_end:
+            pattern_probs = self.pattern_final_probs
+        else:
+            pattern_fraction = (updates - self.pattern_ramp_start) / max(
+                self.pattern_ramp_end - self.pattern_ramp_start,
+                1,
+            )
+            pattern_probs = _interpolate_probs(
+                self.pattern_start_probs,
+                self.pattern_final_probs,
+                pattern_fraction,
+            )
+        if updates <= self.joint_quota_start:
+            quota_scale = 0.0
+        elif updates >= self.joint_quota_full:
+            quota_scale = 1.0
+        else:
+            quota_scale = (updates - self.joint_quota_start) / max(
+                self.joint_quota_full - self.joint_quota_start,
+                1,
+            )
+        joint_quotas = tuple(
+            (pattern, count, fraction * quota_scale)
+            for pattern, count, fraction in self.condition_joint_quotas
+            if fraction * quota_scale > 0.0
+        )
         return UnifiedRound0State(
             completed_updates=updates,
             phase=phase,
@@ -163,14 +247,15 @@ class UnifiedRound0Curriculum:
             condition_weight_scale=float(condition_weight_scale),
             condition_choices=self.condition_choices,
             condition_probs=tuple(float(value) for value in probs),
-            condition_pattern_choices=("even",),
-            condition_pattern_probs=(1.0,),
+            condition_pattern_choices=self.condition_pattern_choices,
+            condition_pattern_probs=tuple(float(value) for value in pattern_probs),
             solver_steps=solver_steps,
+            condition_joint_quotas=joint_quotas,
         )
 
     def metadata(self):
         return {
-            "name": "unified_round0",
+            "name": self.config.get("name", "unified_round0"),
             "max_updates": self.max_updates,
             "optional_max_updates": self.optional_max_updates,
             "reference_updates_per_epoch": self.reference_updates_per_epoch,

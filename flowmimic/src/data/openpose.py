@@ -139,16 +139,52 @@ def cache_openpose_npy(npy_path, cache_path, src_fps=None, target_fps=None):
     return coords, vis
 
 
-def _aist_cache_path(cache_root, pkl_path, camera=None):
+def _fps_cache_tag(src_fps, target_fps):
+    if src_fps is None or target_fps is None:
+        return ""
+
+    def _format(value):
+        value = float(value)
+        return str(int(value)) if value.is_integer() else str(value).replace(".", "p")
+
+    return f"_{_format(src_fps)}to{_format(target_fps)}fps"
+
+
+def _aist_cache_path(
+    cache_root,
+    pkl_path,
+    camera=None,
+    src_fps=None,
+    target_fps=None,
+):
     name = os.path.splitext(os.path.basename(pkl_path))[0]
+    fps_tag = _fps_cache_tag(src_fps, target_fps)
     if camera is None:
-        return os.path.join(cache_root, "aist", f"{name}_{_CACHE_TAG}.npz")
-    return os.path.join(cache_root, "aist", f"{name}_c{camera}_{_CACHE_TAG}.npz")
+        return os.path.join(cache_root, "aist", f"{name}_{_CACHE_TAG}{fps_tag}.npz")
+    return os.path.join(
+        cache_root,
+        "aist",
+        f"{name}_c{camera}_{_CACHE_TAG}{fps_tag}.npz",
+    )
 
 
-def _mvh_cache_path(cache_root, mv_root, seq_dir, cam):
+def _mvh_cache_path(
+    cache_root,
+    mv_root,
+    seq_dir,
+    cam,
+    src_fps=None,
+    target_fps=None,
+):
     rel = os.path.relpath(seq_dir, mv_root)
-    return os.path.join(cache_root, "mvh", rel, "openpose", f"{cam}_{_CACHE_TAG}.npz")
+    fps_tag = _fps_cache_tag(src_fps, target_fps)
+    return os.path.join(
+        cache_root,
+        "mvh",
+        rel,
+        "openpose",
+        f"{cam}_{_CACHE_TAG}{fps_tag}.npz",
+    )
 
 
 def load_aist_openpose(
@@ -164,7 +200,13 @@ def load_aist_openpose(
 ):
     cache_path = None
     if cache_root:
-        cache_path = _aist_cache_path(cache_root, pkl_path, camera=camera)
+        cache_path = _aist_cache_path(
+            cache_root,
+            pkl_path,
+            camera=camera,
+            src_fps=src_fps,
+            target_fps=target_fps,
+        )
         if os.path.exists(cache_path):
             coords, vis, conf = _load_openpose_cache(cache_path)
             return _sanitize_openpose(coords, vis, conf, return_conf=return_conf)
@@ -184,7 +226,16 @@ def load_aist_openpose(
         )
         if cache_root and write_cache:
             _save_openpose_cache(
-                _aist_cache_path(cache_root, pkl_path, camera=cam), coords, vis, conf
+                _aist_cache_path(
+                    cache_root,
+                    pkl_path,
+                    camera=cam,
+                    src_fps=src_fps,
+                    target_fps=target_fps,
+                ),
+                coords,
+                vis,
+                conf,
             )
         return _sanitize_openpose(coords, vis, conf, return_conf=return_conf)
     if return_conf:
@@ -213,7 +264,14 @@ def load_mvh_openpose(
     cam_list = [camera] if camera is not None else cameras
     for cam in cam_list:
         if cache_root:
-            cache_path = _mvh_cache_path(cache_root, mv_root, seq_dir, cam)
+            cache_path = _mvh_cache_path(
+                cache_root,
+                mv_root,
+                seq_dir,
+                cam,
+                src_fps=src_fps,
+                target_fps=target_fps,
+            )
             if os.path.exists(cache_path):
                 coords, vis, conf = _load_openpose_cache(cache_path)
                 return _sanitize_openpose(coords, vis, conf, return_conf=return_conf)

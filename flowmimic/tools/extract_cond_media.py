@@ -89,13 +89,13 @@ def main():
         )
 
     config = load_config()
-    target_fps = args.fps or config.get("target_fps", 30)
-    aist_fps = config.get("aist_fps", 60)
-    mvh_fps = 25
+    meta = _parse_meta(args.meta)
+    target_fps = args.fps or meta.get("target_fps") or config.get("target_fps", 30)
+    aist_fps = meta.get("source_fps") or config.get("aist_fps", 60)
+    mvh_fps = meta.get("source_fps") or config.get("mvh_fps", 5)
     video_root = "data/AIST++/Videos"
     mvh_root = os.path.join(os.path.expanduser("~"), "hdd", "MVHumanNet_Data")
 
-    meta = _parse_meta(args.meta)
     dataset = meta.get("dataset", "aist")
     motion_path = meta.get("path", "")
     if not motion_path:
@@ -153,34 +153,53 @@ def main():
         clip_path = os.path.join(out_dir, f"{tag}_clip.mp4")
         ffmpeg_cmd = [
             "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
             "-y",
+            "-i",
+            video_path,
             "-ss",
             f"{clip_start:.6f}",
             "-t",
             f"{clip_duration:.6f}",
-            "-i",
-            video_path,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            f"fps={float(target_fps):.8f}",
+            "-frames:v",
+            str(clip_frames),
             "-vcodec",
             "libx264",
-            "-acodec",
-            "aac",
             "-movflags",
             "faststart",
             clip_path,
         ]
         subprocess.run(ffmpeg_cmd, check=True)
+        if not os.path.exists(clip_path) or os.path.getsize(clip_path) <= 1024:
+            raise RuntimeError(
+                "FFmpeg produced an empty AIST clip. "
+                f"start={start}, seq_len={seq_len}, target_fps={target_fps}, "
+                f"clip_start={clip_start:.3f}s, clip_duration={clip_duration:.3f}s"
+            )
 
         for idx in frame_indices:
-            ts = float(idx) / float(target_fps)
+            ts = float(start + idx) / float(target_fps)
             out_path = os.path.join(frame_dir, f"frame_{int(idx):06d}.png")
             frame_cmd = [
                 "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
                 "-y",
                 "-ss",
                 f"{ts:.6f}",
                 "-i",
-                clip_path,
-                "-vframes",
+                video_path,
+                "-frames:v",
+                "1",
+                "-update",
                 "1",
                 out_path,
             ]
@@ -190,9 +209,15 @@ def main():
             motion_path, target_fps=target_fps, src_fps=aist_fps
         )
         joints = blender_to_yup(joints)
-        if joints.shape[0] >= seq_len:
-            joints = joints[start : start + seq_len]
-        else:
+        if start >= joints.shape[0]:
+            raise ValueError(
+                "Clip start is outside the resampled AIST motion. "
+                f"start={start}, resampled_frames={joints.shape[0]}, "
+                f"source_fps={aist_fps}, target_fps={target_fps}. "
+                "Regenerate this sample; its metadata may predate FPS-aware sampling."
+            )
+        joints = joints[start : start + seq_len]
+        if joints.shape[0] < seq_len:
             pad_len = seq_len - joints.shape[0]
             joints = np.concatenate(
                 [joints, np.zeros((pad_len, 22, 3), dtype=joints.dtype)], axis=0

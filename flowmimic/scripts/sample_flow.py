@@ -88,6 +88,8 @@ def main():
     parser.add_argument("--k2d-npy", type=str, default=None)
     parser.add_argument("--sample-path", type=str, default=None)
     parser.add_argument("--start", type=int, default=None)
+    parser.add_argument("--src-fps", type=float, default=None)
+    parser.add_argument("--target-fps", type=float, default=None)
     parser.add_argument("--dataset", type=str, choices=["auto", "aist", "mvh"], default="auto")
     parser.add_argument("--camera", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -106,7 +108,12 @@ def main():
     openpose_stats_path = ckpt_metadata.get("openpose_stats_path") or config.get(
         "openpose_stats_path", "data/openpose_stats.npz"
     )
-    target_fps = sample_cfg.get("target_fps") or config.get("target_fps", None)
+    target_fps = (
+        args.target_fps
+        or sample_cfg.get("target_fps")
+        or config.get("target_fps", 30)
+    )
+    source_fps_override = args.src_fps or sample_cfg.get("src_fps")
     vae_ckpt_path = args.vae_checkpoint or ckpt_metadata.get("vae_ckpt") or config.get(
         "vae_ckpt", "checkpoints/motion_vae_best.pt"
     )
@@ -242,6 +249,7 @@ def main():
             else:
                 dataset = "aist" if random.random() < 0.5 else "mvh"
         if dataset == "aist":
+            source_fps = source_fps_override or config.get("aist_fps", 60)
             if args.sample_path:
                 pkl_path = args.sample_path
             else:
@@ -255,7 +263,7 @@ def main():
             k2d, vis = load_aist_openpose(
                 pkl_path,
                 aist_openpose_dir,
-                src_fps=sample_cfg.get("src_fps"),
+                src_fps=source_fps,
                 target_fps=target_fps,
                 cache_root=cond_cache_root,
                 camera=cam,
@@ -266,8 +274,16 @@ def main():
             if not style_id_user_set:
                 style_id_value = cond_style_id_value
             domain_id_value = 1
-            meta = {"dataset": "aist", "path": pkl_path, "camera": cam, "genre": genre}
+            meta = {
+                "dataset": "aist",
+                "path": pkl_path,
+                "camera": cam,
+                "genre": genre,
+                "source_fps": float(source_fps),
+                "target_fps": float(target_fps),
+            }
         else:
+            source_fps = source_fps_override or config.get("mvh_fps", 5)
             if args.sample_path:
                 seq_dir = args.sample_path
             else:
@@ -282,7 +298,7 @@ def main():
                 mv_root,
                 mvh_openpose_root,
                 mvh_cameras,
-                src_fps=sample_cfg.get("src_fps"),
+                src_fps=source_fps,
                 target_fps=target_fps,
                 cache_root=cond_cache_root,
                 camera=cam,
@@ -291,7 +307,13 @@ def main():
                 style_id_value = 0
             cond_style_id_value = 0
             domain_id_value = 0
-            meta = {"dataset": "mvh", "path": seq_dir, "camera": cam}
+            meta = {
+                "dataset": "mvh",
+                "path": seq_dir,
+                "camera": cam,
+                "source_fps": float(source_fps),
+                "target_fps": float(target_fps),
+            }
 
     if k2d is None:
         cond = build_dummy_cond(1, device=device)
@@ -414,6 +436,8 @@ def main():
         "output_dir": run_out_dir,
         "orig_len": meta.get("orig_len", ""),
         "start": meta.get("start", ""),
+        "source_fps": meta.get("source_fps"),
+        "target_fps": meta.get("target_fps", float(target_fps)),
         "seed": seed_used,
         "seq_len": seq_len,
         "latent_len": latent_len,
@@ -475,6 +499,10 @@ def main():
         replicate_cmd.extend(["--domain-id", str(domain_id_value)])
     if args.camera is not None:
         replicate_cmd.extend(["--camera", args.camera])
+    if meta_out.get("source_fps") is not None:
+        replicate_cmd.extend(["--src-fps", str(meta_out["source_fps"])])
+    if meta_out.get("target_fps") is not None:
+        replicate_cmd.extend(["--target-fps", str(meta_out["target_fps"])])
     replicate_cmd.extend(["--seed", str(seed_used)])
     if meta_out.get("start", None) is not None:
         replicate_cmd.extend(["--start", str(meta_out["start"])])

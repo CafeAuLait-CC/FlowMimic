@@ -22,6 +22,12 @@ class ConditionalRectFlow(nn.Module):
         cond_layers=4,
         cond_heads=4,
         p_style_drop=0.5,
+        relative_time_bias=False,
+        relative_time_hidden_dim=32,
+        latent_len=16,
+        latent_slot_adapter=False,
+        latent_slot_adapter_heads=8,
+        latent_slot_adapter_ffn_dim=1024,
     ):
         super().__init__()
         self.cond_encoder = CondEncoder2D(
@@ -45,6 +51,12 @@ class ConditionalRectFlow(nn.Module):
             ffn_dim=ffn_dim,
             cond_dim=d_model,
             dropout=dropout,
+            relative_time_bias=relative_time_bias,
+            relative_time_hidden_dim=relative_time_hidden_dim,
+            latent_len=latent_len,
+            latent_slot_adapter=latent_slot_adapter,
+            latent_slot_adapter_heads=latent_slot_adapter_heads,
+            latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
         )
 
     def encode_cond(self, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True, vis_mask=None):
@@ -79,4 +91,12 @@ class ConditionalRectFlow(nn.Module):
                 apply_style_dropout=apply_style_dropout,
                 vis_mask=vis_mask,
             )
-        return self.flow(x_t, t_flow, tau_out, mem, g, mem_mask=mem_mask)
+        return self.flow(
+            x_t,
+            t_flow,
+            tau_out,
+            mem,
+            g,
+            mem_mask=mem_mask,
+            tau_cond=tau_cond,
+        )

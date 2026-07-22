@@ -20,8 +20,21 @@ class EMA:
     def state_dict(self):
         return self.shadow
 
-    def load_state_dict(self, state):
-        self.shadow = {k: v.detach().clone() for k, v in state.items()}
+    def load_state_dict(self, state, allow_missing=False):
+        current_keys = set(self.shadow)
+        state_keys = set(state)
+        missing = sorted(current_keys - state_keys)
+        unexpected = sorted(state_keys - current_keys)
+        if (missing or unexpected) and not allow_missing:
+            raise RuntimeError(
+                f"EMA state is incompatible: missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+        merged = {}
+        for key, value in self.shadow.items():
+            source = state.get(key, value)
+            merged[key] = source.detach().clone()
+        self.shadow = merged
 
 
 class Teacher:

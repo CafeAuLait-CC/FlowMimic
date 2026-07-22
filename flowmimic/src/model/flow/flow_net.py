@@ -1,7 +1,10 @@
 import torch
 from torch import nn
 
-from flowmimic.src.model.flow.flow_blocks import FlowBlock
+from flowmimic.src.model.flow.flow_blocks import (
+    FlowBlock,
+    LatentSlotConditionAdapter,
+)
 from flowmimic.src.model.flow.time_embed import TimeEmbed
 
 
@@ -15,31 +18,76 @@ class FlowNet(nn.Module):
         ffn_dim=2048,
         cond_dim=256,
         dropout=0.1,
+        relative_time_bias=False,
+        relative_time_hidden_dim=32,
+        latent_len=16,
+        latent_slot_adapter=False,
+        latent_slot_adapter_heads=8,
+        latent_slot_adapter_ffn_dim=1024,
     ):
         super().__init__()
         self.in_proj = nn.Linear(d_z, d_model)
         self.out_proj = nn.Linear(d_model, d_z)
         self.tau_embed = TimeEmbed(d_model)
         self.t_embed = TimeEmbed(d_model)
+        self.slot_condition_adapter = (
+            LatentSlotConditionAdapter(
+                latent_len=latent_len,
+                d_model=d_model,
+                n_heads=latent_slot_adapter_heads,
+                ffn_dim=latent_slot_adapter_ffn_dim,
+                dropout=dropout,
+            )
+            if latent_slot_adapter
+            else None
+        )
         self.blocks = nn.ModuleList(
             [
-                FlowBlock(d_model, cond_dim, n_heads, ffn_dim, dropout=dropout)
+                FlowBlock(
+                    d_model,
+                    cond_dim,
+                    n_heads,
+                    ffn_dim,
+                    dropout=dropout,
+                    relative_time_bias=relative_time_bias,
+                    relative_time_hidden_dim=relative_time_hidden_dim,
+                )
                 for _ in range(n_layers)
             ]
         )
 
-    def forward(self, x_t, t_flow, tau_out, mem, g, mem_mask=None):
+    def forward(
+        self,
+        x_t,
+        t_flow,
+        tau_out,
+        mem,
+        g,
+        mem_mask=None,
+        tau_cond=None,
+    ):
         # x_t: [B,T,Dz], t_flow: [B] or [B,T], tau_out: [T] or [B,T]
         b, t, _ = x_t.shape
         h = self.in_proj(x_t)
+        if self.slot_condition_adapter is not None:
+            h = h + self.slot_condition_adapter(mem, mem_mask)
         if tau_out.dim() == 1:
             tau_out = tau_out.unsqueeze(0).expand(b, -1)
+        if tau_cond is not None and tau_cond.dim() == 1:
+            tau_cond = tau_cond.unsqueeze(0).expand(b, -1)
         h = h + self.tau_embed(tau_out)
         if t_flow.dim() == 1:
             t_flow = t_flow.unsqueeze(1).expand(b, t)
         h = h + self.t_embed(t_flow)
 
         for block in self.blocks:
-            h = block(h, g, mem, mem_mask=mem_mask)
+            h = block(
+                h,
+                g,
+                mem,
+                mem_mask=mem_mask,
+                tau_out=tau_out,
+                tau_cond=tau_cond,
+            )
 
         return self.out_proj(h)

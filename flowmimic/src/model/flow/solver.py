@@ -10,6 +10,7 @@ def _flow_eval(flow_fn, x, t, cond_batch):
         cond_batch["mem"],
         cond_batch["g"],
         cond_batch.get("mem_mask"),
+        cond_batch.get("tau_cond"),
     )
     guidance_scale = cond_batch.get("guidance_scale")
     if (
@@ -26,6 +27,7 @@ def _flow_eval(flow_fn, x, t, cond_batch):
         cond_batch["mem_uncond"],
         cond_batch["g_uncond"],
         cond_batch.get("mem_mask_uncond"),
+        cond_batch.get("tau_cond_uncond", cond_batch.get("tau_cond")),
     )
     return v_uncond + float(guidance_scale) * (v_cond - v_uncond)
 
@@ -59,11 +61,12 @@ def solve_flow(
             cond_batch["mem"],
             cond_batch["g"],
             mem_mask,
+            cond_batch.get("tau_cond"),
             use_reentrant=False,
         )
 
-    def _flow_eval_ckpt(x_in, t_in, tau_out, mem, g, mem_mask):
-        return flow_fn(x_in, t_in, tau_out, mem, g, mem_mask)
+    def _flow_eval_ckpt(x_in, t_in, tau_out, mem, g, mem_mask, tau_cond):
+        return flow_fn(x_in, t_in, tau_out, mem, g, mem_mask, tau_cond)
 
     for _ in range(num_steps):
         if method == "heun":

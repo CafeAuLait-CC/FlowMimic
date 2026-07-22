@@ -16,6 +16,13 @@ if ROOT_DIR not in sys.path:
 from flowmimic.src.config.config import load_config
 from flowmimic.src.model.flow.cond_api import build_cond_inputs, build_dummy_cond
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
+from flowmimic.src.model.flow.checkpoint import (
+    flow_state_uses_latent_slot_adapter,
+    flow_state_uses_relative_time_bias,
+    infer_latent_slot_adapter_config,
+    infer_relative_time_hidden_dim,
+    load_flow_state_dict,
+)
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.backend import decode_motion_latent, load_vae_backend
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
@@ -189,6 +196,15 @@ def main():
     latent_len = vae_backend.latent_len
 
     flow_cfg = config.get("flow", {})
+    flow_state = state["ema"] if args.use_ema and "ema" in state else state["model"]
+    relative_time_bias = flow_state_uses_relative_time_bias(flow_state)
+    latent_slot_adapter = flow_state_uses_latent_slot_adapter(flow_state)
+    slot_adapter_config = infer_latent_slot_adapter_config(
+        flow_state,
+        default_latent_len=latent_len,
+        default_ffn_dim=flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
+    )
+    flow_architecture = state.get("metadata", {}).get("flow_architecture", {})
     flow = ConditionalRectFlow(
         d_z=d_z,
         d_model=flow_cfg.get("d_model", 512),
@@ -202,11 +218,19 @@ def main():
         cond_layers=flow_cfg.get("cond_layers", 4),
         cond_heads=flow_cfg.get("cond_heads", 4),
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
+        relative_time_bias=relative_time_bias,
+        relative_time_hidden_dim=infer_relative_time_hidden_dim(flow_state),
+        latent_len=slot_adapter_config["latent_len"],
+        latent_slot_adapter=latent_slot_adapter,
+        latent_slot_adapter_heads=int(
+            flow_architecture.get(
+                "latent_slot_adapter_heads",
+                flow_cfg.get("latent_slot_adapter_heads", 8),
+            )
+        ),
+        latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
     )
-    if args.use_ema and "ema" in state:
-        flow.load_state_dict(state["ema"])
-    else:
-        flow.load_state_dict(state["model"])
+    load_flow_state_dict(flow, flow_state)
     flow.to(device)
     flow.eval()
 
@@ -368,7 +392,12 @@ def main():
     style = flow.style_emb(style_id, domain_id, apply_dropout=False)
     g = flow.cond_mlp(torch.cat([g, style], dim=-1))
 
-    cond_batch = {"tau_out": tau_out, "mem": mem, "g": g}
+    cond_batch = {
+        "tau_out": tau_out,
+        "tau_cond": cond["tau_cond"],
+        "mem": mem,
+        "g": g,
+    }
     if args.guidance_scale != 1.0:
         k2d_uncond = torch.zeros_like(cond["k2d"])
         vis_uncond = (

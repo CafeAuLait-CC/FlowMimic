@@ -20,6 +20,13 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from flowmimic.src.config.config import load_config
+from flowmimic.src.model.flow.checkpoint import (
+    flow_state_uses_latent_slot_adapter,
+    flow_state_uses_relative_time_bias,
+    infer_latent_slot_adapter_config,
+    infer_relative_time_hidden_dim,
+    load_flow_state_dict,
+)
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.teacher import EMA, Teacher
 from flowmimic.src.model.flow.solver import solve_flow
@@ -277,10 +284,14 @@ def main():
         "--curriculum",
         choices=(
             "unified_round0",
+            "unified_round0_phase1d",
             "sparse_pattern_phase1",
             "sparse_pattern_phase1_control",
             "sparse_pattern_phase1a_target",
             "sparse_pattern_phase1a_control",
+            "sparse_pattern_phase1b_relative_time",
+            "sparse_pattern_phase1b_legacy_control",
+            "sparse_pattern_phase1c_latent_slot_adapter",
         ),
         default=None,
         help="Use a named update-based training curriculum from config.json.",
@@ -417,14 +428,15 @@ def main():
     args = parser.parse_args()
     _apply_train_flow_config_defaults(args, config)
     curriculum = None
-    if args.curriculum == "unified_round0":
+    curriculum_config = None
+    if args.curriculum in ("unified_round0", "unified_round0_phase1d"):
         curriculum_config = (
             config.get("flow", {})
             .get("curriculum", {})
-            .get("unified_round0")
+            .get(args.curriculum)
         )
         if not curriculum_config:
-            raise ValueError("Missing flow.curriculum.unified_round0 config")
+            raise ValueError(f"Missing flow.curriculum.{args.curriculum} config")
         curriculum = UnifiedRound0Curriculum(
             curriculum_config,
             max_updates=args.max_updates,
@@ -449,6 +461,9 @@ def main():
         "sparse_pattern_phase1_control",
         "sparse_pattern_phase1a_target",
         "sparse_pattern_phase1a_control",
+        "sparse_pattern_phase1b_relative_time",
+        "sparse_pattern_phase1b_legacy_control",
+        "sparse_pattern_phase1c_latent_slot_adapter",
     ):
         curriculum_config = (
             config.get("flow", {}).get("curriculum", {}).get(args.curriculum)
@@ -474,6 +489,49 @@ def main():
         args.cond_frames_max = max(initial_curriculum_state.condition_choices)
         args.lr = curriculum.lr_peak
         args.lr_decay_epoch = 999999
+    relative_time_bias = bool(
+        (curriculum_config or {}).get(
+            "relative_time_bias",
+            flow_cfg.get("relative_time_bias", False),
+        )
+    )
+    relative_time_hidden_dim = int(
+        (curriculum_config or {}).get(
+            "relative_time_hidden_dim",
+            flow_cfg.get("relative_time_hidden_dim", 32),
+        )
+    )
+    match_relative_time_init_rng = bool(
+        (curriculum_config or {}).get("match_relative_time_init_rng", False)
+    )
+    if match_relative_time_init_rng and relative_time_bias:
+        raise ValueError(
+            "match_relative_time_init_rng is only valid for a legacy control"
+        )
+    latent_slot_adapter = bool(
+        (curriculum_config or {}).get(
+            "latent_slot_adapter",
+            flow_cfg.get("latent_slot_adapter", False),
+        )
+    )
+    latent_slot_adapter_heads = int(
+        (curriculum_config or {}).get(
+            "latent_slot_adapter_heads",
+            flow_cfg.get("latent_slot_adapter_heads", 8),
+        )
+    )
+    latent_slot_adapter_ffn_dim = int(
+        (curriculum_config or {}).get(
+            "latent_slot_adapter_ffn_dim",
+            flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
+        )
+    )
+    latent_slot_adapter_lr_scale = float(
+        (curriculum_config or {}).get(
+            "latent_slot_adapter_lr_scale",
+            flow_cfg.get("latent_slot_adapter_lr_scale", 1.0),
+        )
+    )
     args.cond_frame_choices, args.cond_frame_choice_probs = (
         _parse_condition_frame_mixture(
             args.cond_frame_choices,
@@ -823,6 +881,9 @@ def main():
 
     if is_main:
         print("Building flow model")
+    build_relative_time_bias = (
+        relative_time_bias or match_relative_time_init_rng
+    )
     flow = ConditionalRectFlow(
         d_z=flow_d_z,
         d_model=flow_cfg.get("d_model", 512),
@@ -836,14 +897,79 @@ def main():
         cond_layers=flow_cfg.get("cond_layers", 4),
         cond_heads=flow_cfg.get("cond_heads", 4),
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
+        relative_time_bias=build_relative_time_bias,
+        relative_time_hidden_dim=relative_time_hidden_dim,
+        latent_len=latent_len,
+        latent_slot_adapter=latent_slot_adapter,
+        latent_slot_adapter_heads=latent_slot_adapter_heads,
+        latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
     )
     flow.to(device)
     resume_state = None
+    relative_time_migration = False
+    latent_slot_adapter_migration = False
     if args.resume:
         if is_main:
             print(f"Resuming from {args.resume}")
         resume_state = torch.load(args.resume, map_location=device)
-        flow.load_state_dict(resume_state["model"])
+        resume_model_state = resume_state["model"]
+        source_uses_relative_time = flow_state_uses_relative_time_bias(
+            resume_model_state
+        )
+        source_uses_latent_slot_adapter = flow_state_uses_latent_slot_adapter(
+            resume_model_state
+        )
+        if source_uses_relative_time and not relative_time_bias:
+            raise ValueError(
+                "Checkpoint uses relative-time attention, but the selected "
+                "configuration disables it"
+            )
+        relative_time_migration = (
+            build_relative_time_bias and not source_uses_relative_time
+        )
+        if source_uses_latent_slot_adapter and not latent_slot_adapter:
+            raise ValueError(
+                "Checkpoint uses a latent-slot condition adapter, but the "
+                "selected configuration disables it"
+            )
+        latent_slot_adapter_migration = (
+            latent_slot_adapter and not source_uses_latent_slot_adapter
+        )
+        load_flow_state_dict(
+            flow,
+            resume_model_state,
+            allow_relative_time_migration=relative_time_migration,
+            allow_latent_slot_adapter_migration=latent_slot_adapter_migration,
+        )
+        if relative_time_migration and is_main:
+            print(
+                "Initialized zero-output relative-time attention from a "
+                "legacy flow checkpoint"
+            )
+        if latent_slot_adapter_migration and is_main:
+            print(
+                "Initialized zero-output latent-slot adapter from a legacy "
+                "flow checkpoint"
+            )
+    if latent_slot_adapter and (latent_slot_adapter_migration or not args.resume):
+        if not hasattr(vae, "latent_queries") or not hasattr(vae, "latent_pos"):
+            raise ValueError(
+                "Latent-slot adapter initialization requires query-mode VQ-VAE slots"
+            )
+        flow.flow.slot_condition_adapter.initialize_slot_queries(
+            vae.latent_queries + vae.latent_pos
+        )
+        if is_main:
+            print("Initialized flow adapter slots from VQ-VAE query identities")
+    if match_relative_time_init_rng:
+        for block in flow.flow.blocks:
+            block.relative_time_bias = None
+        relative_time_migration = False
+        if is_main:
+            print(
+                "Removed temporary relative-time modules after matching "
+                "Phase 1B initialization RNG"
+            )
 
     if ddp:
         flow = torch.nn.parallel.DistributedDataParallel(
@@ -877,17 +1003,48 @@ def main():
             f"solver_reg_subbatch_size={solver_reg_subbatch_size or 'full'}; "
             f"cond_match_camera_mode={args.cond_match_camera_mode}"
         )
+        print(
+            "Relative-time attention: enabled={} hidden_dim={}".format(
+                relative_time_bias,
+                relative_time_hidden_dim,
+            )
+        )
+        print(
+            "Latent-slot adapter: enabled={} heads={} ffn_dim={} lr_scale={}".format(
+                latent_slot_adapter,
+                latent_slot_adapter_heads,
+                latent_slot_adapter_ffn_dim,
+                latent_slot_adapter_lr_scale,
+            )
+        )
 
     cond_params = list(flow_model.cond_encoder.parameters()) + list(
         flow_model.cond_mlp.parameters()
     )
     cond_param_ids = {id(p) for p in cond_params}
-    other_params = [p for p in flow_model.parameters() if id(p) not in cond_param_ids]
+    slot_adapter_params = (
+        list(flow_model.flow.slot_condition_adapter.parameters())
+        if flow_model.flow.slot_condition_adapter is not None
+        else []
+    )
+    slot_adapter_param_ids = {id(p) for p in slot_adapter_params}
+    excluded_param_ids = cond_param_ids | slot_adapter_param_ids
+    other_params = [
+        p for p in flow_model.parameters() if id(p) not in excluded_param_ids
+    ]
     base_group_lrs = [lr, lr * cond_lr_scale]
     param_groups = [
         {"params": other_params, "lr": lr},
         {"params": cond_params, "lr": lr * cond_lr_scale},
     ]
+    if slot_adapter_params:
+        base_group_lrs.append(lr * latent_slot_adapter_lr_scale)
+        param_groups.append(
+            {
+                "params": slot_adapter_params,
+                "lr": lr * latent_slot_adapter_lr_scale,
+            }
+        )
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     start_epoch = 0
@@ -927,6 +1084,10 @@ def main():
         if curriculum is not None:
             resume_lr = curriculum.state(optimizer_updates).learning_rate
             scheduled_lrs = [resume_lr, resume_lr * cond_lr_scale]
+            if slot_adapter_params:
+                scheduled_lrs.append(
+                    resume_lr * latent_slot_adapter_lr_scale
+                )
             lr_halved = False
         else:
             scheduled_lrs = [
@@ -1047,6 +1208,23 @@ def main():
     if args.reflow_round >= 1:
         if not args.teacher_ckpt:
             raise ValueError("teacher_ckpt is required for reflow_round >= 1")
+        state = torch.load(args.teacher_ckpt, map_location=device)
+        teacher_state = (
+            state["ema"]
+            if args.use_ema_teacher and "ema" in state
+            else state["model"]
+        )
+        teacher_relative_time_bias = flow_state_uses_relative_time_bias(
+            teacher_state
+        )
+        teacher_latent_slot_adapter = flow_state_uses_latent_slot_adapter(
+            teacher_state
+        )
+        teacher_slot_config = infer_latent_slot_adapter_config(
+            teacher_state,
+            default_latent_len=latent_len,
+            default_ffn_dim=latent_slot_adapter_ffn_dim,
+        )
         teacher_flow = ConditionalRectFlow(
             d_z=flow_d_z,
             d_model=flow_cfg.get("d_model", 512),
@@ -1060,12 +1238,14 @@ def main():
             cond_layers=flow_cfg.get("cond_layers", 4),
             cond_heads=flow_cfg.get("cond_heads", 4),
             p_style_drop=flow_cfg.get("p_style_drop", 0.5),
+            relative_time_bias=teacher_relative_time_bias,
+            relative_time_hidden_dim=infer_relative_time_hidden_dim(teacher_state),
+            latent_len=teacher_slot_config["latent_len"],
+            latent_slot_adapter=teacher_latent_slot_adapter,
+            latent_slot_adapter_heads=latent_slot_adapter_heads,
+            latent_slot_adapter_ffn_dim=teacher_slot_config["ffn_dim"],
         )
-        state = torch.load(args.teacher_ckpt, map_location=device)
-        if args.use_ema_teacher and "ema" in state:
-            teacher_flow.load_state_dict(state["ema"])
-        else:
-            teacher_flow.load_state_dict(state["model"])
+        load_flow_state_dict(teacher_flow, teacher_state)
         teacher_flow.to(device)
         teacher = Teacher(
             teacher_flow,
@@ -1074,7 +1254,12 @@ def main():
 
     ema = EMA(flow_model, decay=ema_decay) if args.ema else None
     if ema is not None and args.resume and ema_state is not None:
-        ema.load_state_dict(ema_state)
+        ema.load_state_dict(
+            ema_state,
+            allow_missing=(
+                relative_time_migration or latent_slot_adapter_migration
+            ),
+        )
     checkpoint_metadata = _make_checkpoint_metadata(
         args=args,
         config=config,
@@ -1093,6 +1278,12 @@ def main():
         cond_frame_choices=cond_frame_choices,
         cond_frame_choice_probs=cond_frame_choice_probs,
         eval_cond_frames=eval_cond_frames,
+        relative_time_bias=relative_time_bias,
+        relative_time_hidden_dim=relative_time_hidden_dim,
+        latent_slot_adapter=latent_slot_adapter,
+        latent_slot_adapter_heads=latent_slot_adapter_heads,
+        latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
+        latent_slot_adapter_lr_scale=latent_slot_adapter_lr_scale,
     )
     checkpoint_metadata["ema_enabled"] = bool(args.ema)
     checkpoint_metadata["ema_decay"] = float(ema_decay)
@@ -1230,14 +1421,14 @@ def main():
         w_smooth_epoch = _ramp_weight(
             epoch, solver_smooth_start_epoch, solver_smooth_ramp_epochs
         )
-        total_loss = 0.0
-        base_loss_sum = 0.0
-        smooth_weighted_sum = 0.0
-        cond_weighted_sum = 0.0
+        total_loss_terms = []
+        base_loss_terms = []
+        smooth_weighted_terms = []
+        cond_weighted_terms = []
         total_count = 0
-        smooth_acc_sum = 0.0
-        smooth_jerk_sum = 0.0
-        cond_match_sum = 0.0
+        smooth_acc_terms = []
+        smooth_jerk_terms = []
+        cond_match_terms = []
         smooth_count = 0
         cond_count = 0
         bad_streak = 0
@@ -1432,6 +1623,7 @@ def main():
                             g_t = flow_model.cond_mlp(torch.cat([g2d, style_t], dim=-1))
                             cond_batch = {
                                 "tau_out": tau_out,
+                                "tau_cond": tau_cond,
                                 "mem": mem,
                                 "g": g_t,
                                 "mem_mask": ~mask_cond,
@@ -1585,6 +1777,7 @@ def main():
                     tau_cond_reg = _reg_select(tau_cond)
                     cond_batch = {
                         "tau_out": tau_out,
+                        "tau_cond": tau_cond_reg,
                         "mem": mem_reg,
                         "g": g_reg,
                         "mem_mask": ~mask_cond_reg,
@@ -2184,6 +2377,12 @@ def _make_checkpoint_metadata(
     cond_frame_choices,
     cond_frame_choice_probs,
     eval_cond_frames,
+    relative_time_bias,
+    relative_time_hidden_dim,
+    latent_slot_adapter,
+    latent_slot_adapter_heads,
+    latent_slot_adapter_ffn_dim,
+    latent_slot_adapter_lr_scale,
 ):
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -2198,6 +2397,14 @@ def _make_checkpoint_metadata(
         "seq_len": int(seq_len),
         "latent_len": int(latent_len),
         "d_z": int(flow_d_z),
+        "flow_architecture": {
+            "relative_time_bias": bool(relative_time_bias),
+            "relative_time_hidden_dim": int(relative_time_hidden_dim),
+            "latent_slot_adapter": bool(latent_slot_adapter),
+            "latent_slot_adapter_heads": int(latent_slot_adapter_heads),
+            "latent_slot_adapter_ffn_dim": int(latent_slot_adapter_ffn_dim),
+            "latent_slot_adapter_lr_scale": float(latent_slot_adapter_lr_scale),
+        },
         "datasets": sorted(datasets),
         "aist_crop_mode": args.aist_crop_mode,
         "aist_clip_repeat": int(args.aist_clip_repeat),
@@ -2491,6 +2698,20 @@ def _single_loader_iter(loader):
 
 
 def _merge_batches(batches):
+    if len(batches) == 1:
+        batch = batches[0]
+        return (
+            batch["motion"],
+            batch["domain_id"],
+            batch["style_id"],
+            batch["mask"],
+            _normalize_meta(batch["meta"]),
+            batch.get("k2d"),
+            batch.get("vis"),
+            batch.get("conf", batch.get("vis")),
+            batch.get("tau_cond"),
+            batch.get("mask_cond"),
+        )
     motions = []
     domain_ids = []
     style_ids = []

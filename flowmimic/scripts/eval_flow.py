@@ -30,6 +30,13 @@ from flowmimic.src.metrics import (
     summarize_motion_feature_metrics,
 )
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
+from flowmimic.src.model.flow.checkpoint import (
+    flow_state_uses_latent_slot_adapter,
+    flow_state_uses_relative_time_bias,
+    infer_latent_slot_adapter_config,
+    infer_relative_time_hidden_dim,
+    load_flow_state_dict,
+)
 from flowmimic.src.model.flow.solver import solve_flow
 from flowmimic.src.model.vae.losses import LAYOUT_SLICES
 from flowmimic.src.model.vae.backend import decode_motion_latent, load_vae_backend
@@ -636,6 +643,7 @@ def _generate_batch(
         g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
         cond_batch = {
             "tau_out": tau_out,
+            "tau_cond": tau_cond,
             "mem": mem,
             "g": g,
             "mem_mask": ~mask_cond,
@@ -1260,6 +1268,15 @@ def main():
     )
 
     flow_cfg = cfg.get("flow", {})
+    flow_state = state.get("ema") if args.use_ema and "ema" in state else state["model"]
+    relative_time_bias = flow_state_uses_relative_time_bias(flow_state)
+    latent_slot_adapter = flow_state_uses_latent_slot_adapter(flow_state)
+    slot_adapter_config = infer_latent_slot_adapter_config(
+        flow_state,
+        default_latent_len=latent_len,
+        default_ffn_dim=flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
+    )
+    flow_architecture = ckpt_metadata.get("flow_architecture", {})
     flow = ConditionalRectFlow(
         d_z=d_z,
         d_model=flow_cfg.get("d_model", 512),
@@ -1273,12 +1290,24 @@ def main():
         cond_layers=flow_cfg.get("cond_layers", 4),
         cond_heads=flow_cfg.get("cond_heads", 4),
         p_style_drop=flow_cfg.get("p_style_drop", 0.5),
+        relative_time_bias=relative_time_bias,
+        relative_time_hidden_dim=infer_relative_time_hidden_dim(flow_state),
+        latent_len=slot_adapter_config["latent_len"],
+        latent_slot_adapter=latent_slot_adapter,
+        latent_slot_adapter_heads=int(
+            flow_architecture.get(
+                "latent_slot_adapter_heads",
+                flow_cfg.get("latent_slot_adapter_heads", 8),
+            )
+        ),
+        latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
     ).to(args.device)
     print(f"Loading flow model: {args.flow_ckpt}")
-    flow_state = state.get("ema") if args.use_ema and "ema" in state else state["model"]
     if args.use_ema and "ema" not in state:
         print("Warning: --use-ema requested but checkpoint has no EMA state; using model.")
-    flow.load_state_dict(flow_state)
+    load_flow_state_dict(flow, flow_state)
+    print(f"Relative-time attention: enabled={relative_time_bias}")
+    print(f"Latent-slot adapter: enabled={latent_slot_adapter}")
     flow.eval()
 
     t2m_extractor = None

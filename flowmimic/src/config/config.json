@@ -94,7 +94,13 @@
       "cond_lr_scale": 0.1,
       "lr_scale_mode": "none",
       "lr_decay_epoch": null,
+      "finite_check_every": 100,
       "max_bad_steps": 50
+    },
+    "data_loading": {
+      "pin_memory": true,
+      "prefetch_factor": 4,
+      "persistent_workers": true
     },
     "conditioning": {
       "cond_frames_min": 7,

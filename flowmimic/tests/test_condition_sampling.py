@@ -3,7 +3,10 @@ import unittest
 import numpy as np
 import torch
 
-from flowmimic.scripts.train_flow import _apply_condition_count_schedule
+from flowmimic.scripts.train_flow import (
+    _apply_condition_count_schedule,
+    _merge_batches,
+)
 from flowmimic.src.model.vae.datasets.condition_sampling import (
     condition_sample_key,
     deterministic_condition_indices,
@@ -12,6 +15,26 @@ from flowmimic.src.model.vae.datasets.condition_sampling import (
 
 
 class ConditionSamplingTest(unittest.TestCase):
+    def test_single_dataset_merge_preserves_batch_storage(self):
+        motion = torch.randn(2, 196, 263)
+        batch = {
+            "motion": motion,
+            "domain_id": torch.zeros(2, dtype=torch.long),
+            "style_id": torch.zeros(2, dtype=torch.long),
+            "mask": torch.ones(2, 196, dtype=torch.bool),
+            "meta": {"path": ["a", "b"], "start": [0, 1]},
+            "k2d": torch.randn(2, 196, 25, 2),
+            "vis": torch.ones(2, 196, 25),
+            "conf": torch.ones(2, 196, 25),
+            "tau_cond": torch.randn(2, 196),
+            "mask_cond": torch.ones(2, 196, dtype=torch.bool),
+        }
+
+        merged = _merge_batches([batch])
+
+        self.assertEqual(merged[0].data_ptr(), motion.data_ptr())
+        self.assertEqual(merged[4][1]["path"], "b")
+
     def test_even_indices_are_sorted_unique_and_exact(self):
         for count in (7, 14, 28, 49, 98, 196):
             with self.subTest(count=count):

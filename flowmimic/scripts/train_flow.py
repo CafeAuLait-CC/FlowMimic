@@ -119,6 +119,23 @@ def _apply_train_flow_config_defaults(args, config):
         args.lr = flow_cfg.get("lr")
     if args.num_workers is None:
         args.num_workers = int(config.get("num_workers", 10))
+    args.pin_memory = bool(
+        flow_cfg.get("pin_memory", config.get("pin_memory", False))
+    )
+    args.prefetch_factor = max(
+        1,
+        int(flow_cfg.get("prefetch_factor", config.get("prefetch_factor", 2))),
+    )
+    args.persistent_workers = bool(
+        flow_cfg.get(
+            "persistent_workers",
+            config.get("persistent_workers", False),
+        )
+    )
+    args.finite_check_every = max(
+        1,
+        int(flow_cfg.get("finite_check_every", 1)),
+    )
     if args.eval_guidance_scale is None:
         args.eval_guidance_scale = float(flow_eval_cfg.get("guidance_scale", 1.0))
     if args.cfg_drop_prob is None:
@@ -833,15 +850,26 @@ def main():
 
     loader_a = None
     loader_b = None
+    loader_runtime = {
+        "num_workers": args.num_workers,
+        "worker_init_fn": _seed_worker,
+        "pin_memory": args.pin_memory,
+    }
+    if args.num_workers > 0:
+        loader_runtime.update(
+            {
+                "prefetch_factor": args.prefetch_factor,
+                "persistent_workers": args.persistent_workers,
+            }
+        )
     if dataset_a is not None:
         loader_a = DataLoader(
             dataset_a,
             batch_size=args.batch_size,
             shuffle=(sampler_a is None),
             drop_last=True,
-            num_workers=args.num_workers,
             sampler=sampler_a,
-            worker_init_fn=_seed_worker,
+            **loader_runtime,
         )
     if dataset_b is not None:
         loader_b = DataLoader(
@@ -849,9 +877,8 @@ def main():
             batch_size=args.batch_size,
             shuffle=(sampler_b is None),
             drop_last=True,
-            num_workers=args.num_workers,
             sampler=sampler_b,
-            worker_init_fn=_seed_worker,
+            **loader_runtime,
         )
 
     if is_main:
@@ -1495,6 +1522,12 @@ def main():
             bad_local = False
             loss = None
             drop_cond = None
+            audit_finite = (
+                args.debug
+                or args.finite_check_every <= 1
+                or global_step % args.finite_check_every == 0
+            )
+            non_blocking = args.pin_memory
             t0 = time.perf_counter()
             batch = next(batch_iter)
             (
@@ -1509,10 +1542,10 @@ def main():
                 tau_cond,
                 mask_cond,
             ) = _merge_batches(batch)
-            motion = motion.to(device)
-            domain_id = domain_id.to(device)
-            style_id = style_id.to(device)
-            if not torch.isfinite(motion).all():
+            motion = motion.to(device, non_blocking=non_blocking)
+            domain_id = domain_id.to(device, non_blocking=non_blocking)
+            style_id = style_id.to(device, non_blocking=non_blocking)
+            if audit_finite and not torch.isfinite(motion).all():
                 if args.debug:
                     _debug_log("Warning: non-finite motion batch; skipping", epoch + 1)
                 bad_local = True
@@ -1526,11 +1559,11 @@ def main():
                         motion,
                         domain_id,
                         style_id,
-                        mask=mask.to(device),
+                        mask=mask.to(device, non_blocking=non_blocking),
                     )
                 if latent_mean is not None and latent_std is not None:
                     z_data = (z_data - latent_mean) / (latent_std + 1e-6)
-                if not torch.isfinite(z_data).all():
+                if audit_finite and not torch.isfinite(z_data).all():
                     if args.debug:
                         _debug_log("Warning: non-finite z_data; skipping", epoch + 1)
                     bad_local = True
@@ -1546,13 +1579,15 @@ def main():
                         _debug_log("Warning: missing k2d batch; skipping", epoch + 1)
                     bad_local = True
                 else:
-                    k2d_batch = k2d_batch.to(device)
-                    vis_batch = vis_batch.to(device)
+                    k2d_batch = k2d_batch.to(device, non_blocking=non_blocking)
+                    vis_batch = vis_batch.to(device, non_blocking=non_blocking)
                     conf_batch = (
-                        conf_batch.to(device) if conf_batch is not None else vis_batch
+                        conf_batch.to(device, non_blocking=non_blocking)
+                        if conf_batch is not None
+                        else vis_batch
                     )
-                    tau_cond = tau_cond.to(device)
-                    mask_cond = mask_cond.to(device)
+                    tau_cond = tau_cond.to(device, non_blocking=non_blocking)
+                    mask_cond = mask_cond.to(device, non_blocking=non_blocking)
                     if curriculum_step_state is not None:
                         (
                             k2d_batch,
@@ -1570,7 +1605,7 @@ def main():
                             curriculum_step_state.condition_pattern_probs,
                             curriculum_step_state.condition_joint_quotas,
                         )
-                    if not torch.isfinite(k2d_batch).all():
+                    if audit_finite and not torch.isfinite(k2d_batch).all():
                         if args.debug:
                             _debug_log(
                                 "Warning: non-finite keypoints batch; skipping",
@@ -1598,7 +1633,10 @@ def main():
                     mean=k2d_mean,
                     std=k2d_std,
                 )
-                if not torch.isfinite(g2d).all() or not torch.isfinite(mem).all():
+                if audit_finite and (
+                    not torch.isfinite(g2d).all()
+                    or not torch.isfinite(mem).all()
+                ):
                     if args.debug:
                         _debug_log(
                             "Warning: non-finite cond encoder output; skipping",
@@ -1656,9 +1694,13 @@ def main():
                     mem=mem,
                     g=g,
                     mem_mask=~mask_cond,
+                    tau_cond=tau_cond,
                 )
                 target = z_data - x0
-                if not torch.isfinite(v_pred).all() or not torch.isfinite(target).all():
+                if audit_finite and (
+                    not torch.isfinite(v_pred).all()
+                    or not torch.isfinite(target).all()
+                ):
                     if args.debug:
                         _debug_log(
                             "Warning: non-finite v_pred/target; skipping", epoch + 1
@@ -1901,7 +1943,7 @@ def main():
                             lambda_acc * smooth_acc + lambda_jerk * smooth_jerk
                         )
                         loss = loss + smooth_weighted_loss
-                if not torch.isfinite(loss):
+                if audit_finite and not torch.isfinite(loss):
                     if args.debug:
                         _debug_log("Warning: non-finite loss; skipping", epoch + 1)
                     bad_local = True
@@ -1936,20 +1978,20 @@ def main():
                 ema.update(flow_model)
             t5 = time.perf_counter()
             t_backward += t5 - t4
-            total_loss += loss.item()
-            base_loss_sum += base_loss.detach().item()
+            total_loss_terms.append(loss.detach())
+            base_loss_terms.append(base_loss.detach())
             total_count += 1
             if smooth_weighted_loss is not None:
-                smooth_weighted_sum += smooth_weighted_loss.detach().item()
+                smooth_weighted_terms.append(smooth_weighted_loss.detach())
             if cond_weighted_loss is not None:
-                cond_weighted_sum += cond_weighted_loss.detach().item()
+                cond_weighted_terms.append(cond_weighted_loss.detach())
             if smooth_acc is not None:
-                smooth_acc_sum += smooth_acc.detach().item()
+                smooth_acc_terms.append(smooth_acc.detach())
                 smooth_count += 1
             if smooth_jerk is not None:
-                smooth_jerk_sum += smooth_jerk.detach().item()
+                smooth_jerk_terms.append(smooth_jerk.detach())
             if cond_match_loss is not None:
-                cond_match_sum += cond_match_loss.detach().item()
+                cond_match_terms.append(cond_match_loss.detach())
                 cond_count += 1
             if save_every_steps and optimizer_updates % save_every_steps == 0:
                 state = _flow_checkpoint_state(
@@ -1966,41 +2008,45 @@ def main():
                     torch.save(state, last_path)
                     torch.save(state, last_good_path)
 
-        if ddp:
-            stats = torch.tensor(
-                [
-                    total_loss,
-                    base_loss_sum,
-                    smooth_weighted_sum,
-                    cond_weighted_sum,
-                    total_count,
-                    smooth_acc_sum,
-                    smooth_jerk_sum,
-                    cond_match_sum,
-                    t_load,
-                    t_encode,
-                    t_cond,
-                    t_forward,
-                    t_backward,
-                    smooth_count,
-                    cond_count,
-                ],
-                device=device,
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            total_loss = stats[0].item()
-            base_loss_sum = stats[1].item()
-            smooth_weighted_sum = stats[2].item()
-            cond_weighted_sum = stats[3].item()
-            total_count = int(stats[4].item())
-            smooth_acc_sum = stats[5].item()
-            smooth_jerk_sum = stats[6].item()
-            cond_match_sum = stats[7].item()
-            t_load, t_encode, t_cond, t_forward, t_backward = [
-                s.item() for s in stats[8:13]
+        def _sum_epoch_terms(terms):
+            if not terms:
+                return torch.zeros((), device=device)
+            return torch.stack(terms).sum()
+
+        stats = torch.stack(
+            [
+                _sum_epoch_terms(total_loss_terms),
+                _sum_epoch_terms(base_loss_terms),
+                _sum_epoch_terms(smooth_weighted_terms),
+                _sum_epoch_terms(cond_weighted_terms),
+                torch.tensor(total_count, device=device),
+                _sum_epoch_terms(smooth_acc_terms),
+                _sum_epoch_terms(smooth_jerk_terms),
+                _sum_epoch_terms(cond_match_terms),
+                torch.tensor(t_load, device=device),
+                torch.tensor(t_encode, device=device),
+                torch.tensor(t_cond, device=device),
+                torch.tensor(t_forward, device=device),
+                torch.tensor(t_backward, device=device),
+                torch.tensor(smooth_count, device=device),
+                torch.tensor(cond_count, device=device),
             ]
-            smooth_count = int(stats[13].item())
-            cond_count = int(stats[14].item())
+        )
+        if ddp:
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss = stats[0].item()
+        base_loss_sum = stats[1].item()
+        smooth_weighted_sum = stats[2].item()
+        cond_weighted_sum = stats[3].item()
+        total_count = int(stats[4].item())
+        smooth_acc_sum = stats[5].item()
+        smooth_jerk_sum = stats[6].item()
+        cond_match_sum = stats[7].item()
+        t_load, t_encode, t_cond, t_forward, t_backward = [
+            s.item() for s in stats[8:13]
+        ]
+        smooth_count = int(stats[13].item())
+        cond_count = int(stats[14].item())
         curriculum_end_state = (
             curriculum.state(optimizer_updates) if curriculum is not None else None
         )

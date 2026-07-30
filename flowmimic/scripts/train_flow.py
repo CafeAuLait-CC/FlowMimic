@@ -23,6 +23,7 @@ from flowmimic.src.config.config import load_config
 from flowmimic.src.model.flow.checkpoint import (
     flow_state_uses_latent_slot_adapter,
     flow_state_uses_relative_time_bias,
+    flow_state_uses_true_null_condition,
     infer_latent_slot_adapter_config,
     infer_relative_time_hidden_dim,
     load_flow_state_dict,
@@ -65,6 +66,9 @@ WANDB_EVAL_METRIC_KEYS = (
     "e2d_slack",
     "skate_mean",
 )
+
+CFG_TIME_BIN_EDGES = (0.0, 0.25, 0.5, 0.75, 1.0)
+CFG_TIME_BIN_LABELS = ("t0_0p25", "t0p25_0p5", "t0p5_0p75", "t0p75_1")
 
 
 def _apply_train_flow_config_defaults(args, config):
@@ -302,6 +306,7 @@ def main():
         choices=(
             "unified_round0",
             "unified_round0_phase1d",
+            "unified_round0_phase1d_cfg5",
             "sparse_pattern_phase1",
             "sparse_pattern_phase1_control",
             "sparse_pattern_phase1a_target",
@@ -309,6 +314,9 @@ def main():
             "sparse_pattern_phase1b_relative_time",
             "sparse_pattern_phase1b_legacy_control",
             "sparse_pattern_phase1c_latent_slot_adapter",
+            "cfg_phase2_true_null",
+            "cfg_phase2_true_null_drop10",
+            "cfg_phase2_control",
         ),
         default=None,
         help="Use a named update-based training curriculum from config.json.",
@@ -446,7 +454,11 @@ def main():
     _apply_train_flow_config_defaults(args, config)
     curriculum = None
     curriculum_config = None
-    if args.curriculum in ("unified_round0", "unified_round0_phase1d"):
+    if args.curriculum in (
+        "unified_round0",
+        "unified_round0_phase1d",
+        "unified_round0_phase1d_cfg5",
+    ):
         curriculum_config = (
             config.get("flow", {})
             .get("curriculum", {})
@@ -481,6 +493,9 @@ def main():
         "sparse_pattern_phase1b_relative_time",
         "sparse_pattern_phase1b_legacy_control",
         "sparse_pattern_phase1c_latent_slot_adapter",
+        "cfg_phase2_true_null",
+        "cfg_phase2_true_null_drop10",
+        "cfg_phase2_control",
     ):
         curriculum_config = (
             config.get("flow", {}).get("curriculum", {}).get(args.curriculum)
@@ -549,6 +564,30 @@ def main():
             flow_cfg.get("latent_slot_adapter_lr_scale", 1.0),
         )
     )
+    true_null_condition = bool(
+        (curriculum_config or {}).get(
+            "true_null_condition",
+            flow_cfg.get("true_null_condition", False),
+        )
+    )
+    cfg_ramp_start_update = (curriculum_config or {}).get(
+        "cfg_ramp_start_update"
+    )
+    cfg_ramp_end_update = (curriculum_config or {}).get(
+        "cfg_ramp_end_update"
+    )
+    if "cfg_drop_prob" in (curriculum_config or {}):
+        args.cfg_drop_prob = float(curriculum_config["cfg_drop_prob"])
+    if cfg_ramp_start_update is not None:
+        cfg_ramp_start_update = int(cfg_ramp_start_update)
+    if cfg_ramp_end_update is not None:
+        cfg_ramp_end_update = int(cfg_ramp_end_update)
+    if (
+        cfg_ramp_start_update is not None
+        and cfg_ramp_end_update is not None
+        and cfg_ramp_end_update <= cfg_ramp_start_update
+    ):
+        raise ValueError("cfg_ramp_end_update must exceed cfg_ramp_start_update")
     args.cond_frame_choices, args.cond_frame_choice_probs = (
         _parse_condition_frame_mixture(
             args.cond_frame_choices,
@@ -600,6 +639,14 @@ def main():
                 stamp = datetime.now().strftime("%y%m%d-%H%M%S")
                 run_name = f"flow-{stamp}"
             run_group = args.wandb_group or "Flow"
+            wandb_settings = None
+            if os.environ.get("FLOWMIMIC_WANDB_DISABLE_STATS", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                wandb_settings = wandb.Settings(x_disable_stats=True)
+                print("W&B background system telemetry disabled")
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 entity=args.wandb_entity,
@@ -609,6 +656,7 @@ def main():
                 resume=args.wandb_resume if args.wandb_id else None,
                 tags=tags or None,
                 mode=args.wandb_mode,
+                settings=wandb_settings,
                 config={
                     "epochs": args.epochs,
                     "batch_size": args.batch_size,
@@ -930,11 +978,13 @@ def main():
         latent_slot_adapter=latent_slot_adapter,
         latent_slot_adapter_heads=latent_slot_adapter_heads,
         latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
+        true_null_condition=true_null_condition,
     )
     flow.to(device)
     resume_state = None
     relative_time_migration = False
     latent_slot_adapter_migration = False
+    true_null_migration = False
     if args.resume:
         if is_main:
             print(f"Resuming from {args.resume}")
@@ -944,6 +994,9 @@ def main():
             resume_model_state
         )
         source_uses_latent_slot_adapter = flow_state_uses_latent_slot_adapter(
+            resume_model_state
+        )
+        source_uses_true_null = flow_state_uses_true_null_condition(
             resume_model_state
         )
         if source_uses_relative_time and not relative_time_bias:
@@ -962,11 +1015,20 @@ def main():
         latent_slot_adapter_migration = (
             latent_slot_adapter and not source_uses_latent_slot_adapter
         )
+        if source_uses_true_null and not true_null_condition:
+            raise ValueError(
+                "Checkpoint uses true-null conditioning, but the selected "
+                "configuration disables it"
+            )
+        true_null_migration = (
+            true_null_condition and not source_uses_true_null
+        )
         load_flow_state_dict(
             flow,
             resume_model_state,
             allow_relative_time_migration=relative_time_migration,
             allow_latent_slot_adapter_migration=latent_slot_adapter_migration,
+            allow_true_null_migration=true_null_migration,
         )
         if relative_time_migration and is_main:
             print(
@@ -977,6 +1039,11 @@ def main():
             print(
                 "Initialized zero-output latent-slot adapter from a legacy "
                 "flow checkpoint"
+            )
+        if true_null_migration and is_main:
+            print(
+                "Initialized learned true-null condition from a legacy flow "
+                "checkpoint"
             )
     if latent_slot_adapter and (latent_slot_adapter_migration or not args.resume):
         if not hasattr(vae, "latent_queries") or not hasattr(vae, "latent_pos"):
@@ -1042,6 +1109,14 @@ def main():
                 latent_slot_adapter_heads,
                 latent_slot_adapter_ffn_dim,
                 latent_slot_adapter_lr_scale,
+            )
+        )
+        print(
+            "True-null condition: enabled={} target_prob={} update_ramp={}-{}".format(
+                true_null_condition,
+                args.cfg_drop_prob,
+                cfg_ramp_start_update,
+                cfg_ramp_end_update,
             )
         )
 
@@ -1247,6 +1322,9 @@ def main():
         teacher_latent_slot_adapter = flow_state_uses_latent_slot_adapter(
             teacher_state
         )
+        teacher_true_null_condition = flow_state_uses_true_null_condition(
+            teacher_state
+        )
         teacher_slot_config = infer_latent_slot_adapter_config(
             teacher_state,
             default_latent_len=latent_len,
@@ -1271,6 +1349,7 @@ def main():
             latent_slot_adapter=teacher_latent_slot_adapter,
             latent_slot_adapter_heads=latent_slot_adapter_heads,
             latent_slot_adapter_ffn_dim=teacher_slot_config["ffn_dim"],
+            true_null_condition=teacher_true_null_condition,
         )
         load_flow_state_dict(teacher_flow, teacher_state)
         teacher_flow.to(device)
@@ -1284,7 +1363,9 @@ def main():
         ema.load_state_dict(
             ema_state,
             allow_missing=(
-                relative_time_migration or latent_slot_adapter_migration
+                relative_time_migration
+                or latent_slot_adapter_migration
+                or true_null_migration
             ),
         )
     checkpoint_metadata = _make_checkpoint_metadata(
@@ -1311,6 +1392,9 @@ def main():
         latent_slot_adapter_heads=latent_slot_adapter_heads,
         latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
         latent_slot_adapter_lr_scale=latent_slot_adapter_lr_scale,
+        true_null_condition=true_null_condition,
+        cfg_ramp_start_update=cfg_ramp_start_update,
+        cfg_ramp_end_update=cfg_ramp_end_update,
     )
     checkpoint_metadata["ema_enabled"] = bool(args.ema)
     checkpoint_metadata["ema_decay"] = float(ema_decay)
@@ -1391,9 +1475,19 @@ def main():
             ramp_epochs=args.cond_frame_drop_ramp_epochs,
         )
         effective_cfg_drop_prob = (
-            args.cfg_drop_prob
-            if args.cfg_start_epoch <= 0 or epoch_num >= args.cfg_start_epoch
-            else 0.0
+            _scheduled_update_probability(
+                optimizer_updates,
+                args.cfg_drop_prob,
+                cfg_ramp_start_update,
+                cfg_ramp_end_update,
+            )
+            if cfg_ramp_start_update is not None
+            else (
+                args.cfg_drop_prob
+                if args.cfg_start_epoch <= 0
+                or epoch_num >= args.cfg_start_epoch
+                else 0.0
+            )
         )
         for dataset in (dataset_a, dataset_b):
             if dataset is not None and hasattr(dataset, "cond_frame_drop_prob"):
@@ -1456,6 +1550,24 @@ def main():
         smooth_acc_terms = []
         smooth_jerk_terms = []
         cond_match_terms = []
+        cfg_cond_loss_sum = torch.zeros((), device=device)
+        cfg_null_loss_sum = torch.zeros((), device=device)
+        cfg_cond_count = torch.zeros((), device=device)
+        cfg_null_count = torch.zeros((), device=device)
+        cfg_delta_l2_sum = torch.zeros((), device=device)
+        cfg_delta_count = torch.zeros((), device=device)
+        cfg_cond_time_loss_sums = torch.zeros(
+            len(CFG_TIME_BIN_LABELS), device=device
+        )
+        cfg_null_time_loss_sums = torch.zeros(
+            len(CFG_TIME_BIN_LABELS), device=device
+        )
+        cfg_cond_time_counts = torch.zeros(
+            len(CFG_TIME_BIN_LABELS), device=device
+        )
+        cfg_null_time_counts = torch.zeros(
+            len(CFG_TIME_BIN_LABELS), device=device
+        )
         smooth_count = 0
         cond_count = 0
         bad_streak = 0
@@ -1507,6 +1619,16 @@ def main():
                 curriculum.state(optimizer_updates)
                 if curriculum is not None
                 else None
+            )
+            step_cfg_drop_prob = (
+                _scheduled_update_probability(
+                    optimizer_updates,
+                    args.cfg_drop_prob,
+                    cfg_ramp_start_update,
+                    cfg_ramp_end_update,
+                )
+                if cfg_ramp_start_update is not None
+                else effective_cfg_drop_prob
             )
             if curriculum_step_state is not None:
                 _set_optimizer_group_lrs(
@@ -1612,12 +1734,12 @@ def main():
                                 epoch + 1,
                             )
                         bad_local = True
-                    elif effective_cfg_drop_prob > 0:
+                    elif step_cfg_drop_prob > 0:
                         drop_cond = (
                             torch.rand(k2d_batch.shape[0], device=device)
-                            < effective_cfg_drop_prob
+                            < step_cfg_drop_prob
                         )
-                        if drop_cond.any():
+                        if drop_cond.any() and not true_null_condition:
                             k2d_batch = k2d_batch.clone()
                             vis_batch = vis_batch.clone()
                             conf_batch = conf_batch.clone()
@@ -1649,45 +1771,79 @@ def main():
                     use_teacher = True
                     if teacher_mode == "mixed":
                         use_teacher = torch.rand(1).item() < p_teacher
-                    if use_teacher:
-                        with torch.no_grad():
-                            style_id_cond = style_id
-                            if drop_cond is not None and drop_cond.any():
-                                style_id_cond = style_id.clone()
-                                style_id_cond[drop_cond] = 0
-                            style_t = flow_model.style_emb(
-                                style_id_cond, domain_id, apply_dropout=False
-                            )
-                            g_t = flow_model.cond_mlp(torch.cat([g2d, style_t], dim=-1))
-                            cond_batch = {
-                                "tau_out": tau_out,
-                                "tau_cond": tau_cond,
-                                "mem": mem,
-                                "g": g_t,
-                                "mem_mask": ~mask_cond,
-                            }
-                        z_data = teacher.generate_x1_hat(x0, cond_batch)
-                        if not torch.isfinite(z_data).all():
-                            if args.debug:
-                                _debug_log(
-                                    "Warning: non-finite teacher target; skipping",
-                                    epoch + 1,
-                                )
-                            bad_local = True
 
-            if not bad_local:
-                x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
                 style_id_cond = style_id
-                if drop_cond is not None and drop_cond.any():
+                if (
+                    not true_null_condition
+                    and drop_cond is not None
+                    and drop_cond.any()
+                ):
                     style_id_cond = style_id.clone()
                     style_id_cond[drop_cond] = 0
                 style = flow_model.style_emb(
                     style_id_cond, domain_id, apply_dropout=not use_teacher
                 )
                 g = flow_model.cond_mlp(torch.cat([g2d, style], dim=-1))
+                if true_null_condition:
+                    if drop_cond is None:
+                        drop_cond = torch.zeros(
+                            k2d_batch.shape[0],
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    if drop_cond.any():
+                        conf_batch = conf_batch.clone()
+                        conf_batch[drop_cond] = 0.0
+
+                if use_teacher:
+                    with torch.no_grad():
+                        style_t = flow_model.style_emb(
+                            style_id_cond,
+                            domain_id,
+                            apply_dropout=False,
+                        )
+                        g_t = flow_model.cond_mlp(
+                            torch.cat([g2d, style_t], dim=-1)
+                        )
+                        mem_t = mem
+                        tau_cond_t = tau_cond
+                        mask_cond_t = mask_cond
+                        if true_null_condition:
+                            (
+                                g_t,
+                                mem_t,
+                                tau_cond_t,
+                                mask_cond_t,
+                            ) = flow_model.apply_true_null_condition(
+                                g_t,
+                                mem,
+                                tau_cond,
+                                mask_cond,
+                                style_id,
+                                domain_id,
+                                drop_cond,
+                            )
+                        cond_batch = {
+                            "tau_out": tau_out,
+                            "tau_cond": tau_cond_t,
+                            "mem": mem_t,
+                            "g": g_t,
+                            "mem_mask": ~mask_cond_t,
+                        }
+                    z_data = teacher.generate_x1_hat(x0, cond_batch)
+                    if not torch.isfinite(z_data).all():
+                        if args.debug:
+                            _debug_log(
+                                "Warning: non-finite teacher target; skipping",
+                                epoch + 1,
+                            )
+                        bad_local = True
+
+            if not bad_local:
+                x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
                 t3 = time.perf_counter()
                 t_cond += t3 - t2
-                v_pred = flow(
+                flow_output = flow(
                     x_t,
                     t,
                     tau_out,
@@ -1695,7 +1851,16 @@ def main():
                     g=g,
                     mem_mask=~mask_cond,
                     tau_cond=tau_cond,
+                    null_mask=drop_cond if true_null_condition else None,
+                    style_id=style_id if true_null_condition else None,
+                    domain_id=domain_id if true_null_condition else None,
+                    return_cfg_diagnostics=true_null_condition,
                 )
+                if true_null_condition:
+                    v_pred, cfg_forward_diagnostics = flow_output
+                else:
+                    v_pred = flow_output
+                    cfg_forward_diagnostics = None
                 target = z_data - x0
                 if audit_finite and (
                     not torch.isfinite(v_pred).all()
@@ -1710,7 +1875,11 @@ def main():
             if not bad_local:
                 t4 = time.perf_counter()
                 t_forward += t4 - t3
-                base_loss = torch.mean((v_pred - target) ** 2)
+                base_loss_per_sample = torch.mean(
+                    (v_pred - target) ** 2,
+                    dim=tuple(range(1, v_pred.ndim)),
+                )
+                base_loss = base_loss_per_sample.mean()
                 loss = base_loss
                 smooth_acc = None
                 smooth_jerk = None
@@ -1993,6 +2162,32 @@ def main():
             if cond_match_loss is not None:
                 cond_match_terms.append(cond_match_loss.detach())
                 cond_count += 1
+            if true_null_condition:
+                null_rows = drop_cond
+                cond_rows = ~null_rows
+                detached_sample_loss = base_loss_per_sample.detach()
+                cfg_cond_loss_sum += detached_sample_loss[cond_rows].sum()
+                cfg_null_loss_sum += detached_sample_loss[null_rows].sum()
+                cfg_cond_count += cond_rows.sum()
+                cfg_null_count += null_rows.sum()
+                delta_l2 = cfg_forward_diagnostics["guidance_delta_l2"]
+                cfg_delta_l2_sum += delta_l2.sum()
+                cfg_delta_count += delta_l2.numel()
+                detached_t = t.detach()
+                for bin_idx, (lower, upper) in enumerate(
+                    zip(CFG_TIME_BIN_EDGES[:-1], CFG_TIME_BIN_EDGES[1:])
+                ):
+                    time_rows = (detached_t >= lower) & (detached_t < upper)
+                    cond_time_rows = time_rows & cond_rows
+                    null_time_rows = time_rows & null_rows
+                    cfg_cond_time_loss_sums[bin_idx] += detached_sample_loss[
+                        cond_time_rows
+                    ].sum()
+                    cfg_null_time_loss_sums[bin_idx] += detached_sample_loss[
+                        null_time_rows
+                    ].sum()
+                    cfg_cond_time_counts[bin_idx] += cond_time_rows.sum()
+                    cfg_null_time_counts[bin_idx] += null_time_rows.sum()
             if save_every_steps and optimizer_updates % save_every_steps == 0:
                 state = _flow_checkpoint_state(
                     flow_model,
@@ -2034,6 +2229,26 @@ def main():
         )
         if ddp:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        cfg_stats = torch.cat(
+            [
+                torch.stack(
+                    [
+                        cfg_cond_loss_sum,
+                        cfg_null_loss_sum,
+                        cfg_cond_count,
+                        cfg_null_count,
+                        cfg_delta_l2_sum,
+                        cfg_delta_count,
+                    ]
+                ),
+                cfg_cond_time_loss_sums,
+                cfg_null_time_loss_sums,
+                cfg_cond_time_counts,
+                cfg_null_time_counts,
+            ]
+        )
+        if ddp:
+            dist.all_reduce(cfg_stats, op=dist.ReduceOp.SUM)
         total_loss = stats[0].item()
         base_loss_sum = stats[1].item()
         smooth_weighted_sum = stats[2].item()
@@ -2047,9 +2262,39 @@ def main():
         ]
         smooth_count = int(stats[13].item())
         cond_count = int(stats[14].item())
+        cfg_cond_loss_sum = cfg_stats[0].item()
+        cfg_null_loss_sum = cfg_stats[1].item()
+        cfg_cond_count = int(cfg_stats[2].item())
+        cfg_null_count = int(cfg_stats[3].item())
+        cfg_delta_l2_sum = cfg_stats[4].item()
+        cfg_delta_count = int(cfg_stats[5].item())
+        cfg_offset = 6
+        cfg_bin_count = len(CFG_TIME_BIN_LABELS)
+        cfg_cond_time_loss_sums = cfg_stats[
+            cfg_offset : cfg_offset + cfg_bin_count
+        ].tolist()
+        cfg_offset += cfg_bin_count
+        cfg_null_time_loss_sums = cfg_stats[
+            cfg_offset : cfg_offset + cfg_bin_count
+        ].tolist()
+        cfg_offset += cfg_bin_count
+        cfg_cond_time_counts = cfg_stats[
+            cfg_offset : cfg_offset + cfg_bin_count
+        ].tolist()
+        cfg_offset += cfg_bin_count
+        cfg_null_time_counts = cfg_stats[
+            cfg_offset : cfg_offset + cfg_bin_count
+        ].tolist()
         curriculum_end_state = (
             curriculum.state(optimizer_updates) if curriculum is not None else None
         )
+        if cfg_ramp_start_update is not None:
+            effective_cfg_drop_prob = _scheduled_update_probability(
+                optimizer_updates,
+                args.cfg_drop_prob,
+                cfg_ramp_start_update,
+                cfg_ramp_end_update,
+            )
         last_completed_epoch = epoch + 1
         if is_main:
             total_loss_avg = total_loss / max(total_count, 1)
@@ -2073,6 +2318,12 @@ def main():
                 cond_match_log_ema if cond_match_log_ema is not None else 0.0
             )
             cond_updates = cond_count / max(world_size, 1)
+            cfg_cond_loss_avg = cfg_cond_loss_sum / max(cfg_cond_count, 1)
+            cfg_null_loss_avg = cfg_null_loss_sum / max(cfg_null_count, 1)
+            cfg_actual_null_fraction = cfg_null_count / max(
+                cfg_cond_count + cfg_null_count, 1
+            )
+            cfg_delta_l2_avg = cfg_delta_l2_sum / max(cfg_delta_count, 1)
             print(f"Epoch {epoch + 1} avg_loss={total_loss_avg:.6f}")
             print(
                 (
@@ -2085,6 +2336,20 @@ def main():
                     cond_weighted_avg,
                 )
             )
+            if true_null_condition:
+                print(
+                    (
+                        "Epoch {} cfg_velocity_cond={:.6f} "
+                        "cfg_velocity_null={:.6f} cfg_actual_null={:.4f} "
+                        "cfg_delta_l2={:.6f}"
+                    ).format(
+                        epoch + 1,
+                        cfg_cond_loss_avg,
+                        cfg_null_loss_avg,
+                        cfg_actual_null_fraction,
+                        cfg_delta_l2_avg,
+                    )
+                )
             print(
                 (
                     "Epoch {} smooth_acc={:.6f} smooth_jerk={:.6f} "
@@ -2189,6 +2454,28 @@ def main():
                         wandb_metrics[
                             f"schedule/joint_quota_{pattern}_k{count}"
                         ] = fraction
+                if true_null_condition:
+                    wandb_metrics.update(
+                        {
+                            "loss/velocity_cond": cfg_cond_loss_avg,
+                            "schedule/actual_cfg_drop_fraction": cfg_actual_null_fraction,
+                        }
+                    )
+                    if cfg_null_count > 0:
+                        wandb_metrics["loss/velocity_null"] = cfg_null_loss_avg
+                    if cfg_delta_count > 0:
+                        wandb_metrics["cfg/guidance_delta_l2"] = cfg_delta_l2_avg
+                    for bin_idx, label in enumerate(CFG_TIME_BIN_LABELS):
+                        cond_bin_count = cfg_cond_time_counts[bin_idx]
+                        null_bin_count = cfg_null_time_counts[bin_idx]
+                        if cond_bin_count > 0:
+                            wandb_metrics[f"loss/velocity_cond_{label}"] = (
+                                cfg_cond_time_loss_sums[bin_idx] / cond_bin_count
+                            )
+                        if null_bin_count > 0:
+                            wandb_metrics[f"loss/velocity_null_{label}"] = (
+                                cfg_null_time_loss_sums[bin_idx] / null_bin_count
+                            )
                 wandb_run.log(
                     wandb_metrics,
                     step=epoch + 1,
@@ -2429,6 +2716,9 @@ def _make_checkpoint_metadata(
     latent_slot_adapter_heads,
     latent_slot_adapter_ffn_dim,
     latent_slot_adapter_lr_scale,
+    true_null_condition,
+    cfg_ramp_start_update,
+    cfg_ramp_end_update,
 ):
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -2450,6 +2740,7 @@ def _make_checkpoint_metadata(
             "latent_slot_adapter_heads": int(latent_slot_adapter_heads),
             "latent_slot_adapter_ffn_dim": int(latent_slot_adapter_ffn_dim),
             "latent_slot_adapter_lr_scale": float(latent_slot_adapter_lr_scale),
+            "true_null_condition": bool(true_null_condition),
         },
         "datasets": sorted(datasets),
         "aist_crop_mode": args.aist_crop_mode,
@@ -2468,6 +2759,9 @@ def _make_checkpoint_metadata(
             "cond_frame_drop_max_block_frac": args.cond_frame_drop_max_block_frac,
             "cfg_drop_prob": args.cfg_drop_prob,
             "cfg_start_epoch": args.cfg_start_epoch,
+            "cfg_ramp_start_update": cfg_ramp_start_update,
+            "cfg_ramp_end_update": cfg_ramp_end_update,
+            "true_null_condition": bool(true_null_condition),
         },
         "regularization": {
             "solver_cond_start_epoch": args.solver_cond_start_epoch,
@@ -3081,6 +3375,29 @@ def _scheduled_probability(epoch_num, target_prob, start_epoch=0, ramp_epochs=0)
     progress = (int(epoch_num) - ramp_start) / float(ramp_epochs)
     progress = min(max(progress, 0.0), 1.0)
     return target_prob * progress
+
+
+def _scheduled_update_probability(
+    completed_updates,
+    target_prob,
+    start_update,
+    end_update,
+):
+    target_prob = float(target_prob or 0.0)
+    if target_prob <= 0.0:
+        return 0.0
+    if start_update is None:
+        return target_prob
+    start_update = int(start_update)
+    if int(completed_updates) <= start_update:
+        return 0.0
+    if end_update is None:
+        return target_prob
+    end_update = int(end_update)
+    progress = (int(completed_updates) - start_update) / float(
+        max(end_update - start_update, 1)
+    )
+    return target_prob * min(max(progress, 0.0), 1.0)
 
 
 def _apply_condition_count_schedule(

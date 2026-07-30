@@ -1,5 +1,6 @@
 RELATIVE_TIME_STATE_MARKER = ".relative_time_bias."
 LATENT_SLOT_ADAPTER_STATE_MARKER = "slot_condition_adapter."
+TRUE_NULL_STATE_MARKERS = ("null_memory", "null_global")
 
 
 def flow_state_uses_relative_time_bias(state_dict):
@@ -16,6 +17,13 @@ def infer_relative_time_hidden_dim(state_dict, default=32):
 
 def flow_state_uses_latent_slot_adapter(state_dict):
     return any(LATENT_SLOT_ADAPTER_STATE_MARKER in key for key in state_dict)
+
+
+def flow_state_uses_true_null_condition(state_dict):
+    return all(
+        any(key.endswith(marker) for key in state_dict)
+        for marker in TRUE_NULL_STATE_MARKERS
+    )
 
 
 def infer_latent_slot_adapter_config(
@@ -39,6 +47,7 @@ def load_flow_state_dict(
     state_dict,
     allow_relative_time_migration=False,
     allow_latent_slot_adapter_migration=False,
+    allow_true_null_migration=False,
 ):
     """Load a flow state, optionally initializing new conditioning branches."""
     incompatible = model.load_state_dict(state_dict, strict=False)
@@ -53,6 +62,12 @@ def load_flow_state_dict(
             key
             for key in missing
             if LATENT_SLOT_ADAPTER_STATE_MARKER not in key
+        ]
+    if allow_true_null_migration:
+        missing = [
+            key
+            for key in missing
+            if not any(key.endswith(marker) for marker in TRUE_NULL_STATE_MARKERS)
         ]
     if missing or unexpected:
         raise RuntimeError(

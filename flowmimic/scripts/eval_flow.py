@@ -33,6 +33,7 @@ from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.checkpoint import (
     flow_state_uses_latent_slot_adapter,
     flow_state_uses_relative_time_bias,
+    flow_state_uses_true_null_condition,
     infer_latent_slot_adapter_config,
     infer_relative_time_hidden_dim,
     load_flow_state_dict,
@@ -649,25 +650,38 @@ def _generate_batch(
             "mem_mask": ~mask_cond,
         }
         if guidance_scale != 1.0:
-            k2d_uncond = torch.zeros_like(k2d_batch)
-            vis_uncond = torch.zeros_like(vis_batch)
-            g2d_uncond, mem_uncond, _ = flow.cond_encoder(
-                k2d_uncond,
-                tau_cond,
-                vis_mask=vis_uncond,
-                mask_cond=mask_cond,
-                mean=k2d_mean,
-                std=k2d_std,
-            )
-            style_uncond = flow.style_emb(
-                torch.zeros_like(style_id), domain_id, apply_dropout=False
-            )
-            g_uncond = flow.cond_mlp(torch.cat([g2d_uncond, style_uncond], dim=-1))
+            if flow.true_null_condition:
+                (
+                    g_uncond,
+                    mem_uncond,
+                    mem_mask_uncond,
+                    tau_cond_uncond,
+                ) = flow.encode_null_condition(style_id, domain_id)
+            else:
+                k2d_uncond = torch.zeros_like(k2d_batch)
+                vis_uncond = torch.zeros_like(vis_batch)
+                g2d_uncond, mem_uncond, _ = flow.cond_encoder(
+                    k2d_uncond,
+                    tau_cond,
+                    vis_mask=vis_uncond,
+                    mask_cond=mask_cond,
+                    mean=k2d_mean,
+                    std=k2d_std,
+                )
+                style_uncond = flow.style_emb(
+                    torch.zeros_like(style_id), domain_id, apply_dropout=False
+                )
+                g_uncond = flow.cond_mlp(
+                    torch.cat([g2d_uncond, style_uncond], dim=-1)
+                )
+                mem_mask_uncond = ~mask_cond
+                tau_cond_uncond = tau_cond
             cond_batch.update(
                 {
                     "mem_uncond": mem_uncond,
                     "g_uncond": g_uncond,
-                    "mem_mask_uncond": ~mask_cond,
+                    "mem_mask_uncond": mem_mask_uncond,
+                    "tau_cond_uncond": tau_cond_uncond,
                     "guidance_scale": guidance_scale,
                 }
             )
@@ -1271,6 +1285,7 @@ def main():
     flow_state = state.get("ema") if args.use_ema and "ema" in state else state["model"]
     relative_time_bias = flow_state_uses_relative_time_bias(flow_state)
     latent_slot_adapter = flow_state_uses_latent_slot_adapter(flow_state)
+    true_null_condition = flow_state_uses_true_null_condition(flow_state)
     slot_adapter_config = infer_latent_slot_adapter_config(
         flow_state,
         default_latent_len=latent_len,
@@ -1301,6 +1316,7 @@ def main():
             )
         ),
         latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
+        true_null_condition=true_null_condition,
     ).to(args.device)
     print(f"Loading flow model: {args.flow_ckpt}")
     if args.use_ema and "ema" not in state:
@@ -1308,6 +1324,7 @@ def main():
     load_flow_state_dict(flow, flow_state)
     print(f"Relative-time attention: enabled={relative_time_bias}")
     print(f"Latent-slot adapter: enabled={latent_slot_adapter}")
+    print(f"True-null condition: enabled={true_null_condition}")
     flow.eval()
 
     t2m_extractor = None

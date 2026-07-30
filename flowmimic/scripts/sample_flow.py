@@ -19,6 +19,7 @@ from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.checkpoint import (
     flow_state_uses_latent_slot_adapter,
     flow_state_uses_relative_time_bias,
+    flow_state_uses_true_null_condition,
     infer_latent_slot_adapter_config,
     infer_relative_time_hidden_dim,
     load_flow_state_dict,
@@ -199,6 +200,7 @@ def main():
     flow_state = state["ema"] if args.use_ema and "ema" in state else state["model"]
     relative_time_bias = flow_state_uses_relative_time_bias(flow_state)
     latent_slot_adapter = flow_state_uses_latent_slot_adapter(flow_state)
+    true_null_condition = flow_state_uses_true_null_condition(flow_state)
     slot_adapter_config = infer_latent_slot_adapter_config(
         flow_state,
         default_latent_len=latent_len,
@@ -229,6 +231,7 @@ def main():
             )
         ),
         latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
+        true_null_condition=true_null_condition,
     )
     load_flow_state_dict(flow, flow_state)
     flow.to(device)
@@ -399,25 +402,39 @@ def main():
         "g": g,
     }
     if args.guidance_scale != 1.0:
-        k2d_uncond = torch.zeros_like(cond["k2d"])
-        vis_uncond = (
-            torch.zeros_like(cond["vis_mask"]) if "vis_mask" in cond else None
-        )
-        g2d_uncond, mem_uncond, _ = flow.cond_encoder(
-            k2d_uncond,
-            cond["tau_cond"],
-            vis_mask=vis_uncond,
-            mean=k2d_mean,
-            std=k2d_std,
-        )
-        style_uncond = flow.style_emb(
-            torch.zeros_like(style_id), domain_id, apply_dropout=False
-        )
-        g_uncond = flow.cond_mlp(torch.cat([g2d_uncond, style_uncond], dim=-1))
+        if true_null_condition:
+            (
+                g_uncond,
+                mem_uncond,
+                mem_mask_uncond,
+                tau_cond_uncond,
+            ) = flow.encode_null_condition(style_id, domain_id)
+        else:
+            k2d_uncond = torch.zeros_like(cond["k2d"])
+            vis_uncond = (
+                torch.zeros_like(cond["vis_mask"]) if "vis_mask" in cond else None
+            )
+            g2d_uncond, mem_uncond, _ = flow.cond_encoder(
+                k2d_uncond,
+                cond["tau_cond"],
+                vis_mask=vis_uncond,
+                mean=k2d_mean,
+                std=k2d_std,
+            )
+            style_uncond = flow.style_emb(
+                torch.zeros_like(style_id), domain_id, apply_dropout=False
+            )
+            g_uncond = flow.cond_mlp(
+                torch.cat([g2d_uncond, style_uncond], dim=-1)
+            )
+            mem_mask_uncond = None
+            tau_cond_uncond = cond["tau_cond"]
         cond_batch.update(
             {
                 "mem_uncond": mem_uncond,
                 "g_uncond": g_uncond,
+                "mem_mask_uncond": mem_mask_uncond,
+                "tau_cond_uncond": tau_cond_uncond,
                 "guidance_scale": args.guidance_scale,
             }
         )

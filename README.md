@@ -231,15 +231,15 @@ Flow training expects the selected VAE latent target to be normalized. Compute l
 
 ```bash
 python flowmimic/tools/compute_vae_latent_stats.py \
-  --checkpoint checkpoints/vqvae/<run>/motion_vqvae_latest.pt \
+  --checkpoint checkpoints/vqvae/aist_mvh_len196_latent16_code1024_visible_retrain_to200_ddp2_retry_260717/motion_vqvae_epoch200.pt \
   --vae-type motion_vqvae \
   --seq-len 196 \
   --split train \
   --aist-crop-mode first \
-  --out-path data/vqvae_latent_stats_aist_train_latent16_epoch800.npz
+  --out-path data/vqvae_latent_stats_aist_train_latent16_epoch200_retry.npz
 ```
 
-For continuous MotionVAE checkpoints, use `--vae-type motion_vae` or leave `--vae-type auto`.
+The selected flow checkpoint, VQ-VAE checkpoint, and latent-statistics file must remain a matched set. When selecting a different autoencoder checkpoint, compute a new statistics file with a name that identifies that checkpoint. For continuous MotionVAE checkpoints, use `--vae-type motion_vae` or leave `--vae-type auto`.
 
 ## Flow Training
 
@@ -251,34 +251,21 @@ The VQ-flow setup predicts velocity in normalized VQ-VAE latent space:
 noise x0 -> rectified flow -> normalized z_q -> latent denorm -> VQ-VAE decoder -> 263D motion -> SMPL22 joints
 ```
 
-Example AIST-only VQ-flow command:
+The selected AIST-only Round 0 setup is defined by the `unified_round0_phase1d_cfg5` update-based curriculum. Launch it through the maintained wrapper:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python flowmimic/scripts/train_flow.py \
-  --datasets AIST \
-  --seq-len 196 \
-  --batch-size 256 \
-  --aist-crop-mode random \
-  --aist-clip-repeat 128 \
-  --vae-ckpt checkpoints/vqvae/<run>/motion_vqvae_latest.pt \
-  --vae-type motion_vqvae \
-  --latent-stats-path data/vqvae_latent_stats_aist_train_latent16_epoch800.npz \
-  --cond-frames-min 196 \
-  --cond-frames-max 196 \
-  --cond-drop-prob 0.05 \
-  --cfg-drop-prob 0.10 \
-  --cfg-start-epoch 150 \
-  --cond-frame-drop-prob 0.35 \
-  --cond-frame-drop-start-epoch 150 \
-  --ema-decay 0.99 \
-  --eval-steps 16,50 \
-  --eval-every-epochs 5 \
-  --eval-aist-splits test \
-  --eval-aist-cameras 01 \
-  --eval-aist-crop-mode first \
-  --eval-replications 3 \
-  --async-cpu-eval
+# One GPU. The launcher resumes flow_round0_last_good.pt when available.
+CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 \
+  bash flowmimic/scripts/run_aist_unified_phase1d_cfg.sh
+
+# Two GPUs with the same global batch and update schedule.
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 GLOBAL_BATCH_SIZE=896 \
+  bash flowmimic/scripts/run_aist_unified_phase1d_cfg.sh
 ```
+
+The curriculum is expressed in optimizer updates so changing GPU count does not change its schedule. It starts with dense `K=196` conditioning, then ramps to `K={196,98,49,28,14,7}` with final probabilities `{0.30,0.15,0.20,0.15,0.12,0.08}`. Condition timestamp patterns ramp from fully even to `{even: 0.50, random: 0.30, boundary_gap: 0.20}`, with additional quotas for difficult sparse cases. True-null CFG dropout ramps from 0% to 5% over the first 1,730 reference updates. The selected setup keeps 5% per-joint dropout, disables blank-frame masking, uses shared-camera condition matching, disables flow-side smoothness regularization, and uses EMA decay 0.99.
+
+Train-time evaluation uses the official AIST test split, camera `01`, first crop, the fixed boundary-gap `K=7` manifest, 470 motions x 3 replications, 50 Heun steps, and guidance scale 2.5. See `flowmimic/scripts/run_aist_unified_phase1d_cfg.sh` and the `unified_round0_phase1d_cfg5` entry in `flowmimic/src/config/config.json` for the complete reproducible configuration.
 
 Less commonly changed defaults live in `flowmimic/src/config/config.json`, grouped under `flow.architecture`, `flow.optimization`, `flow.conditioning`, `flow.regularization`, `flow.eval`, `flow.checkpointing`, and `flow.wandb`. `train_flow.py` still exposes the high-impact experiment knobs on the CLI, then fills internal defaults from config.
 
@@ -288,8 +275,8 @@ Important training controls:
 - `--latent-stats-path` must match the VAE checkpoint and latent shape.
 - `--cond-frames-min/--cond-frames-max` controls condition density.
 - `--cond-drop-prob` drops individual visible 2D joints.
-- `--cond-frame-drop-prob` masks whole condition frames.
-- `--cfg-drop-prob` drops the full condition for classifier-free guidance training.
+- `--cond-frame-drop-prob` masks whole condition frames as valid blank tokens. It is disabled in the selected unified pipeline; sparse frames are instead omitted from attention through the condition-count/pattern curriculum.
+- `--cfg-drop-prob` replaces the full condition with the learned true-null condition for classifier-free guidance training when the selected curriculum enables true-null conditioning.
 - `--cfg-start-epoch` and `--cond-frame-drop-start-epoch` can delay those augmentations.
 - `--solver-cond-start-epoch` and `--solver-smooth-start-epoch` schedule solver-side condition and smoothness losses.
 - `--solver-reg-subbatch-size` controls how much of each batch runs through the expensive differentiable solver/decode regularizers.
@@ -312,39 +299,39 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
 
 ```bash
 python flowmimic/scripts/sample_flow.py \
-  --checkpoint checkpoints/flow/<run>/flow_round0_last.pt \
-  --vae-checkpoint checkpoints/vqvae/<run>/motion_vqvae_latest.pt \
-  --vae-type motion_vqvae \
+  --checkpoint checkpoints/flow/vqflow_aist_zq16_unified_sparse_cfg5_260728/flow_round0_update68220.pt \
   --seq-len 196 \
   --steps 50 \
   --solver heun \
-  --guidance-scale 1.0 \
+  --guidance-scale 2.5 \
   --use-ema
 ```
+
+Current flow checkpoints record the matching VQ-VAE and latent-statistics paths in their metadata. `sample_flow.py` resolves those assets automatically; pass `--vae-checkpoint` and `--latent-stats-path` explicitly only for legacy checkpoints without complete metadata or when intentionally overriding the matched assets.
 
 Specific AIST sample and camera:
 
 ```bash
 python flowmimic/scripts/sample_flow.py \
-  --checkpoint checkpoints/flow/<run>/flow_round0_last.pt \
-  --vae-checkpoint checkpoints/vqvae/<run>/motion_vqvae_latest.pt \
-  --vae-type motion_vqvae \
+  --checkpoint checkpoints/flow/vqflow_aist_zq16_unified_sparse_cfg5_260728/flow_round0_update68220.pt \
   --dataset aist \
   --sample-path data/AIST++/Annotations/motions/<motion>.pkl \
   --camera 01 \
   --seq-len 196 \
   --steps 50 \
+  --guidance-scale 2.5 \
   --use-ema
 ```
 
-Default outputs:
+Each invocation creates a timestamped run directory and updates `output/flow/last` to point to the newest result:
 
 ```text
-output/flow/result_smpl22.npy
-output/flow/result_meta.json
+output/flow/<checkpoint_name>/<timestamp>/result_smpl22.npy
+output/flow/<checkpoint_name>/<timestamp>/result_meta.json
+output/flow/last -> output/flow/<checkpoint_name>/<timestamp>
 ```
 
-`result_smpl22.npy` is an SMPL22 joint sequence. Use `flowmimic/tools/extract_cond_media.py` to extract the matching conditioning video/frames from `result_meta.json`.
+`result_smpl22.npy` is an SMPL22 joint sequence. Use `flowmimic/tools/extract_cond_media.py --meta output/flow/last/result_meta.json` to extract the matching conditioning video/frames.
 
 ## Flow Evaluation
 
@@ -426,6 +413,7 @@ StickMotion sample export:
 
 ```bash
 python baselines/stickmotion/tools/export_aist_samples.py \
+  --ckpt /path/to/no_locus_stickmotion.ckpt \
   --max-samples 4 \
   --output-space blender
 ```
@@ -441,6 +429,10 @@ python flowmimic/tools/sample_aist_method_comparison.py \
   --condition-frames 28 \
   --stickmotion-sketch-frames 24 98 171 \
   --flow-steps 50 \
+  --flow-ckpt checkpoints/flow/vqflow_aist_zq16_unified_sparse_cfg5_260728/flow_round0_update68220.pt \
+  --flow-use-ema \
+  --mld-ckpt /path/to/mld.ckpt \
+  --stickmotion-ckpt /path/to/no_locus_stickmotion.ckpt \
   --visualization-mode rigged \
   --rigged-model web_view/assets/smpl22_rigged_calibrated.glb \
   --flow-gpu 0 \
@@ -448,12 +440,7 @@ python flowmimic/tools/sample_aist_method_comparison.py \
   --stickmotion-gpu 1
 ```
 
-The comparison uses the first 196 frames of one split motion. FlowMimic receives the
-requested number of uniformly spaced camera-specific pose conditions. MLD and
-StickMotion receive the same camera-matched caption; StickMotion also receives its
-three generated stickman sketches and full locus condition. The output bundle contains
-four Blender Z-up `[196, 22, 3]` arrays, the StickMotion sketch tracks and locus,
-per-method metadata/logs, and `comparison_manifest.json`.
+The comparison uses a 196-frame clip beginning at `--start`. FlowMimic receives the requested number of uniformly spaced camera-specific pose conditions. MLD and StickMotion receive the same camera-matched caption, and StickMotion also receives its three generated stickman sketches. The selected StickMotion baseline disables its trajectory/locus branch. A locus track is still exported as a diagnostic reference, but it is not provided to the model during generation. The output bundle contains four Blender Z-up `[196, 22, 3]` arrays, the StickMotion sketch tracks and diagnostic locus, per-method metadata/logs, and `comparison_manifest.json`.
 
 Load all four motions, the text, and the StickMotion sketches into one Blender scene:
 
@@ -487,7 +474,9 @@ The calibration centers the torso chain, mirrors and levels paired joints, and m
 ```bash
 # Compare one-step rectified-flow endpoint estimates with multi-step solver endpoints.
 python flowmimic/tools/eval_solver_endpoint_gap.py \
-  --flow-ckpt checkpoints/flow/<run>/flow_round0_last.pt
+  --checkpoint checkpoints/flow/vqflow_aist_zq16_unified_sparse_cfg5_260728/flow_round0_update68220.pt \
+  --vae-ckpt checkpoints/vqvae/aist_mvh_len196_latent16_code1024_visible_retrain_to200_ddp2_retry_260717/motion_vqvae_epoch200.pt \
+  --latent-stats-path data/vqvae_latent_stats_aist_train_latent16_epoch200_retry.npz
 
 # Export paired input/reconstruction SMPL22 clips for visual inspection.
 python flowmimic/tools/export_vae_recon_smpl22_samples.py

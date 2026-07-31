@@ -146,6 +146,20 @@ def _gpu_env(gpu: int) -> dict:
     return env
 
 
+def _device_runtime(device: str | None, gpu: int) -> tuple[str, dict]:
+    if device is None:
+        return "cuda", _gpu_env(gpu)
+    normalized = device.strip().lower()
+    if not re.fullmatch(r"(?:cpu|cuda(?::\d+)?)", normalized):
+        raise ValueError(
+            f"Unsupported device {device!r}; use cpu, cuda, or cuda:<index>"
+        )
+    env = os.environ.copy()
+    if normalized == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    return normalized, env
+
+
 def _relative(path: Path, base: Path) -> str:
     return os.path.relpath(path.resolve(), base.resolve())
 
@@ -234,6 +248,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-gpu", type=int, default=0)
     parser.add_argument("--mld-gpu", type=int, default=0)
     parser.add_argument("--stickmotion-gpu", type=int, default=0)
+    parser.add_argument("--flow-device", default=None)
+    parser.add_argument("--mld-device", default=None)
+    parser.add_argument("--stickmotion-device", default=None)
     parser.add_argument("--flow-python", default=None)
     parser.add_argument("--mld-python", default=None)
     parser.add_argument("--stickmotion-python", default=None)
@@ -279,6 +296,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     workspace = WORKSPACE
+    flow_device, flow_env = _device_runtime(args.flow_device, args.flow_gpu)
+    mld_device, mld_env = _device_runtime(args.mld_device, args.mld_gpu)
+    stickmotion_device, stickmotion_env = _device_runtime(
+        args.stickmotion_device, args.stickmotion_gpu
+    )
     default_rigged_model = workspace / "web_view" / "assets" / "smpl22_rigged_calibrated.glb"
     if not default_rigged_model.is_file():
         default_rigged_model = workspace / "web_view" / "assets" / "smpl22_rigged.glb"
@@ -448,7 +470,7 @@ def main() -> None:
             "--out-dir",
             str(flow_runs),
             "--device",
-            "cuda",
+            flow_device,
         ]
         if args.flow_use_ema:
             flow_command.append("--use-ema")
@@ -456,7 +478,7 @@ def main() -> None:
             "flowmimic",
             flow_command,
             workspace,
-            _gpu_env(args.flow_gpu),
+            flow_env,
             run_dir / "flowmimic.log",
         )
         flow_source_dir = (flow_runs / "last").resolve()
@@ -478,7 +500,7 @@ def main() -> None:
         "--seed",
         str(args.seed),
         "--device",
-        "cuda",
+        mld_device,
         "--ckpt",
         args.mld_ckpt,
         "--output",
@@ -486,7 +508,7 @@ def main() -> None:
         "--meta",
         str(mld_meta_path),
     ]
-    _run("mld", mld_command, workspace, _gpu_env(args.mld_gpu), run_dir / "mld.log")
+    _run("mld", mld_command, workspace, mld_env, run_dir / "mld.log")
 
     stick_path = run_dir / "stickmotion.npy"
     stick_ref_path = run_dir / "stickmotion_reference.npy"
@@ -513,7 +535,7 @@ def main() -> None:
         "--seed",
         str(args.seed),
         "--device",
-        "cuda",
+        stickmotion_device,
         "--ckpt",
         args.stickmotion_ckpt,
         "--output",
@@ -531,7 +553,7 @@ def main() -> None:
         "stickmotion",
         stick_command,
         workspace,
-        _gpu_env(args.stickmotion_gpu),
+        stickmotion_env,
         run_dir / "stickmotion.log",
     )
     stick_meta = json.loads(stick_meta_path.read_text(encoding="utf-8"))

@@ -74,6 +74,72 @@ def _write_preview_meta(path, condition_indices, frame_indices, all_frames):
         )
 
 
+def _write_ready_marker(path, payload):
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    os.replace(temp_path, path)
+
+
+def _extract_preview_frames_from_video(
+    video_path,
+    frame_dir,
+    frame_indices,
+    clip_frames,
+    clip_start,
+    clip_duration,
+    target_fps,
+):
+    valid_indices = sorted(
+        {int(idx) for idx in frame_indices if 0 <= int(idx) < int(clip_frames)}
+    )
+    if not valid_indices:
+        return []
+
+    select_expr = "+".join(f"eq(n\\,{idx})" for idx in valid_indices)
+    temp_pattern = os.path.join(frame_dir, "preview_%06d.jpg")
+    frame_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{clip_start:.6f}",
+        "-i",
+        video_path,
+        "-t",
+        f"{clip_duration:.6f}",
+        "-vf",
+        (
+            f"fps={float(target_fps):.8f},select={select_expr},"
+            "scale=w='min(960,iw)':h=-2"
+        ),
+        "-vsync",
+        "0",
+        "-q:v",
+        "3",
+        "-start_number",
+        "0",
+        temp_pattern,
+    ]
+    subprocess.run(frame_cmd, check=True)
+    extracted = sorted(
+        os.path.join(frame_dir, name)
+        for name in os.listdir(frame_dir)
+        if name.startswith("preview_") and name.endswith(".jpg")
+    )
+    if len(extracted) != len(valid_indices):
+        raise RuntimeError(
+            "FFmpeg extracted an unexpected number of preview frames: "
+            f"expected={len(valid_indices)}, actual={len(extracted)}"
+        )
+    for source, idx in zip(extracted, valid_indices):
+        os.replace(source, os.path.join(frame_dir, f"frame_{idx:06d}.jpg"))
+    return valid_indices
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta", default="output/flow/last/result_meta.json")
@@ -132,13 +198,7 @@ def main():
     os.makedirs(frame_dir, exist_ok=True)
     smpl_out = os.path.join(out_dir, "cond_clip_smpl22.npy")
     preview_meta_path = os.path.join(out_dir, "condition_preview_meta.json")
-    _write_preview_meta(
-        preview_meta_path,
-        condition_indices=condition_indices,
-        frame_indices=frame_indices,
-        all_frames=args.all_frames,
-    )
-
+    preview_ready_path = os.path.join(out_dir, "condition_preview_ready.json")
     if dataset == "aist":
         base = os.path.splitext(os.path.basename(motion_path))[0]
         base_cam = base.replace("_cAll_", f"_c{camera}_")
@@ -150,60 +210,28 @@ def main():
         clip_duration = clip_frames / float(target_fps)
         clip_start = start / float(target_fps)
 
-        clip_path = os.path.join(out_dir, f"{tag}_clip.mp4")
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
+        extracted_indices = _extract_preview_frames_from_video(
             video_path,
-            "-ss",
-            f"{clip_start:.6f}",
-            "-t",
-            f"{clip_duration:.6f}",
-            "-map",
-            "0:v:0",
-            "-an",
-            "-vf",
-            f"fps={float(target_fps):.8f}",
-            "-frames:v",
-            str(clip_frames),
-            "-vcodec",
-            "libx264",
-            "-movflags",
-            "faststart",
-            clip_path,
-        ]
-        subprocess.run(ffmpeg_cmd, check=True)
-        if not os.path.exists(clip_path) or os.path.getsize(clip_path) <= 1024:
-            raise RuntimeError(
-                "FFmpeg produced an empty AIST clip. "
-                f"start={start}, seq_len={seq_len}, target_fps={target_fps}, "
-                f"clip_start={clip_start:.3f}s, clip_duration={clip_duration:.3f}s"
-            )
-
-        for idx in frame_indices:
-            ts = float(start + idx) / float(target_fps)
-            out_path = os.path.join(frame_dir, f"frame_{int(idx):06d}.png")
-            frame_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-ss",
-                f"{ts:.6f}",
-                "-i",
-                video_path,
-                "-frames:v",
-                "1",
-                "-update",
-                "1",
-                out_path,
-            ]
-            subprocess.run(frame_cmd, check=True)
+            frame_dir,
+            frame_indices,
+            clip_frames,
+            clip_start,
+            clip_duration,
+            target_fps,
+        )
+        _write_preview_meta(
+            preview_meta_path,
+            condition_indices=condition_indices,
+            frame_indices=extracted_indices,
+            all_frames=args.all_frames,
+        )
+        _write_ready_marker(
+            preview_ready_path,
+            {
+                "preview_ready": True,
+                "preview_frame_count": len(extracted_indices),
+            },
+        )
 
         joints = load_aistpp_smpl22_30fps(
             motion_path, target_fps=target_fps, src_fps=aist_fps
@@ -226,10 +254,50 @@ def main():
         joints = yup_to_blender(joints)
         np.save(smpl_out, joints)
 
+        clip_path = os.path.join(out_dir, f"{tag}_clip.mp4")
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{clip_start:.6f}",
+            "-i",
+            video_path,
+            "-t",
+            f"{clip_duration:.6f}",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            f"fps={float(target_fps):.8f}",
+            "-frames:v",
+            str(clip_frames),
+            "-vcodec",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            clip_path,
+        ]
+        subprocess.run(ffmpeg_cmd, check=True)
+        if not os.path.exists(clip_path) or os.path.getsize(clip_path) <= 1024:
+            raise RuntimeError(
+                "FFmpeg produced an empty AIST clip. "
+                f"start={start}, seq_len={seq_len}, target_fps={target_fps}, "
+                f"clip_start={clip_start:.3f}s, clip_duration={clip_duration:.3f}s"
+            )
+
         print(f"Saved clip: {clip_path}")
         print(
             f"Saved preview frames: {frame_dir} "
-            f"({len(frame_indices)}/{len(condition_indices)} condition frames)"
+            f"({len(extracted_indices)}/{len(condition_indices)} condition frames)"
         )
         print(f"Saved smpl22: {smpl_out}")
         print(f"Saved preview meta: {preview_meta_path}")
@@ -275,6 +343,13 @@ def main():
         shutil.copy2(src_path, out_path)
         frame_map.append((idx, frame_snap, out_path))
 
+    _write_preview_meta(
+        preview_meta_path,
+        condition_indices=condition_indices,
+        frame_indices=[int(idx) for idx, _, _ in frame_map],
+        all_frames=args.all_frames,
+    )
+
     joints = load_mvhumannet_sequence_smpl22_30fps(
         motion_path, target_fps=target_fps, src_fps=5
     )
@@ -290,6 +365,15 @@ def main():
     joints = yup_to_blender(joints)
     np.save(smpl_out, joints)
 
+    _write_ready_marker(
+        preview_ready_path,
+        {
+            "preview_ready": True,
+            "preview_frame_count": len(frame_map),
+            "condition_motion": os.path.basename(smpl_out),
+        },
+    )
+
     map_path = os.path.join(out_dir, f"{tag}_frame_map.txt")
     with open(map_path, "w", encoding="utf-8") as f:
         for idx, src_frame, out_path in frame_map:
@@ -297,7 +381,7 @@ def main():
 
     print(
         f"Saved preview frames: {frame_dir} "
-        f"({len(frame_indices)}/{len(condition_indices)} condition frames)"
+        f"({len(frame_map)}/{len(condition_indices)} condition frames)"
     )
     print(f"Saved smpl22: {smpl_out}")
     print(f"Saved preview meta: {preview_meta_path}")

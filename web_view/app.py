@@ -10,7 +10,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -50,6 +52,10 @@ COMPARISON_SCRIPT = (
 GENRE_TO_ID_PATH = ROOT_DIR / "flowmimic" / "src" / "config" / "genre_to_id.json"
 COND_PREVIEW_MAX_FRAMES = int(os.environ.get("FLOWMIMIC_COND_PREVIEW_MAX_FRAMES", "24"))
 COMPARISON_JOB_ROOT = OUTPUT_ROOT / "comparison_jobs"
+GENERATION_JOB_ROOT = OUTPUT_ROOT / "generation_jobs"
+WEB_RESULT_RETENTION = max(
+    1, int(os.environ.get("FLOWMIMIC_WEB_RESULT_RETENTION", "10"))
+)
 COMPARISON_MLD_GPU = int(os.environ.get("FLOWMIMIC_COMPARISON_MLD_GPU", "0"))
 COMPARISON_STICKMOTION_GPU = int(
     os.environ.get("FLOWMIMIC_COMPARISON_STICKMOTION_GPU", "0")
@@ -66,6 +72,7 @@ BASE_PATH = BASE_PATH.rstrip("/")
 
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 COMPARISON_JOB_ROOT.mkdir(parents=True, exist_ok=True)
+GENERATION_JOB_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="FlowMimic Web View", version="0.1.0")
 
@@ -170,6 +177,7 @@ class ComparisonBlendRequest(BaseModel):
     caption_index: int
     caption_text: str
     visualization_mode: Literal["skeleton", "rigged"] = "skeleton"
+    device: str | None = None
 
 
 class ComparisonCaptionRequest(BaseModel):
@@ -213,6 +221,12 @@ def _job_path(job_id: str) -> Path:
     return COMPARISON_JOB_ROOT / job_id
 
 
+def _generation_job_path(job_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+        raise HTTPException(status_code=404, detail="Generation job not found")
+    return GENERATION_JOB_ROOT / job_id
+
+
 def _write_job(job_dir: Path, payload: dict) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
     path = job_dir / "job.json"
@@ -230,6 +244,29 @@ def _read_job(job_id: str) -> tuple[Path, dict]:
         return job_dir, json.loads(status_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail="Comparison job status is unreadable") from exc
+
+
+def _read_generation_job(job_id: str) -> tuple[Path, dict]:
+    job_dir = _generation_job_path(job_id)
+    status_path = job_dir / "job.json"
+    if not status_path.is_file():
+        raise HTTPException(status_code=404, detail="Generation job not found")
+    try:
+        return job_dir, json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Generation job status is unreadable") from exc
+
+
+def _validate_device(value: str | None, field_name: str) -> str | None:
+    if value is None or not value.strip():
+        return None
+    device = value.strip().lower()
+    if not re.fullmatch(r"(?:cpu|cuda(?::\d+)?)", device):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be cpu, cuda, or cuda:<index>",
+        )
+    return device
 
 
 def _replicate_arg(meta: dict, name: str, default=None):
@@ -312,6 +349,7 @@ def _comparison_command(
     caption_index: int,
     caption_text: str,
     visualization_mode: Literal["skeleton", "rigged"],
+    device: str | None,
 ) -> tuple[list[str], dict]:
     if COMPARISON_BLENDER is None:
         raise ValueError(
@@ -382,10 +420,6 @@ def _comparison_command(
         str(motion_path),
         "--existing-flow-meta",
         str(meta_path),
-        "--mld-gpu",
-        str(COMPARISON_MLD_GPU),
-        "--stickmotion-gpu",
-        str(COMPARISON_STICKMOTION_GPU),
         "--run-dir",
         str(bundle_dir),
         "--save-blend",
@@ -395,6 +429,24 @@ def _comparison_command(
         "--visualization-mode",
         visualization_mode,
     ]
+    if device is None:
+        command.extend(
+            [
+                "--mld-gpu",
+                str(COMPARISON_MLD_GPU),
+                "--stickmotion-gpu",
+                str(COMPARISON_STICKMOTION_GPU),
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--mld-device",
+                device,
+                "--stickmotion-device",
+                device,
+            ]
+        )
     if visualization_mode == "rigged":
         command.extend(["--rigged-model", str(RIGGED_MODEL_PATH)])
     if use_ema:
@@ -411,6 +463,7 @@ def _comparison_command(
         "stickmotion_sketch_frames": sketch_frames,
         "stickmotion_source_frames": [start + index for index in sketch_frames],
         "visualization_mode": visualization_mode,
+        "device": device or "configured CUDA device",
         "source_result": str(result_dir.relative_to(OUTPUT_ROOT)),
     }
 
@@ -424,6 +477,7 @@ def _run_comparison_job(
     caption_index: int,
     caption_text: str,
     visualization_mode: Literal["skeleton", "rigged"],
+    device: str | None,
 ) -> None:
     job_dir = COMPARISON_JOB_ROOT / job_id
     bundle_dir = job_dir / "bundle"
@@ -439,6 +493,7 @@ def _run_comparison_job(
             caption_index,
             caption_text,
             visualization_mode,
+            device,
         )
         status.update(
             {
@@ -529,6 +584,53 @@ def _comparison_response(job_id: str, status: dict) -> dict:
     return response
 
 
+def _comparison_identity(meta: dict) -> tuple[str, int] | None:
+    sample_id = Path(str(meta.get("path", ""))).stem
+    if not sample_id:
+        return None
+    try:
+        start = int(meta.get("start") or 0)
+    except (TypeError, ValueError):
+        return None
+    return sample_id, start
+
+
+def _latest_matching_comparison(meta: dict, result_id: str) -> dict | None:
+    identity = _comparison_identity(meta)
+    if identity is None:
+        return None
+    sample_id, start = identity
+    candidates = sorted(
+        COMPARISON_JOB_ROOT.glob("*/job.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for status_path in candidates:
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        details = status.get("details", {})
+        try:
+            clip_start = int(details.get("clip_start") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            status.get("status") != "complete"
+            or details.get("sample_id") != sample_id
+            or clip_start != start
+        ):
+            continue
+        job_id = status_path.parent.name
+        bundle_dir = status_path.parent / "bundle"
+        if not (bundle_dir / "comparison_manifest.json").is_file():
+            continue
+        response = _comparison_response(job_id, status)
+        response["matches_current_flow"] = details.get("source_result") == result_id
+        return response
+    return None
+
+
 def _run(cmd: list[str]) -> dict:
     proc = subprocess.run(
         cmd,
@@ -563,6 +665,7 @@ def _result_response(
     sample_run: dict | None = None,
     extract_run: dict | None = None,
     restored: bool = False,
+    preview_only: bool = False,
 ) -> dict:
     meta_path = run_dir / "result_meta.json"
     try:
@@ -606,7 +709,9 @@ def _result_response(
         "result_id": str(run_dir.relative_to(OUTPUT_ROOT)),
         "generated_motion_name": generated_motion_name,
         "meta": meta,
-        "generated_motion": _load_motion(gen_motion_path),
+        "generated_motion": None
+        if preview_only
+        else _load_motion(gen_motion_path),
         "condition_motion": _load_motion(cond_motion_path),
         "generated_motion_url": _file_url(gen_motion_path)
         if gen_motion_path.exists()
@@ -627,6 +732,10 @@ def _result_response(
         },
         "meta_url": _file_url(meta_path),
     }
+    if not preview_only:
+        comparison = _latest_matching_comparison(meta, response["result_id"])
+        if comparison is not None:
+            response["comparison"] = comparison
     if sample_run is not None:
         response["sample_run"] = sample_run
     if extract_run is not None:
@@ -672,6 +781,237 @@ def _latest_result() -> tuple[Path, str]:
             )
         generated_motion_name = candidates[0].name
     return run_dir, generated_motion_name
+
+
+def _generation_response(job_id: str, status: dict) -> dict:
+    response = dict(status)
+    response["job_id"] = job_id
+    response["status_url"] = _prefix(f"/api/generation-jobs/{job_id}")
+    response["result_url"] = _prefix(f"/api/generation-jobs/{job_id}/result")
+    for key in ("sample_log_file", "extract_log_file"):
+        if status.get(key):
+            response[key.replace("_file", "_url")] = _file_url(
+                OUTPUT_ROOT / status[key]
+            )
+    return response
+
+
+def _write_result_meta(path: Path, payload: dict) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def _prune_web_results(retain: int = WEB_RESULT_RETENTION) -> None:
+    candidates = []
+    for meta_path in OUTPUT_ROOT.glob("*/*/result_meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not meta.get("web_generation_job_id"):
+            continue
+        candidates.append((meta_path.stat().st_mtime, meta_path.parent))
+    candidates.sort(reverse=True)
+    for _, run_dir in candidates[retain:]:
+        try:
+            run_dir.relative_to(OUTPUT_ROOT)
+        except ValueError:
+            continue
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _run_generation_job(
+    job_id: str,
+    sample_command: list[str],
+    run_dir: Path,
+    generated_motion_name: str,
+) -> None:
+    job_dir = GENERATION_JOB_ROOT / job_id
+    status_path = job_dir / "job.json"
+    sample_log_path = job_dir / "sample.log"
+    extract_log_path = job_dir / "extract.log"
+    meta_path = run_dir / "result_meta.json"
+    extract_out_dir = run_dir / "cond_media"
+    preview_ready_path = extract_out_dir / "condition_preview_ready.json"
+    video_path = extract_out_dir / "result_clip.mp4"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    sample_process = None
+    extract_process = None
+    sample_log = None
+    extract_log = None
+    preview_ready = False
+    video_ready = False
+    motion_ready = False
+    extract_done = False
+    extract_error = None
+    try:
+        status.update(
+            {
+                "status": "running",
+                "stage": "Selecting condition frames",
+                "sample_log_file": str(sample_log_path.relative_to(OUTPUT_ROOT)),
+                "extract_log_file": str(extract_log_path.relative_to(OUTPUT_ROOT)),
+            }
+        )
+        _write_job(job_dir, status)
+        sample_log = sample_log_path.open("w", encoding="utf-8")
+        sample_log.write(f"$ {shlex.join(sample_command)}\n\n")
+        sample_log.flush()
+        sample_process = subprocess.Popen(
+            sample_command,
+            cwd=str(ROOT_DIR),
+            stdout=sample_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        status["pid"] = sample_process.pid
+        _write_job(job_dir, status)
+
+        while True:
+            if extract_process is None and meta_path.is_file():
+                try:
+                    preview_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    preview_meta = {}
+                if preview_meta.get("condition_indices"):
+                    extract_command = [
+                        sys.executable,
+                        str(EXTRACT_SCRIPT),
+                        "--meta",
+                        str(meta_path),
+                        "--out-dir",
+                        str(extract_out_dir),
+                        "--max-frames",
+                        str(COND_PREVIEW_MAX_FRAMES),
+                    ]
+                    extract_log = extract_log_path.open("w", encoding="utf-8")
+                    extract_log.write(f"$ {shlex.join(extract_command)}\n\n")
+                    extract_log.flush()
+                    extract_process = subprocess.Popen(
+                        extract_command,
+                        cwd=str(ROOT_DIR),
+                        stdout=extract_log,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    status.update(
+                        {
+                            "stage": "Generating motion and condition preview",
+                            "result_id": str(run_dir.relative_to(OUTPUT_ROOT)),
+                            "preview_started": True,
+                        }
+                    )
+                    _write_job(job_dir, status)
+
+            if (
+                extract_process is not None
+                and not preview_ready
+                and preview_ready_path.is_file()
+            ):
+                preview_ready = True
+                status["preview_ready"] = True
+                status["stage"] = "Condition frames ready; generating motion and video"
+                _write_job(job_dir, status)
+
+            if extract_process is not None and not extract_done:
+                extract_returncode = extract_process.poll()
+                if extract_returncode is not None:
+                    extract_done = True
+                    if extract_log is not None:
+                        extract_log.close()
+                        extract_log = None
+                    if extract_returncode == 0:
+                        preview_ready = preview_ready or (
+                            preview_ready_path.is_file()
+                            and (extract_out_dir / "condition_preview_meta.json").is_file()
+                            and (extract_out_dir / "cond_clip_smpl22.npy").is_file()
+                        )
+                        video_ready = video_path.is_file()
+                        status["preview_ready"] = preview_ready
+                        status["video_ready"] = video_ready
+                        status["stage"] = (
+                            "Condition media ready; generating motion"
+                            if not motion_ready
+                            else "Complete"
+                        )
+                    else:
+                        extract_error = (
+                            f"Condition media extraction exited with code "
+                            f"{extract_returncode}"
+                        )
+                        status["preview_error"] = extract_error
+                    _write_job(job_dir, status)
+
+            sample_returncode = sample_process.poll()
+            if sample_returncode is not None and not motion_ready:
+                if sample_log is not None:
+                    sample_log.close()
+                    sample_log = None
+                if sample_returncode != 0:
+                    if extract_process is not None and extract_process.poll() is None:
+                        extract_process.terminate()
+                        extract_process.wait(timeout=10)
+                    raise RuntimeError(
+                        f"FlowMimic sampler exited with code {sample_returncode}"
+                    )
+                if not meta_path.is_file() or not (
+                    run_dir / generated_motion_name
+                ).is_file():
+                    raise RuntimeError(
+                        "FlowMimic sampler did not produce the expected result files"
+                    )
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta["web_generation_job_id"] = job_id
+                _write_result_meta(meta_path, meta)
+                motion_ready = True
+                status["motion_ready"] = True
+                status["stage"] = (
+                    "Complete"
+                    if extract_done
+                    else "Motion ready; preparing condition media"
+                )
+                _write_job(job_dir, status)
+
+            if motion_ready and extract_done:
+                break
+            time.sleep(0.15)
+
+        status.update(
+            {
+                "status": "complete",
+                "stage": "Complete",
+                "preview_ready": preview_ready,
+                "video_ready": video_ready,
+                "motion_ready": True,
+            }
+        )
+        if extract_error:
+            status["preview_error"] = extract_error
+        _prune_web_results()
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Generation job %s failed", job_id)
+        for process in (sample_process, extract_process):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        status.update(
+            {
+                "status": "failed",
+                "stage": "Failed",
+                "error": str(exc),
+            }
+        )
+    finally:
+        if sample_log is not None:
+            sample_log.close()
+        if extract_log is not None:
+            extract_log.close()
+        status.pop("pid", None)
+        _write_job(job_dir, status)
 
 
 def _list_checkpoints(max_items: int = 300) -> list[str]:
@@ -803,6 +1143,7 @@ def random_comparison_caption(req: ComparisonCaptionRequest) -> dict:
 def create_comparison_job(
     req: ComparisonBlendRequest, background_tasks: BackgroundTasks
 ) -> dict:
+    device = _validate_device(req.device, "device")
     result_dir = _resolve_output_child(req.result_id, "result_id")
     if not result_dir.is_dir():
         raise HTTPException(status_code=404, detail="FlowMimic result not found")
@@ -863,6 +1204,7 @@ def create_comparison_job(
             req.caption_index,
             caption_text,
             req.visualization_mode,
+            device,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -883,6 +1225,7 @@ def create_comparison_job(
         req.caption_index,
         caption_text,
         req.visualization_mode,
+        device,
     )
     return _comparison_response(job_id, status)
 
@@ -968,8 +1311,35 @@ def latest_generated_result() -> dict:
     )
 
 
+@app.get(_prefix("/api/generation-jobs/{job_id}"))
+def generation_job_status(job_id: str) -> dict:
+    _, status = _read_generation_job(job_id)
+    return _generation_response(job_id, status)
+
+
+@app.get(_prefix("/api/generation-jobs/{job_id}/result"))
+def generation_job_result(job_id: str, preview_only: bool = False) -> dict:
+    _, status = _read_generation_job(job_id)
+    if not status.get("preview_ready") and not status.get("motion_ready"):
+        raise HTTPException(status_code=409, detail="Generation result is not ready")
+    result_id = status.get("result_id")
+    if not result_id:
+        raise HTTPException(status_code=409, detail="Generation result is unresolved")
+    run_dir = _resolve_output_child(result_id, "result_id")
+    response = _result_response(
+        run_dir,
+        str(status.get("generated_motion_name") or "result_smpl22.npy"),
+        preview_only=preview_only,
+    )
+    # FFmpeg creates the output path before the MP4 is finalized. Do not expose
+    # that path to the browser until the extractor has exited successfully.
+    if preview_only and not status.get("video_ready"):
+        response["video_url"] = None
+    return response
+
+
 @app.post(_prefix("/api/generate"))
-def generate(req: GenerateRequest) -> dict:
+def generate(req: GenerateRequest, background_tasks: BackgroundTasks) -> dict:
     out_root = _resolve_path(req.out_dir)
     if out_root != OUTPUT_ROOT:
         raise HTTPException(
@@ -995,6 +1365,16 @@ def generate(req: GenerateRequest) -> dict:
             status_code=400,
             detail="guidance_scale must be a finite value between 0.0 and 3.0",
         )
+    device = _validate_device(req.device, "device")
+    generated_motion_name = _validate_rel_component(req.out, "output name")
+    if Path(generated_motion_name).suffix.lower() != ".npy":
+        raise HTTPException(status_code=400, detail="Output name must end in .npy")
+    output_model_name = _validate_rel_component(
+        Path(checkpoint).parent.name or "model", "checkpoint model name"
+    )
+    run_tag = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    result_id = f"{output_model_name}/{run_tag}"
+    run_dir = OUTPUT_ROOT / output_model_name / run_tag
 
     sample_cmd = [
         sys.executable,
@@ -1012,9 +1392,11 @@ def generate(req: GenerateRequest) -> dict:
         "--dataset",
         req.dataset,
         "--out",
-        req.out,
+        generated_motion_name,
         "--out-dir",
         req.out_dir,
+        "--run-tag",
+        run_tag,
     ]
     if req.condition_frames is not None:
         if req.condition_frames < 1:
@@ -1046,68 +1428,27 @@ def generate(req: GenerateRequest) -> dict:
         sample_cmd.extend(["--src-fps", str(req.src_fps)])
     if req.target_fps is not None:
         sample_cmd.extend(["--target-fps", str(req.target_fps)])
-    if req.device:
-        sample_cmd.extend(["--device", req.device])
+    if device:
+        sample_cmd.extend(["--device", device])
 
-    sample_run = _run(sample_cmd)
-    if sample_run["returncode"] != 0:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "stage": "sample_flow",
-                "run": sample_run,
-            },
-        )
-
-    last_link = OUTPUT_ROOT / "last"
-    if not last_link.exists():
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "stage": "sample_flow",
-                "error": "output/flow/last not found",
-                "run": sample_run,
-            },
-        )
-    run_dir = last_link.resolve()
-    meta_path = run_dir / "result_meta.json"
-    if not meta_path.exists():
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "stage": "sample_flow",
-                "error": "result_meta.json not found",
-                "run_dir": str(run_dir),
-            },
-        )
-
-    extract_out_dir = run_dir / "cond_media"
-    extract_cmd = [
-        sys.executable,
-        str(EXTRACT_SCRIPT),
-        "--meta",
-        str(meta_path),
-        "--out-dir",
-        str(extract_out_dir),
-        "--max-frames",
-        str(COND_PREVIEW_MAX_FRAMES),
-    ]
-    if req.target_fps is not None:
-        extract_cmd.extend(["--fps", str(req.target_fps)])
-    extract_run = _run(extract_cmd)
-    if extract_run["returncode"] != 0:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "stage": "extract_cond_media",
-                "run": extract_run,
-                "sample_run": sample_run,
-            },
-        )
-
-    return _result_response(
+    job_id = uuid.uuid4().hex
+    job_dir = GENERATION_JOB_ROOT / job_id
+    status = {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "Queued",
+        "result_id": result_id,
+        "generated_motion_name": generated_motion_name,
+        "preview_ready": False,
+        "video_ready": False,
+        "motion_ready": False,
+    }
+    _write_job(job_dir, status)
+    background_tasks.add_task(
+        _run_generation_job,
+        job_id,
+        sample_cmd,
         run_dir,
-        req.out,
-        sample_run=sample_run,
-        extract_run=extract_run,
+        generated_motion_name,
     )
+    return _generation_response(job_id, status)

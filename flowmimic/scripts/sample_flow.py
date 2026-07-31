@@ -69,6 +69,14 @@ def _select_preview_indices(indices, max_items=24):
     return [indices[int(i)] for i in pick]
 
 
+def _write_json_atomic(path, payload):
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    os.replace(temp_path, path)
+
+
 def main():
     config = load_config()
     sample_cfg = config.get("sample", {})
@@ -115,12 +123,20 @@ def main():
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--out-dir", type=str, default=sample_cfg.get("output_dir", "output/flow"))
     parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="Optional exact result directory name, used by asynchronous callers.",
+    )
+    parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    state = torch.load(args.checkpoint, map_location=device)
+    # Keep checkpoint/model loading off the critical preview path. The web
+    # caller can start extracting the selected condition media as soon as the
+    # lightweight metadata below is written.
+    state = torch.load(args.checkpoint, map_location="cpu")
     ckpt_metadata = _checkpoint_metadata(state)
     seq_len = args.seq_len or ckpt_metadata.get("seq_len") or config["seq_len"]
     openpose_stats_path = ckpt_metadata.get("openpose_stats_path") or config.get(
@@ -137,11 +153,19 @@ def main():
     )
     ckpt_parent = os.path.basename(os.path.dirname(os.path.normpath(args.checkpoint)))
     model_name = ckpt_parent if ckpt_parent else "model"
-    ts_base = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.run_tag is not None and (
+        not args.run_tag
+        or args.run_tag in (".", "..")
+        or os.path.basename(args.run_tag) != args.run_tag
+    ):
+        parser.error("--run-tag must be a single non-empty path component")
+    ts_base = args.run_tag or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_tag = ts_base
     run_out_dir = os.path.join(args.out_dir, model_name, run_tag)
     suffix = 1
     while os.path.exists(run_out_dir):
+        if args.run_tag is not None:
+            parser.error(f"--run-tag already exists: {args.run_tag}")
         run_tag = f"{ts_base}_{suffix:02d}"
         run_out_dir = os.path.join(args.out_dir, model_name, run_tag)
         suffix += 1
@@ -192,73 +216,6 @@ def main():
     torch.manual_seed(seed_used)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_used)
-
-    vae_backend = load_vae_backend(
-        vae_ckpt_path,
-        config,
-        device,
-        seq_len=seq_len,
-        vae_type=args.vae_type,
-        latent_len=sample_cfg.get("vae_latent_len"),
-        latent_token_mode=sample_cfg.get("vae_latent_token_mode"),
-    )
-    vae = vae_backend.model
-    d_z = vae_backend.d_z
-    latent_len = vae_backend.latent_len
-
-    flow_cfg = config.get("flow", {})
-    flow_state = state["ema"] if args.use_ema and "ema" in state else state["model"]
-    relative_time_bias = flow_state_uses_relative_time_bias(flow_state)
-    latent_slot_adapter = flow_state_uses_latent_slot_adapter(flow_state)
-    true_null_condition = flow_state_uses_true_null_condition(flow_state)
-    slot_adapter_config = infer_latent_slot_adapter_config(
-        flow_state,
-        default_latent_len=latent_len,
-        default_ffn_dim=flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
-    )
-    flow_architecture = state.get("metadata", {}).get("flow_architecture", {})
-    flow = ConditionalRectFlow(
-        d_z=d_z,
-        d_model=flow_cfg.get("d_model", 512),
-        n_layers=flow_cfg.get("n_layers", 8),
-        n_heads=flow_cfg.get("n_heads", 8),
-        ffn_dim=flow_cfg.get("ffn_dim", 2048),
-        dropout=flow_cfg.get("dropout", 0.1),
-        num_styles=config["num_styles"],
-        style_dim=flow_cfg.get("style_dim", 32),
-        cond_dim=flow_cfg.get("cond_dim", 256),
-        cond_layers=flow_cfg.get("cond_layers", 4),
-        cond_heads=flow_cfg.get("cond_heads", 4),
-        p_style_drop=flow_cfg.get("p_style_drop", 0.5),
-        relative_time_bias=relative_time_bias,
-        relative_time_hidden_dim=infer_relative_time_hidden_dim(flow_state),
-        latent_len=slot_adapter_config["latent_len"],
-        latent_slot_adapter=latent_slot_adapter,
-        latent_slot_adapter_heads=int(
-            flow_architecture.get(
-                "latent_slot_adapter_heads",
-                flow_cfg.get("latent_slot_adapter_heads", 8),
-            )
-        ),
-        latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
-        true_null_condition=true_null_condition,
-    )
-    load_flow_state_dict(flow, flow_state)
-    flow.to(device)
-    flow.eval()
-
-    k2d_mean = None
-    k2d_std = None
-    if os.path.exists(openpose_stats_path):
-        stats = np.load(openpose_stats_path)
-        k2d_mean = stats["mean"]
-        k2d_std = stats["std"]
-    latent_mean = None
-    latent_std = None
-    if os.path.exists(latent_stats_path):
-        stats = np.load(latent_stats_path)
-        latent_mean = torch.tensor(stats["mean"], device=device, dtype=torch.float32)
-        latent_std = torch.tensor(stats["std"], device=device, dtype=torch.float32)
 
     meta = {}
     style_id_user_set = args.style_id is not None
@@ -352,9 +309,10 @@ def main():
                 "target_fps": float(target_fps),
             }
 
+    k2d_sparse = None
+    vis_sparse = None
     if k2d is None:
-        cond = build_dummy_cond(1, device=device)
-        tau_cond = cond["tau_cond"].squeeze(0).cpu().numpy()
+        tau_cond = np.linspace(0.0, 1.0, num=6, dtype=np.float32)
         sample_idx = list(range(tau_cond.shape[0]))
     else:
         orig_len = k2d.shape[0]
@@ -391,7 +349,116 @@ def main():
         tau_cond = sample_idx.astype(np.float32) / max(t_len - 1, 1)
         k2d_sparse = k2d[sample_idx]
         vis_sparse = vis[sample_idx] if vis is not None else None
-        cond = build_cond_inputs(k2d_sparse, tau_cond, device, vis_mask=vis_sparse)
+
+    if hasattr(sample_idx, "tolist"):
+        sample_idx_out = sample_idx.tolist()
+    else:
+        sample_idx_out = list(sample_idx)
+    sample_idx_out = [int(i) for i in sample_idx_out]
+    preview_idx_out = _select_preview_indices(sample_idx_out, max_items=24)
+    os.makedirs(run_out_dir, exist_ok=True)
+    meta_path = os.path.join(run_out_dir, "result_meta.json")
+    preview_meta = {
+        "status": "sampling",
+        "dataset": meta.get("dataset", "unknown"),
+        "path": meta.get("path", ""),
+        "camera": meta.get("camera", ""),
+        "orig_len": meta.get("orig_len", ""),
+        "start": meta.get("start", ""),
+        "source_fps": meta.get("source_fps"),
+        "target_fps": meta.get("target_fps", float(target_fps)),
+        "seed": seed_used,
+        "seq_len": seq_len,
+        "run_timestamp": run_tag,
+        "output_dir": run_out_dir,
+        "condition_indices": sample_idx_out,
+        "sparse_indices": sample_idx_out,
+        "condition_frame_count": len(sample_idx_out),
+        "condition_preview_indices": preview_idx_out,
+        "condition_preview_frame_count": len(preview_idx_out),
+        "condition_frames_requested": args.cond_frames,
+        "condition_pattern": args.cond_pattern,
+        "tau_cond": tau_cond.tolist(),
+    }
+    _write_json_atomic(meta_path, preview_meta)
+    print(f"Condition metadata ready: {meta_path}", flush=True)
+
+    vae_backend = load_vae_backend(
+        vae_ckpt_path,
+        config,
+        device,
+        seq_len=seq_len,
+        vae_type=args.vae_type,
+        latent_len=sample_cfg.get("vae_latent_len"),
+        latent_token_mode=sample_cfg.get("vae_latent_token_mode"),
+    )
+    vae = vae_backend.model
+    d_z = vae_backend.d_z
+    latent_len = vae_backend.latent_len
+
+    flow_cfg = config.get("flow", {})
+    flow_state = state["ema"] if args.use_ema and "ema" in state else state["model"]
+    relative_time_bias = flow_state_uses_relative_time_bias(flow_state)
+    latent_slot_adapter = flow_state_uses_latent_slot_adapter(flow_state)
+    true_null_condition = flow_state_uses_true_null_condition(flow_state)
+    slot_adapter_config = infer_latent_slot_adapter_config(
+        flow_state,
+        default_latent_len=latent_len,
+        default_ffn_dim=flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
+    )
+    flow_architecture = state.get("metadata", {}).get("flow_architecture", {})
+    flow = ConditionalRectFlow(
+        d_z=d_z,
+        d_model=flow_cfg.get("d_model", 512),
+        n_layers=flow_cfg.get("n_layers", 8),
+        n_heads=flow_cfg.get("n_heads", 8),
+        ffn_dim=flow_cfg.get("ffn_dim", 2048),
+        dropout=flow_cfg.get("dropout", 0.1),
+        num_styles=config["num_styles"],
+        style_dim=flow_cfg.get("style_dim", 32),
+        cond_dim=flow_cfg.get("cond_dim", 256),
+        cond_layers=flow_cfg.get("cond_layers", 4),
+        cond_heads=flow_cfg.get("cond_heads", 4),
+        p_style_drop=flow_cfg.get("p_style_drop", 0.5),
+        relative_time_bias=relative_time_bias,
+        relative_time_hidden_dim=infer_relative_time_hidden_dim(flow_state),
+        latent_len=slot_adapter_config["latent_len"],
+        latent_slot_adapter=latent_slot_adapter,
+        latent_slot_adapter_heads=int(
+            flow_architecture.get(
+                "latent_slot_adapter_heads",
+                flow_cfg.get("latent_slot_adapter_heads", 8),
+            )
+        ),
+        latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
+        true_null_condition=true_null_condition,
+    )
+    load_flow_state_dict(flow, flow_state)
+    flow.to(device)
+    flow.eval()
+
+    k2d_mean = None
+    k2d_std = None
+    if os.path.exists(openpose_stats_path):
+        stats = np.load(openpose_stats_path)
+        k2d_mean = stats["mean"]
+        k2d_std = stats["std"]
+    latent_mean = None
+    latent_std = None
+    if os.path.exists(latent_stats_path):
+        stats = np.load(latent_stats_path)
+        latent_mean = torch.tensor(stats["mean"], device=device, dtype=torch.float32)
+        latent_std = torch.tensor(stats["std"], device=device, dtype=torch.float32)
+
+    if k2d is None:
+        cond = build_dummy_cond(1, device=device)
+    else:
+        cond = build_cond_inputs(
+            k2d_sparse,
+            tau_cond,
+            device,
+            vis_mask=vis_sparse,
+        )
 
     tau_out = torch.linspace(0.0, 1.0, steps=latent_len, device=device)
     x0 = torch.randn(1, latent_len, d_z, device=device)
@@ -467,18 +534,11 @@ def main():
     joints = align_smpl22_with_contact_and_center(ik263, joints)
     joints = yup_to_blender(joints)
 
-    os.makedirs(run_out_dir, exist_ok=True)
     out_npy = os.path.join(run_out_dir, args.out)
     np.save(out_npy, joints)
 
-    meta_path = os.path.join(run_out_dir, "result_meta.json")
-    if hasattr(sample_idx, "tolist"):
-        sample_idx_out = sample_idx.tolist()
-    else:
-        sample_idx_out = list(sample_idx)
-    sample_idx_out = [int(i) for i in sample_idx_out]
-    preview_idx_out = _select_preview_indices(sample_idx_out, max_items=24)
     meta_out = {
+        "status": "complete",
         "dataset": meta.get("dataset", "unknown"),
         "path": meta.get("path", ""),
         "camera": meta.get("camera", ""),
@@ -584,8 +644,7 @@ def main():
     os.symlink(rel_target, last_link)
     meta_out["last_symlink"] = last_link
 
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta_out, f, indent=2)
+    _write_json_atomic(meta_path, meta_out)
     print(f"Updated latest symlink: {last_link} -> {run_out_dir}")
     print(f"seed: {seed_used}")
     print(f"start: {meta_out.get('start', None)}")

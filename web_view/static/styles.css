@@ -494,6 +494,12 @@ button:disabled {
   margin-top: 8px;
 }
 
+.comparison-device-field {
+  display: block;
+  width: min(280px, 100%);
+  margin-top: 14px;
+}
+
 .dialog-actions {
   margin-top: 16px;
 }

@@ -321,6 +321,7 @@ const els = {
   stickFrame2: document.getElementById("stickFrame2"),
   stickFrame3: document.getElementById("stickFrame3"),
   stickSourceFrames: document.getElementById("stickSourceFrames"),
+  comparisonDevice: document.getElementById("comparisonDevice"),
   comparisonText: document.getElementById("comparisonText"),
   comparisonTextMeta: document.getElementById("comparisonTextMeta"),
   randomizeCaptionBtn: document.getElementById("randomizeCaptionBtn"),
@@ -344,6 +345,7 @@ let currentVisualizationMode = "skeleton";
 let currentReplicateCommand = "";
 let styleNameById = new Map([[0, "Unknown"]]);
 let currentFrameUrls = [];
+let currentVideoUrl = "";
 let lightboxOpen = false;
 let lightboxIndex = 0;
 let currentFrameInfo = {};
@@ -354,8 +356,17 @@ let comparisonPollTimer = null;
 let comparisonBusy = false;
 let comparisonCaptionLoading = false;
 let captionRequestSerial = 0;
+let currentComparisonIdentity = null;
+let currentBaselineIdentity = null;
+let comparisonRestoreJobId = null;
 let latestResultAvailable = false;
 let resultRequestBusy = false;
+let activeGenerationJobId = null;
+let generationPollTimer = null;
+let generationPreviewLoaded = false;
+let generationVideoLoaded = false;
+let generationMotionLoaded = false;
+let generationStage = "";
 let viewportsReady = false;
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
 const FORM_STATE_VERSION = 4;
@@ -477,6 +488,7 @@ function updateComparisonControls() {
   sketchFrameInputs().forEach((input) => {
     input.disabled = comparisonBusy;
   });
+  els.comparisonDevice.disabled = comparisonBusy;
   els.comparisonText.disabled = comparisonBusy || comparisonCaptionLoading;
   els.randomizeCaptionBtn.disabled =
     comparisonBusy || comparisonCaptionLoading || !currentComparisonSource;
@@ -584,6 +596,14 @@ function clearBaselineResults() {
   els.baselineBlendDownload.removeAttribute("href");
   mldView.setMotion(null);
   stickmotionView.setMotion(null);
+  currentBaselineIdentity = null;
+}
+
+function comparisonIdentity(meta) {
+  const rawPath = String(meta?.path || "");
+  const sampleId = rawPath.split("/").pop()?.replace(/\.[^.]+$/, "") || "";
+  if (!sampleId) return null;
+  return `${sampleId}::${Number(meta?.start || 0)}`;
 }
 
 function resetComparisonExport() {
@@ -594,6 +614,8 @@ function resetComparisonExport() {
   }
   activeComparisonJobId = null;
   currentComparisonSource = null;
+  currentComparisonIdentity = null;
+  comparisonRestoreJobId = null;
   currentComparisonCaption = null;
   comparisonCaptionLoading = false;
   comparisonBusy = false;
@@ -615,19 +637,32 @@ function resetComparisonExport() {
 }
 
 function setComparisonSource(data) {
-  resetComparisonExport();
   if (data?.meta?.dataset !== "aist" || !data.result_id) {
+    resetComparisonExport();
     return;
   }
   const seqLen = Number(data.meta.seq_len || 0);
   if (seqLen !== 196) {
+    resetComparisonExport();
     return;
+  }
+  const nextIdentity = comparisonIdentity(data.meta);
+  const sameClip = nextIdentity != null && nextIdentity === currentComparisonIdentity;
+  if (!sameClip) {
+    resetComparisonExport();
+  } else {
+    els.blendDownload.hidden = true;
+    els.blendDownload.removeAttribute("href");
+    els.baselineBlendDownload.hidden = true;
+    els.baselineBlendDownload.removeAttribute("href");
+    setComparisonJobStage();
   }
   currentComparisonSource = {
     resultId: data.result_id,
     motionFilename: data.generated_motion_name || "result_smpl22.npy",
     meta: data.meta,
   };
+  currentComparisonIdentity = nextIdentity;
   const maxFrame = seqLen - 1;
   sketchFrameInputs().forEach((input) => {
     input.max = String(maxFrame);
@@ -642,6 +677,7 @@ function setComparisonSource(data) {
   els.openBlendBtn.disabled = false;
   setComparisonBusy(false);
   updateSketchSourceFrames();
+  restoreComparisonForResult(data);
 }
 
 function getFormState() {
@@ -1018,31 +1054,53 @@ function setFrames(urls, info = {}) {
   currentFrameInfo = info && typeof info === "object" ? info : {};
   els.framesGrid.innerHTML = "";
   updateFramesMeta();
-  if (!currentFrameUrls || currentFrameUrls.length === 0) return;
+  if (!currentFrameUrls || currentFrameUrls.length === 0) return Promise.resolve();
   const previewIndices = Array.isArray(currentFrameInfo.preview_indices)
     ? currentFrameInfo.preview_indices
     : [];
+  const imageReady = [];
   for (let i = 0; i < currentFrameUrls.length; i += 1) {
     const u = currentFrameUrls[i];
     const img = document.createElement("img");
-    img.src = u;
-    img.loading = "lazy";
+    img.loading = "eager";
+    img.decoding = "async";
     const frameNo = previewIndices[i];
     img.alt = frameNo == null ? `Condition frame ${i + 1}` : `Condition frame ${frameNo}`;
     img.title = frameNo == null ? `Condition frame ${i + 1}` : `Condition frame ${frameNo}`;
     img.addEventListener("click", () => openLightbox(i));
+    imageReady.push(new Promise((resolve) => {
+      const settle = () => resolve();
+      img.addEventListener("load", settle, { once: true });
+      img.addEventListener("error", settle, { once: true });
+    }));
+    img.src = u;
     els.framesGrid.appendChild(img);
   }
+  return Promise.race([
+    Promise.all(imageReady),
+    new Promise((resolve) => window.setTimeout(resolve, 5000)),
+  ]);
 }
 
 function setVideo(url) {
+  const nextUrl = typeof url === "string" ? url : "";
+  if (nextUrl && nextUrl === currentVideoUrl && els.clipVideo.readyState > 0) {
+    els.clipVideo.style.display = "block";
+    els.noVideoMsg.style.display = "none";
+    return;
+  }
+  els.clipVideo.pause();
+  currentVideoUrl = "";
+  els.clipVideo.removeAttribute("src");
+  els.clipVideo.load();
   if (!url) {
     els.clipVideo.style.display = "none";
-    els.clipVideo.removeAttribute("src");
     els.noVideoMsg.style.display = "block";
     return;
   }
-  els.clipVideo.src = url;
+  currentVideoUrl = nextUrl;
+  els.clipVideo.src = nextUrl;
+  els.clipVideo.load();
   els.clipVideo.style.display = "block";
   els.noVideoMsg.style.display = "none";
 }
@@ -1203,7 +1261,7 @@ function renderStickMotionConditions(data) {
   });
 }
 
-async function loadComparisonResults(resultsUrl) {
+async function loadComparisonResults(resultsUrl, { scroll = true } = {}) {
   const res = await fetch(resultsUrl, { cache: "no-store" });
   const data = await res.json();
   if (!res.ok) {
@@ -1217,13 +1275,48 @@ async function loadComparisonResults(resultsUrl) {
     stickmotionView.setVisualizationMode(currentVisualizationMode);
   }
   els.baselineSampleMeta.textContent = `${data.sample_id} | start ${data.clip_start}`;
+  currentBaselineIdentity = `${data.sample_id}::${Number(data.clip_start || 0)}`;
   els.baselineCaption.textContent = data.mld_text === data.stickmotion_text
     ? data.mld_text
     : `MLD: ${data.mld_text} | StickMotion: ${data.stickmotion_text}`;
   mldView.setMotion(data.mld_motion);
   stickmotionView.setMotion(data.stickmotion_motion);
   renderStickMotionConditions(data);
-  els.baselinePanel.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (scroll) {
+    els.baselinePanel.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function restoreComparisonForResult(data) {
+  const comparison = data?.comparison;
+  if (!comparison?.results_url || !currentComparisonIdentity) return;
+  if (currentBaselineIdentity === currentComparisonIdentity) {
+    if (comparison.matches_current_flow && comparison.download_url) {
+      els.baselineBlendDownload.href = comparison.download_url;
+      els.baselineBlendDownload.hidden = false;
+      els.blendDownload.href = comparison.download_url;
+      els.blendDownload.hidden = false;
+    }
+    return;
+  }
+  if (comparisonRestoreJobId === comparison.job_id) return;
+  comparisonRestoreJobId = comparison.job_id;
+  loadComparisonResults(comparison.results_url, { scroll: false })
+    .then(() => {
+      if (comparison.matches_current_flow && comparison.download_url) {
+        els.baselineBlendDownload.href = comparison.download_url;
+        els.baselineBlendDownload.hidden = false;
+        els.blendDownload.href = comparison.download_url;
+        els.blendDownload.hidden = false;
+      }
+      appendLog("Restored comparison results for this clip.");
+    })
+    .catch((err) => {
+      if (comparisonRestoreJobId === comparison.job_id) {
+        comparisonRestoreJobId = null;
+      }
+      appendLog(`Comparison restore failed: ${err}`);
+    });
 }
 
 async function pollComparisonJob(jobId, statusUrl) {
@@ -1318,6 +1411,7 @@ async function onBuildBlend() {
         caption_index: currentComparisonCaption.index,
         caption_text: captionText,
         visualization_mode: currentVisualizationMode,
+        device: els.comparisonDevice.value.trim() || null,
       }),
     });
     const data = await res.json();
@@ -1340,7 +1434,7 @@ async function onBuildBlend() {
   }
 }
 
-function displayGeneratedResult(data) {
+function displayGeneratedResult(data, { preserveConditionMedia = false } = {}) {
   currentReplicateCommand = data.meta?.replicate_command || "";
   els.replicateBtn.disabled = !currentReplicateCommand;
   if (currentReplicateCommand) {
@@ -1349,11 +1443,126 @@ function displayGeneratedResult(data) {
   updateViewportTitles(data.meta || {});
   genView.setMotion(data.generated_motion);
   condView.setMotion(data.condition_motion);
-  setVideo(data.video_url);
-  setFrames(data.frame_urls || [], data.condition_frame_info || {});
+  if (!preserveConditionMedia) {
+    setVideo(data.video_url);
+    setFrames(data.frame_urls || [], data.condition_frame_info || {});
+  }
   setComparisonSource(data);
   latestResultAvailable = true;
   updateResultRequestControls();
+}
+
+async function displayConditionPreview(data) {
+  updateViewportTitles(data.meta || {});
+  if (data.condition_motion) {
+    condView.setMotion(data.condition_motion);
+  }
+  setVideo(data.video_url);
+  await setFrames(data.frame_urls || [], data.condition_frame_info || {});
+}
+
+async function fetchGenerationResult(resultUrl, mode) {
+  const requestUrl = mode !== "motion"
+    ? `${resultUrl}${resultUrl.includes("?") ? "&" : "?"}preview_only=true`
+    : resultUrl;
+  const res = await fetch(requestUrl, { cache: "no-store" });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      comparisonErrorText(data, `Generation result request failed (${res.status})`)
+    );
+  }
+  if (mode === "preview") {
+    await displayConditionPreview(data);
+    appendLog("Condition frames are ready.");
+  } else if (mode === "video") {
+    await displayConditionPreview(data);
+    appendLog("Condition video clip is ready.");
+  } else {
+    displayGeneratedResult(data, {
+      preserveConditionMedia: generationPreviewLoaded,
+    });
+    appendLog(`result_dir: ${data.result_dir}`);
+    appendLog("FlowMimic motion is ready.");
+  }
+  return data;
+}
+
+async function pollGenerationJob(jobId, statusUrl, resultUrl) {
+  if (activeGenerationJobId !== jobId) return;
+  try {
+    const res = await fetch(statusUrl, { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(
+        comparisonErrorText(data, `Generation status failed (${res.status})`)
+      );
+    }
+    if (activeGenerationJobId !== jobId) return;
+    const stage = data.stage || data.status || "Working";
+    if (stage !== generationStage) {
+      generationStage = stage;
+      appendLog(stage);
+    }
+    if (data.preview_ready && !generationPreviewLoaded) {
+      generationPreviewLoaded = true;
+      try {
+        const previewData = await fetchGenerationResult(resultUrl, "preview");
+        generationVideoLoaded = Boolean(previewData.video_url);
+      } catch (err) {
+        generationPreviewLoaded = false;
+        appendLog(`Condition preview load failed: ${err}`);
+      }
+    }
+    if (data.video_ready && !generationVideoLoaded) {
+      generationVideoLoaded = true;
+      try {
+        const videoData = await fetchGenerationResult(resultUrl, "video");
+        generationVideoLoaded = Boolean(videoData.video_url);
+      } catch (err) {
+        generationVideoLoaded = false;
+        appendLog(`Condition video load failed: ${err}`);
+      }
+    }
+    if (data.motion_ready && !generationMotionLoaded) {
+      generationMotionLoaded = true;
+      try {
+        await fetchGenerationResult(resultUrl, "motion");
+      } catch (err) {
+        generationMotionLoaded = false;
+        appendLog(`Generated motion load failed: ${err}`);
+      }
+    }
+    if (data.status === "failed") {
+      appendLog(`Generation failed: ${data.error || "unknown error"}`);
+      if (data.sample_log_url) appendLog(`sample log: ${data.sample_log_url}`);
+      if (data.extract_log_url) appendLog(`media log: ${data.extract_log_url}`);
+      activeGenerationJobId = null;
+      generationPollTimer = null;
+      setResultRequestBusy(false);
+      return;
+    }
+    if (data.status === "complete" && generationMotionLoaded) {
+      if (data.preview_error) {
+        appendLog(`Condition preview unavailable: ${data.preview_error}`);
+      }
+      activeGenerationJobId = null;
+      generationPollTimer = null;
+      setResultRequestBusy(false);
+      return;
+    }
+    generationPollTimer = window.setTimeout(
+      () => pollGenerationJob(jobId, statusUrl, resultUrl),
+      600
+    );
+  } catch (err) {
+    if (activeGenerationJobId !== jobId) return;
+    appendLog(`Generation status unavailable; retrying: ${err}`);
+    generationPollTimer = window.setTimeout(
+      () => pollGenerationJob(jobId, statusUrl, resultUrl),
+      1800
+    );
+  }
 }
 
 async function onLoadLatest() {
@@ -1420,9 +1629,17 @@ async function onGenerate() {
   }
 
   setResultRequestBusy(true);
-  resetComparisonExport();
+  if (generationPollTimer != null) {
+    window.clearTimeout(generationPollTimer);
+    generationPollTimer = null;
+  }
+  activeGenerationJobId = null;
+  generationPreviewLoaded = false;
+  generationVideoLoaded = false;
+  generationMotionLoaded = false;
+  generationStage = "";
   clearLog();
-  appendLog("Running sample_flow.py ...");
+  appendLog("Starting FlowMimic generation ...");
   appendLog(
     `Condition frames: ${payload.condition_frames == null ? "checkpoint default" : payload.condition_frames}`
   );
@@ -1438,20 +1655,15 @@ async function onGenerate() {
     if (!res.ok) {
       appendLog("Generation failed.");
       appendLog(JSON.stringify(data, null, 2));
+      setResultRequestBusy(false);
       return;
     }
-
-    appendLog("sample_flow.py finished.");
-    appendLog("extract_cond_media.py finished.");
-    if (data.sample_run?.stdout) appendLog(data.sample_run.stdout);
-    if (data.sample_run?.stderr) appendLog(data.sample_run.stderr);
-    if (data.extract_run?.stdout) appendLog(data.extract_run.stdout);
-    if (data.extract_run?.stderr) appendLog(data.extract_run.stderr);
-    appendLog(`result_dir: ${data.result_dir}`);
-    displayGeneratedResult(data);
+    activeGenerationJobId = data.job_id;
+    generationStage = data.stage || "Queued";
+    appendLog(`Generation job ${data.job_id}: ${generationStage}`);
+    pollGenerationJob(data.job_id, data.status_url, data.result_url);
   } catch (err) {
     appendLog(`Request failed: ${err}`);
-  } finally {
     setResultRequestBusy(false);
   }
 }
@@ -1517,6 +1729,12 @@ sketchFrameInputs().forEach((input) => {
 });
 els.lightboxPrev.addEventListener("click", () => stepLightbox(-1));
 els.lightboxNext.addEventListener("click", () => stepLightbox(1));
+els.clipVideo.addEventListener("error", () => {
+  if (!currentVideoUrl) return;
+  appendLog(`Video clip failed to load: ${currentVideoUrl}`);
+  els.clipVideo.style.display = "none";
+  els.noVideoMsg.style.display = "block";
+});
 els.lightbox.addEventListener("click", (ev) => {
   const t = ev.target;
   if (t === els.lightboxImage) return;

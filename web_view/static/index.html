@@ -244,7 +244,7 @@
       <div id="framesMeta" class="frames-meta muted"></div>
       <div id="framesGrid" class="frames-grid"></div>
       <div class="video-wrap">
-        <video id="clipVideo" controls muted loop playsinline></video>
+        <video id="clipVideo" controls muted loop playsinline preload="metadata"></video>
         <div id="noVideoMsg" class="muted">No video clip available for this sample.</div>
       </div>
     </section>
@@ -291,6 +291,10 @@
     </div>
     <div id="stickSourceFrames" class="muted source-frame-summary"></div>
 
+    <label class="comparison-device-field">Device (optional)
+      <input id="comparisonDevice" placeholder="cpu / cuda / cuda:0" />
+    </label>
+
     <div class="dialog-actions">
       <button id="buildBlendBtn" type="button">Build .blend</button>
       <span id="blendSpinner" class="spinner" aria-hidden="true"></span>
@@ -310,6 +314,6 @@
     </div>
   </div>
 
-  <script type="module" src="./static/app.js?v=20260730-cfg-controls"></script>
+  <script type="module" src="./static/app.js?v=20260731-condition-media-fix2"></script>
 </body>
 </html>

@@ -468,7 +468,7 @@ def main() -> None:
     mld_meta_path = run_dir / "mld_meta.json"
     mld_command = [
         args.mld_python,
-        "flowmimic/tools/export_mld_aist_sample.py",
+        "baselines/mld/tools/export_aist_sample.py",
         "--text",
         caption["text"],
         "--length",
@@ -495,7 +495,7 @@ def main() -> None:
     stick_meta_path = run_dir / "stickmotion_meta.json"
     stick_command = [
         args.stickmotion_python,
-        "flowmimic/tools/export_stickmotion_aist_sample.py",
+        "baselines/stickmotion/tools/export_aist_sample.py",
         "--sample-id",
         sample_id,
         "--split",

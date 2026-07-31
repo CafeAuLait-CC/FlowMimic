@@ -17,6 +17,17 @@ Detailed experiment notes are in `docs/`.
 ## Project Structure
 
 ```text
+baselines/
+  common/
+    evaluation.py             # Shared canonical baseline metrics
+  mld/
+    configs/                  # MLD AIST++ experiment configs
+    scripts/                  # MLD train/eval entrypoints
+    tools/                    # MLD preparation and export tools
+  stickmotion/
+    configs/                  # StickMotion AIST++ experiment configs
+    scripts/                  # StickMotion train/eval entrypoints
+    tools/                    # StickMotion training and export tools
 flowmimic/
   src/
     config/
@@ -62,10 +73,6 @@ flowmimic/
     prepare_aist_t2m_datasets.py
     process_aist_text_tokens.py
     train_aist_t2m_evaluator_pipeline.py
-    train_mld_aist.py
-    train_stickmotion_aist.py
-    evaluate_stickmotion_aist.py
-    export_stickmotion_aist_samples.py
     export_vae_recon_smpl22_samples.py
     eval_solver_endpoint_gap.py
 ```
@@ -394,19 +401,31 @@ Train-time eval in `train_flow.py` uses the same core evaluator. W&B logging is 
 
 ## Baseline Utilities
 
-MLD and StickMotion AIST training wrappers:
+MLD and StickMotion AIST training pipelines:
 
 ```bash
-python flowmimic/tools/train_mld_aist.py
-python flowmimic/tools/train_stickmotion_aist.py
+bash baselines/mld/scripts/run_aist_mvh_pipeline.sh
+bash baselines/stickmotion/scripts/run_aist_no_locus.sh
 ```
 
-StickMotion evaluation/export helpers:
+Canonical baseline evaluation uses the same official AIST test split, first-196 crop, frozen AIST T2M motion encoder, evaluator normalization, and physical-motion metrics as `eval_flow.py`:
 
 ```bash
-python flowmimic/tools/evaluate_stickmotion_aist.py
+python baselines/mld/scripts/eval.py \
+  --mld-ckpt /path/to/mld.ckpt \
+  --replications 3 \
+  --save-json output/eval/mld.json
 
-python flowmimic/tools/export_stickmotion_aist_samples.py \
+python baselines/stickmotion/scripts/eval.py \
+  --stickmotion-ckpt /path/to/stickmotion.ckpt \
+  --replications 3 \
+  --save-json output/eval/stickmotion.json
+```
+
+StickMotion sample export:
+
+```bash
+python baselines/stickmotion/tools/export_aist_samples.py \
   --max-samples 4 \
   --output-space blender
 ```

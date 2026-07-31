@@ -50,6 +50,14 @@
           </select>
         </label>
 
+        <label>Condition Pattern
+          <select id="conditionPattern">
+            <option value="even">Even</option>
+            <option value="random">Random</option>
+            <option value="boundary_gap">Boundary gap</option>
+          </select>
+        </label>
+
         <label>Steps
           <input id="steps" type="number" min="1" value="8" />
         </label>
@@ -58,6 +66,50 @@
           <input id="device" placeholder="cpu / cuda:0" />
         </label>
 
+        <div class="guidance-control" role="group" aria-labelledby="guidanceScaleLabel">
+          <div class="guidance-heading">
+            <label id="guidanceScaleLabel" for="guidanceScaleSlider">CFG Guidance</label>
+          </div>
+          <div class="guidance-input-row">
+            <div class="guidance-slider-wrap">
+              <input
+                id="guidanceScaleSlider"
+                class="guidance-slider"
+                type="range"
+                min="0"
+                max="3"
+                step="0.05"
+                value="1"
+                list="guidanceScaleMarks"
+                aria-label="CFG guidance scale"
+              />
+              <datalist id="guidanceScaleMarks">
+                <option value="0.8"></option>
+                <option value="1.0"></option>
+                <option value="1.2"></option>
+                <option value="2.5"></option>
+              </datalist>
+              <div class="guidance-ticks" aria-hidden="true">
+                <span style="--tick-position: 26.667%">0.8</span>
+                <span style="--tick-position: 33.333%">1.0</span>
+                <span class="recommended" style="--tick-position: 40%" title="Balanced preset">1.2</span>
+                <span class="recommended" style="--tick-position: 83.333%" title="Quality-first preset">2.5</span>
+              </div>
+            </div>
+            <label class="guidance-number-field" for="guidanceScaleInput">
+              <span>Exact</span>
+              <input
+                id="guidanceScaleInput"
+                type="number"
+                min="0"
+                max="3"
+                step="0.05"
+                value="1"
+                inputmode="decimal"
+              />
+            </label>
+          </div>
+        </div>
       </div>
 
       <details class="advanced-options">
@@ -258,6 +310,6 @@
     </div>
   </div>
 
-  <script type="module" src="./static/app.js?v=20260718-comparison-compact-header"></script>
+  <script type="module" src="./static/app.js?v=20260730-cfg-controls"></script>
 </body>
 </html>

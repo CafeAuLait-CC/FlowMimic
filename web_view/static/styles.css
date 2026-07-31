@@ -173,6 +173,95 @@ main {
   gap: 8px 12px;
 }
 
+.guidance-control {
+  grid-column: span 2;
+  min-width: 0;
+  width: 100%;
+  max-width: 520px;
+  padding-top: 2px;
+}
+
+.guidance-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 3px;
+  font-size: 13px;
+}
+
+.guidance-heading label {
+  display: block;
+  font-weight: 500;
+}
+
+.guidance-input-row {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) 92px;
+  align-items: start;
+  gap: 14px;
+}
+
+.guidance-slider-wrap {
+  min-width: 0;
+}
+
+.guidance-slider {
+  width: 100%;
+  height: 30px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  accent-color: var(--accent);
+  background: transparent;
+  cursor: pointer;
+}
+
+.guidance-ticks {
+  position: relative;
+  height: 16px;
+  margin: -2px 8px 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.guidance-ticks span {
+  position: absolute;
+  left: var(--tick-position);
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.guidance-ticks span::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: -6px;
+  width: 1px;
+  height: 4px;
+  background: #9aa39f;
+}
+
+.guidance-ticks .recommended {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.guidance-number-field {
+  gap: 3px;
+}
+
+.guidance-number-field span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.guidance-number-field input {
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
 .advanced-options {
   margin-top: 10px;
   padding-top: 8px;
@@ -294,6 +383,21 @@ button:disabled {
 }
 
 @media (max-width: 680px) {
+  .guidance-control {
+    grid-column: 1 / -1;
+    max-width: none;
+  }
+
+  .guidance-input-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .guidance-number-field {
+    width: 92px;
+    justify-self: end;
+  }
+
   .viewers-panel .panel-heading,
   .viewers-panel .panel-heading-action {
     align-items: flex-start;

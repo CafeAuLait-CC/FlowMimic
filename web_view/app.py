@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -141,8 +142,10 @@ class GenerateRequest(BaseModel):
     model_filename: str | None = None
     vae_checkpoint: str | None = None
     condition_frames: int | None = None
+    condition_pattern: Literal["even", "random", "boundary_gap"] = "even"
     steps: int = 8
     solver: str = "heun"
+    guidance_scale: float = 1.0
     style_id: int | None = None
     domain_id: int = 0
     k2d_npy: str | None = None
@@ -759,8 +762,10 @@ def defaults() -> dict:
         "default_vae_checkpoint": "",
         "configured_vae_checkpoint": cfg.get("vae_ckpt", ""),
         "default_condition_frames": None,
+        "default_condition_pattern": "even",
         "default_steps": 8,
         "default_solver": "heun",
+        "default_guidance_scale": 1.0,
         "default_dataset": "aist",
         "default_device": "",
         "default_style_id": None,
@@ -985,6 +990,12 @@ def generate(req: GenerateRequest) -> dict:
         model_filename = _validate_rel_component(model_filename, "model_filename")
         checkpoint = f"checkpoints/flow/{model_name}/{model_filename}"
 
+    if not math.isfinite(req.guidance_scale) or not 0.0 <= req.guidance_scale <= 3.0:
+        raise HTTPException(
+            status_code=400,
+            detail="guidance_scale must be a finite value between 0.0 and 3.0",
+        )
+
     sample_cmd = [
         sys.executable,
         str(SAMPLE_SCRIPT),
@@ -994,6 +1005,10 @@ def generate(req: GenerateRequest) -> dict:
         str(req.steps),
         "--solver",
         req.solver,
+        "--guidance-scale",
+        str(req.guidance_scale),
+        "--cond-pattern",
+        req.condition_pattern,
         "--dataset",
         req.dataset,
         "--out",

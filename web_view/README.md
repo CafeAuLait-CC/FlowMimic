@@ -32,8 +32,9 @@ URL prefix is configurable with env var `FLOWMIMIC_BASE_PATH` (default: `/flowmi
 - Backend calls:
   - `flowmimic/scripts/sample_flow.py`
   - `flowmimic/tools/extract_cond_media.py`
-- `Condition Frames` selects a true uniformly spaced condition-token count.
-  Leaving it at `checkpoint default` preserves the checkpoint's evaluation density.
+- `Condition Frames` selects the condition-token count; leaving it at `checkpoint default` preserves the checkpoint's evaluation density.
+- `Condition Pattern` selects even, random, or boundary-gap condition timestamps. The chosen pattern and indices are preserved in `result_meta.json` and the replicate command.
+- `CFG Guidance` supports synchronized slider and exact numeric entry from 0.0 to 3.0. Scale 1.0 preserves the conditional prediction, 1.2 is the balanced preset, and 2.5 is the evaluated quality-first preset.
 - The web module currently assumes output root is `output/flow`.
 - **Load Last** restores the run referenced by `output/flow/last` without rerunning sampling or condition-media extraction.
 - Generated, condition, MLD, and StickMotion motions are rendered at 30 FPS with mouse orbit controls. The 3D Motion switch changes every viewport between the SMPL22 skeleton and the calibrated rig in `web_view/assets/smpl22_rigged_calibrated.glb`; the selection is persisted in the browser. The original `smpl22_rigged.glb` in the same asset folder is used automatically when the calibrated asset is absent.

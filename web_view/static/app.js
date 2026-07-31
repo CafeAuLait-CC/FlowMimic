@@ -281,6 +281,9 @@ const els = {
   samplePath: document.getElementById("samplePath"),
   camera: document.getElementById("camera"),
   conditionFrames: document.getElementById("conditionFrames"),
+  conditionPattern: document.getElementById("conditionPattern"),
+  guidanceScaleSlider: document.getElementById("guidanceScaleSlider"),
+  guidanceScaleInput: document.getElementById("guidanceScaleInput"),
   steps: document.getElementById("steps"),
   solver: document.getElementById("solver"),
   styleId: document.getElementById("styleId"),
@@ -355,10 +358,12 @@ let latestResultAvailable = false;
 let resultRequestBusy = false;
 let viewportsReady = false;
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
-const FORM_STATE_VERSION = 3;
+const FORM_STATE_VERSION = 4;
 let defaultsCache = {
   default_steps: 8,
   default_solver: "heun",
+  default_guidance_scale: 1.0,
+  default_condition_pattern: "even",
   default_dataset: "aist",
   default_style_id: null,
   default_device: "",
@@ -375,6 +380,57 @@ function appendLog(text) {
 
 function clearLog() {
   els.statusLog.textContent = "";
+}
+
+function guidanceScaleBounds() {
+  return {
+    min: Number(els.guidanceScaleSlider.min),
+    max: Number(els.guidanceScaleSlider.max),
+  };
+}
+
+function parseGuidanceScale(value) {
+  if (value === "" || value == null) return null;
+  const number = Number(value);
+  const { min, max } = guidanceScaleBounds();
+  if (!Number.isFinite(number) || number < min || number > max) return null;
+  return number;
+}
+
+function formatGuidanceScaleInput(value) {
+  return Number(value).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function renderGuidanceScale(value, updateInput = true) {
+  const number = parseGuidanceScale(value);
+  if (number == null) return false;
+  els.guidanceScaleSlider.value = String(number);
+  if (updateInput) {
+    els.guidanceScaleInput.value = formatGuidanceScaleInput(number);
+  }
+  els.guidanceScaleInput.setCustomValidity("");
+  return true;
+}
+
+function onGuidanceSliderInput() {
+  renderGuidanceScale(els.guidanceScaleSlider.value);
+  saveFormState();
+}
+
+function onGuidanceNumberInput(commit = false) {
+  const number = parseGuidanceScale(els.guidanceScaleInput.value);
+  if (number == null) {
+    const { min, max } = guidanceScaleBounds();
+    els.guidanceScaleInput.setCustomValidity(
+      `Enter a guidance scale between ${min} and ${max}.`
+    );
+    if (commit) {
+      renderGuidanceScale(els.guidanceScaleSlider.value);
+    }
+    return;
+  }
+  renderGuidanceScale(number, commit);
+  saveFormState();
 }
 
 function updateResultRequestControls() {
@@ -598,6 +654,8 @@ function getFormState() {
     samplePath: els.samplePath.value,
     camera: els.camera.value,
     conditionFrames: els.conditionFrames.value,
+    conditionPattern: els.conditionPattern.value,
+    guidanceScale: els.guidanceScaleInput.value,
     steps: els.steps.value,
     solver: els.solver.value,
     styleId: els.styleId.value,
@@ -623,6 +681,15 @@ function applyFormState(state) {
   if (typeof state.samplePath === "string") els.samplePath.value = state.samplePath;
   if (typeof state.camera === "string") els.camera.value = state.camera;
   if (typeof state.conditionFrames === "string") els.conditionFrames.value = state.conditionFrames;
+  if (typeof state.conditionPattern === "string") {
+    els.conditionPattern.value = state.conditionPattern;
+  }
+  if (
+    typeof state.guidanceScale === "string"
+    || typeof state.guidanceScale === "number"
+  ) {
+    renderGuidanceScale(state.guidanceScale);
+  }
   if (typeof state.steps === "string") els.steps.value = state.steps;
   if (typeof state.solver === "string") els.solver.value = state.solver;
   if (typeof state.styleId === "string") setStyleSelectValue(state.styleId);
@@ -676,6 +743,12 @@ function parseOptionalInt(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
   return Math.trunc(n);
+}
+
+function parseOptionalFloat(value) {
+  if (value === "" || value == null) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function splitShellCommand(cmd) {
@@ -778,6 +851,8 @@ function applyReplicateCommand(cmd) {
   els.samplePath.value = a["sample-path"] || "";
   els.camera.value = a.camera || "";
   els.conditionFrames.value = a["cond-frames"] || "";
+  els.conditionPattern.value = a["cond-pattern"] || "even";
+  renderGuidanceScale(a["guidance-scale"] || defaultsCache.default_guidance_scale || 1.0);
   els.steps.value = a.steps || "8";
   els.solver.value = a.solver || "heun";
   setStyleSelectValue(a["style-id"] || "");
@@ -851,6 +926,8 @@ async function loadDefaults() {
   latestResultAvailable = Boolean(data.last_meta_exists);
   updateResultRequestControls();
   els.vaeCheckpoint.value = data.default_vae_checkpoint || "";
+  els.conditionPattern.value = data.default_condition_pattern || "even";
+  renderGuidanceScale(data.default_guidance_scale ?? 1.0);
   els.steps.value = data.default_steps || 8;
   els.solver.value = data.default_solver || "heun";
   els.dataset.value = data.default_dataset || "aist";
@@ -890,6 +967,8 @@ function resetArgsKeepCheckpoints() {
   els.conditionFrames.value = defaultsCache.default_condition_frames == null
     ? ""
     : String(defaultsCache.default_condition_frames);
+  els.conditionPattern.value = defaultsCache.default_condition_pattern || "even";
+  renderGuidanceScale(defaultsCache.default_guidance_scale ?? 1.0);
   els.steps.value = String(defaultsCache.default_steps || 8);
   els.solver.value = defaultsCache.default_solver || "heun";
   els.styleId.value = defaultsCache.default_style_id == null ? "" : String(defaultsCache.default_style_id);
@@ -1314,6 +1393,8 @@ async function onGenerate() {
     sample_path: els.samplePath.value.trim() || null,
     camera: els.camera.value.trim() || null,
     condition_frames: parseOptionalInt(els.conditionFrames.value),
+    condition_pattern: els.conditionPattern.value,
+    guidance_scale: parseOptionalFloat(els.guidanceScaleInput.value),
     steps: parseOptionalInt(els.steps.value) ?? 8,
     solver: els.solver.value,
     style_id: parseOptionalInt(els.styleId?.value),
@@ -1332,6 +1413,11 @@ async function onGenerate() {
     appendLog("model name and model filename are required.");
     return;
   }
+  if (parseGuidanceScale(payload.guidance_scale) == null) {
+    appendLog("CFG guidance must be between 0.0 and 3.0.");
+    els.guidanceScaleInput.reportValidity();
+    return;
+  }
 
   setResultRequestBusy(true);
   resetComparisonExport();
@@ -1340,6 +1426,8 @@ async function onGenerate() {
   appendLog(
     `Condition frames: ${payload.condition_frames == null ? "checkpoint default" : payload.condition_frames}`
   );
+  appendLog(`Condition pattern: ${payload.condition_pattern}`);
+  appendLog(`CFG guidance: ${payload.guidance_scale.toFixed(2)}`);
   try {
     const res = await fetch("./api/generate", {
       method: "POST",
@@ -1436,6 +1524,10 @@ els.lightbox.addEventListener("click", (ev) => {
   closeLightbox();
 });
 window.addEventListener("keydown", onLightboxKeydown);
+els.guidanceScaleSlider.addEventListener("input", onGuidanceSliderInput);
+els.guidanceScaleSlider.addEventListener("change", onGuidanceSliderInput);
+els.guidanceScaleInput.addEventListener("input", () => onGuidanceNumberInput(false));
+els.guidanceScaleInput.addEventListener("change", () => onGuidanceNumberInput(true));
 [
   els.modelName,
   els.modelFilename,
@@ -1444,6 +1536,7 @@ window.addEventListener("keydown", onLightboxKeydown);
   els.samplePath,
   els.camera,
   els.conditionFrames,
+  els.conditionPattern,
   els.steps,
   els.solver,
   els.styleId,

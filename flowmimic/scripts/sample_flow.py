@@ -39,6 +39,10 @@ from flowmimic.src.data.openpose import (
 from flowmimic.src.model.vae.stats import load_mean_std
 from flowmimic.src.data.dataloader import yup_to_blender
 from flowmimic.src.model.vae.datasets.aist_filename_parser import get_genre_code
+from flowmimic.src.model.vae.datasets.condition_sampling import (
+    CONDITION_PATTERNS,
+    sample_condition_indices,
+)
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 
 
@@ -82,7 +86,13 @@ def main():
         "--cond-frames",
         type=int,
         default=None,
-        help="Number of uniformly spaced condition frames; defaults to checkpoint metadata.",
+        help="Number of condition frames; defaults to checkpoint metadata.",
+    )
+    parser.add_argument(
+        "--cond-pattern",
+        choices=CONDITION_PATTERNS,
+        default=sample_cfg.get("cond_pattern", "even"),
+        help="Timestamp distribution used to select condition frames.",
     )
     parser.add_argument("--steps", type=int, default=sample_cfg.get("steps", 8))
     parser.add_argument("--solver", type=str, default=sample_cfg.get("solver", "heun"))
@@ -373,8 +383,11 @@ def main():
         if t_len <= k_frames:
             sample_idx = np.arange(t_len)
         else:
-            sample_idx = np.linspace(0, t_len - 1, k_frames)
-            sample_idx = np.unique(np.round(sample_idx).astype(int))
+            sample_idx = sample_condition_indices(
+                t_len,
+                k_frames,
+                pattern=args.cond_pattern,
+            )
         tau_cond = sample_idx.astype(np.float32) / max(t_len - 1, 1)
         k2d_sparse = k2d[sample_idx]
         vis_sparse = vis[sample_idx] if vis is not None else None
@@ -500,6 +513,7 @@ def main():
         "condition_frames_min": cond_frames_min,
         "condition_frames_max": cond_frames_max,
         "condition_frames_requested": args.cond_frames,
+        "condition_pattern": args.cond_pattern,
         "tau_cond": tau_cond.tolist(),
     }
 
@@ -522,6 +536,8 @@ def main():
         str(args.guidance_scale),
         "--cond-frames",
         str(len(sample_idx_out)),
+        "--cond-pattern",
+        args.cond_pattern,
         "--out",
         args.out,
         "--out-dir",

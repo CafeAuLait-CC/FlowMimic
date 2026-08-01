@@ -39,7 +39,11 @@ def _resolve(workspace: Path, value: str) -> Path:
 
 
 def _read_nonempty(path: Path) -> list[str]:
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def _text_stem(sample_id: str, camera: str) -> str:
@@ -58,12 +62,26 @@ def _load_caption(
     workspace: Path, sample_id: str, camera: str, caption_index: int
 ) -> dict:
     stem = _text_stem(sample_id, camera)
-    mld_path = workspace / "data" / "AIST++" / "TextTokens" / "mld_texts" / f"{stem}.txt"
+    mld_path = (
+        workspace / "data" / "AIST++" / "TextTokens" / "mld_texts" / f"{stem}.txt"
+    )
     stick_text_path = (
-        workspace / "data" / "AIST++" / "TextTokens" / "stickmotion" / "texts" / f"{stem}.txt"
+        workspace
+        / "data"
+        / "AIST++"
+        / "TextTokens"
+        / "stickmotion"
+        / "texts"
+        / f"{stem}.txt"
     )
     stick_token_path = (
-        workspace / "data" / "AIST++" / "TextTokens" / "stickmotion" / "tokens" / f"{stem}.txt"
+        workspace
+        / "data"
+        / "AIST++"
+        / "TextTokens"
+        / "stickmotion"
+        / "tokens"
+        / f"{stem}.txt"
     )
     for path in (mld_path, stick_text_path, stick_token_path):
         if not path.exists():
@@ -137,7 +155,9 @@ def _run(name: str, command: list[str], cwd: Path, env: dict, log_path: Path) ->
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
     if result.returncode != 0:
-        raise RuntimeError(f"{name} failed with code {result.returncode}; see {log_path}")
+        raise RuntimeError(
+            f"{name} failed with code {result.returncode}; see {log_path}"
+        )
 
 
 def _gpu_env(gpu: int) -> dict:
@@ -221,9 +241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=196)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--condition-frames", type=int, default=28)
-    parser.add_argument(
-        "--stickmotion-sketch-frames", type=int, nargs=3, default=None
-    )
+    parser.add_argument("--stickmotion-sketch-frames", type=int, nargs=3, default=None)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--flow-steps", type=int, default=50)
     parser.add_argument("--flow-solver", choices=("heun", "euler"), default="heun")
@@ -241,7 +259,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stickmotion-ckpt",
-        default="runs/stickmotion/human_ml3d/aist_remodiffuse/last.ckpt",
+        default=(
+            "runs/stickmotion/human_ml3d/aist_remodiffuse_no_locus_260730/"
+            "epoch=591-step=25644.ckpt"
+        ),
     )
     parser.add_argument("--existing-flow-motion", default=None)
     parser.add_argument("--existing-flow-meta", default=None)
@@ -281,9 +302,7 @@ def parse_args() -> argparse.Namespace:
         args.flow_python = _conda_env_python(
             "flowmimic-310", args.flow_python, "FLOWMIMIC_PYTHON"
         )
-        args.mld_python = _conda_env_python(
-            "mld", args.mld_python, "MLD_PYTHON"
-        )
+        args.mld_python = _conda_env_python("mld", args.mld_python, "MLD_PYTHON")
         args.stickmotion_python = _conda_env_python(
             "stickmotion", args.stickmotion_python, "STICKMOTION_PYTHON"
         )
@@ -301,10 +320,14 @@ def main() -> None:
     stickmotion_device, stickmotion_env = _device_runtime(
         args.stickmotion_device, args.stickmotion_gpu
     )
-    default_rigged_model = workspace / "web_view" / "assets" / "smpl22_rigged_calibrated.glb"
+    default_rigged_model = (
+        workspace / "web_view" / "assets" / "smpl22_rigged_calibrated.glb"
+    )
     if not default_rigged_model.is_file():
         default_rigged_model = workspace / "web_view" / "assets" / "smpl22_rigged.glb"
-    rigged_model = Path(args.rigged_model) if args.rigged_model else default_rigged_model
+    rigged_model = (
+        Path(args.rigged_model) if args.rigged_model else default_rigged_model
+    )
     if not rigged_model.is_absolute():
         rigged_model = (workspace / rigged_model).resolve()
     if args.visualization_mode == "rigged" and not rigged_model.is_file():
@@ -323,7 +346,14 @@ def main() -> None:
             f"stickmotion sketch frames must be within [0, {args.seq_len - 1}]"
         )
 
-    split_path = workspace / "data" / "AIST++" / "Annotations" / "splits" / f"pose_{args.split}.txt"
+    split_path = (
+        workspace
+        / "data"
+        / "AIST++"
+        / "Annotations"
+        / "splits"
+        / f"pose_{args.split}.txt"
+    )
     sample_ids = _read_nonempty(split_path)
     if args.sample_id is None:
         if not 0 <= args.sample_index < len(sample_ids):
@@ -361,14 +391,16 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     motion_path = workspace / "data" / "cached_ik" / "aist" / f"{sample_id}.npy"
-    aist_pkl = workspace / "data" / "AIST++" / "Annotations" / "motions" / f"{sample_id}.pkl"
+    aist_pkl = (
+        workspace / "data" / "AIST++" / "Annotations" / "motions" / f"{sample_id}.pkl"
+    )
     motion = np.load(motion_path).astype(np.float32)
     clip_end = args.start + args.seq_len
     if motion.shape[0] < clip_end or motion.shape[1:] != (263,):
         raise ValueError(
             f"Expected at least ({clip_end}, 263), got {motion.shape}: {motion_path}"
         )
-    motion = motion[args.start:clip_end]
+    motion = motion[args.start : clip_end]
     reference = ik263_to_smpl22(motion)
     reference = align_smpl22_with_contact_and_center(motion, reference)
     reference_path = run_dir / "reference.npy"
@@ -388,7 +420,9 @@ def main() -> None:
         "source_motion": str(motion_path.relative_to(workspace)),
     }
     manifest_path = run_dir / "comparison_manifest.json"
-    manifest_path.write_text(json.dumps(initial_manifest, indent=2) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(initial_manifest, indent=2) + "\n", encoding="utf-8"
+    )
 
     flow_path = run_dir / "flowmimic.npy"
     flow_meta_path = run_dir / "flowmimic_meta.json"
@@ -417,7 +451,9 @@ def main() -> None:
                     f"Existing FlowMimic metadata mismatch for {key}: {actual!r} != {value!r}"
                 )
         if Path(str(flow_meta.get("path", ""))).stem != sample_id:
-            raise ValueError("Existing FlowMimic metadata does not match the requested sample")
+            raise ValueError(
+                "Existing FlowMimic metadata does not match the requested sample"
+            )
         condition_count = int(
             flow_meta.get("condition_frame_count")
             or len(flow_meta.get("condition_indices", []))
@@ -513,7 +549,6 @@ def main() -> None:
     stick_path = run_dir / "stickmotion.npy"
     stick_ref_path = run_dir / "stickmotion_reference.npy"
     tracks_path = run_dir / "stickman_tracks.npy"
-    locus_path = run_dir / "stickmotion_locus.npy"
     stick_meta_path = run_dir / "stickmotion_meta.json"
     stick_command = [
         args.stickmotion_python,
@@ -544,8 +579,6 @@ def main() -> None:
         str(stick_ref_path),
         "--tracks-output",
         str(tracks_path),
-        "--locus-output",
-        str(locus_path),
         "--meta",
         str(stick_meta_path),
     ]
@@ -573,10 +606,22 @@ def main() -> None:
             "camera": args.camera.removeprefix("c"),
         },
         "motions": [
-            {"key": "reference", "label": "Reference", "path": _relative(reference_path, run_dir)},
-            {"key": "flowmimic", "label": "FlowMimic", "path": _relative(flow_path, run_dir)},
+            {
+                "key": "reference",
+                "label": "Reference",
+                "path": _relative(reference_path, run_dir),
+            },
+            {
+                "key": "flowmimic",
+                "label": "FlowMimic",
+                "path": _relative(flow_path, run_dir),
+            },
             {"key": "mld", "label": "MLD", "path": _relative(mld_path, run_dir)},
-            {"key": "stickmotion", "label": "StickMotion", "path": _relative(stick_path, run_dir)},
+            {
+                "key": "stickmotion",
+                "label": "StickMotion",
+                "path": _relative(stick_path, run_dir),
+            },
         ],
         "methods": {
             "flowmimic": {
@@ -601,7 +646,7 @@ def main() -> None:
                 "stickman_source_frame_indices": stick_meta[
                     "stickman_source_frame_indices"
                 ],
-                "locus": _relative(locus_path, run_dir),
+                "locus_used_for_generation": stick_meta["locus_used_for_generation"],
             },
         },
     }
@@ -637,7 +682,13 @@ def main() -> None:
             "--rigged-model",
             str(rigged_model),
         ]
-        _run("blender", save_command, workspace, os.environ.copy(), run_dir / "blender.log")
+        _run(
+            "blender",
+            save_command,
+            workspace,
+            os.environ.copy(),
+            run_dir / "blender.log",
+        )
     if args.launch_blender:
         subprocess.run(blender_command, cwd=workspace, check=True)
 

@@ -60,6 +60,24 @@ def _safe_name(name: str) -> str:
     return name.replace("/", "_").replace("\\", "_")
 
 
+def _parse_named_checkpoint(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "Named checkpoints must use LABEL=PATH, for example epoch260=checkpoints/model.pt"
+        )
+    label, path = value.split("=", 1)
+    label = label.strip()
+    path = path.strip()
+    if not label or not path:
+        raise argparse.ArgumentTypeError("Both LABEL and PATH must be non-empty")
+    safe_label = _safe_name(label).replace(" ", "_")
+    if safe_label != label:
+        raise argparse.ArgumentTypeError(
+            "Checkpoint labels may not contain spaces or path separators"
+        )
+    return label, path
+
+
 def _recover_smpl22(raw_features: torch.Tensor) -> np.ndarray:
     mld_root = ROOT_DIR / "motion-latent-diffusion"
     if str(mld_root) not in sys.path:
@@ -254,6 +272,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="outputs/vae_recon_smpl22_samples")
     parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Merge new outputs into an existing manifest and export configuration.",
+    )
+    parser.add_argument(
         "--old-flowmimic-ckpt",
         default="checkpoints/vae/len200_smooth_decoder/motion_vae_best.pt",
     )
@@ -276,6 +299,14 @@ def main() -> None:
     parser.add_argument(
         "--vqvae-best-ckpt",
         default="checkpoints/vqvae/aist_mvh_len196_latent16_code1024_ddp_260609-134633/motion_vqvae_best.pt",
+    )
+    parser.add_argument(
+        "--vqvae-checkpoint",
+        action="append",
+        type=_parse_named_checkpoint,
+        default=[],
+        metavar="LABEL=PATH",
+        help="Additional named VQ-VAE checkpoint; repeat to compare checkpoints.",
     )
     parser.add_argument(
         "--vqvae-stats",
@@ -328,6 +359,16 @@ def main() -> None:
     if unknown_models:
         raise ValueError(f"Unknown --models entries: {sorted(unknown_models)}")
 
+    named_vqvae_checkpoints = dict(args.vqvae_checkpoint)
+    if len(named_vqvae_checkpoints) != len(args.vqvae_checkpoint):
+        raise ValueError("Duplicate --vqvae-checkpoint labels are not allowed")
+    reserved_labels = {"input", "flowmimic_old_len200", "flowmimic_compact_query", "mld"}
+    duplicate_reserved = reserved_labels.intersection(named_vqvae_checkpoints)
+    if duplicate_reserved:
+        raise ValueError(
+            f"Named VQ-VAE labels conflict with built-in output labels: {sorted(duplicate_reserved)}"
+        )
+
     recon = {}
     old_stats = args.old_flowmimic_stats
     compact_stats = None
@@ -363,6 +404,14 @@ def main() -> None:
         recon["vqvae_best_val"] = _vqvae_reconstruct(
             vqvae_best, raw, vqvae_best_stats, names, genre_to_id, device
         )
+    for label, checkpoint_path in named_vqvae_checkpoints.items():
+        named_vqvae, named_vqvae_ckpt = _load_vqvae_model(checkpoint_path, device)
+        named_vqvae_stats = (
+            args.vqvae_stats or named_vqvae_ckpt.get("stats_path") or old_stats
+        )
+        recon[label] = _vqvae_reconstruct(
+            named_vqvae, raw, named_vqvae_stats, names, genre_to_id, device
+        )
     joints = {key: _recover_smpl22(value) for key, value in recon.items()}
 
     manifest_rows = []
@@ -388,6 +437,19 @@ def main() -> None:
             )
 
     manifest_path = output_dir / "manifest.csv"
+    if args.append and manifest_path.exists():
+        with manifest_path.open(newline="", encoding="utf-8") as f:
+            previous_rows = list(csv.DictReader(f))
+        new_keys = {
+            (str(row["index"]), row["sample"], row["kind"])
+            for row in manifest_rows
+        }
+        manifest_rows = [
+            row
+            for row in previous_rows
+            if (str(row["index"]), row["sample"], row["kind"]) not in new_keys
+        ] + manifest_rows
+        manifest_rows.sort(key=lambda row: (int(row["index"]), row["kind"]))
     with manifest_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
@@ -404,6 +466,11 @@ def main() -> None:
         writer.writerows(manifest_rows)
 
     config_path = output_dir / "export_config.json"
+    previous_config = {}
+    if args.append and config_path.exists():
+        previous_config = json.loads(config_path.read_text(encoding="utf-8"))
+    merged_vqvae_checkpoints = dict(previous_config.get("vqvae_checkpoints", {}))
+    merged_vqvae_checkpoints.update(named_vqvae_checkpoints)
     config_path.write_text(
         json.dumps(
             {
@@ -416,9 +483,12 @@ def main() -> None:
                 "vqvae_latest_ckpt": args.vqvae_latest_ckpt,
                 "vqvae_best_ckpt": args.vqvae_best_ckpt,
                 "vqvae_stats": args.vqvae_stats,
+                "vqvae_checkpoints": merged_vqvae_checkpoints,
                 "split": args.split,
                 "manifest": args.manifest,
-                "models": sorted(requested_models),
+                "models": sorted(
+                    set(previous_config.get("models", [])) | requested_models
+                ),
                 "output_space": args.output_space,
             },
             indent=2,

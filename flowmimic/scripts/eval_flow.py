@@ -1611,6 +1611,7 @@ def main():
             "aist_cameras": args.aist_cameras,
             "aist_crop_mode": args.aist_crop_mode,
             "num_samples": args.num_samples,
+            "batch_size": args.batch_size,
             "replications": replications,
             "multimodality_repeats": eval_multimodality_repeats,
             "multimodality_times": eval_multimodality_times,

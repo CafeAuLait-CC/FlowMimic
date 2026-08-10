@@ -32,6 +32,22 @@ NAME_RE = re.compile(
     r"(?P<dance>d[^_]+)_(?P<music>m[^_]+)_(?P<ch>ch\d+)$"
 )
 
+DEFAULT_MLD_CONFIG = "baselines/mld/configs/mld_diffusion_aist_mvhvae.yaml"
+DEFAULT_MLD_ASSETS_CONFIG = (
+    "baselines/mld/configs/mld_assets_aist_aistmvh_stats.yaml"
+)
+DEFAULT_MLD_CHECKPOINT = (
+    "runs/mld/mld/aist_ik263_mld_196_aistmvh_vae/checkpoints/epoch=2499.ckpt"
+)
+DEFAULT_STICKMOTION_CONFIG = (
+    "baselines/stickmotion/configs/"
+    "stickmotion_remodiffuse_aist_no_locus_eval.py"
+)
+DEFAULT_STICKMOTION_CHECKPOINT = (
+    "runs/stickmotion/human_ml3d/aist_remodiffuse_no_locus_260730/"
+    "epoch=591-step=25644.ckpt"
+)
+
 
 def _resolve(workspace: Path, value: str) -> Path:
     path = Path(value)
@@ -255,15 +271,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mld-ckpt",
-        default="runs/mld/mld/aist_ik263_mld_196/checkpoints/epoch=2999.ckpt",
+        default=DEFAULT_MLD_CHECKPOINT,
     )
+    parser.add_argument("--mld-config", default=DEFAULT_MLD_CONFIG)
+    parser.add_argument("--mld-assets-config", default=DEFAULT_MLD_ASSETS_CONFIG)
     parser.add_argument(
         "--stickmotion-ckpt",
-        default=(
-            "runs/stickmotion/human_ml3d/aist_remodiffuse_no_locus_260730/"
-            "epoch=591-step=25644.ckpt"
-        ),
+        default=DEFAULT_STICKMOTION_CHECKPOINT,
     )
+    parser.add_argument("--stickmotion-config", default=DEFAULT_STICKMOTION_CONFIG)
     parser.add_argument("--existing-flow-motion", default=None)
     parser.add_argument("--existing-flow-meta", default=None)
     parser.add_argument("--flow-gpu", type=int, default=0)
@@ -539,6 +555,10 @@ def main() -> None:
         mld_device,
         "--ckpt",
         args.mld_ckpt,
+        "--cfg",
+        args.mld_config,
+        "--cfg-assets",
+        args.mld_assets_config,
         "--output",
         str(mld_path),
         "--meta",
@@ -573,6 +593,8 @@ def main() -> None:
         stickmotion_device,
         "--ckpt",
         args.stickmotion_ckpt,
+        "--config",
+        args.stickmotion_config,
         "--output",
         str(stick_path),
         "--reference-output",
@@ -633,11 +655,14 @@ def main() -> None:
             },
             "mld": {
                 "checkpoint": args.mld_ckpt,
+                "config": args.mld_config,
+                "assets_config": args.mld_assets_config,
                 "text": caption["text"],
                 "metadata": _relative(mld_meta_path, run_dir),
             },
             "stickmotion": {
                 "checkpoint": args.stickmotion_ckpt,
+                "config": args.stickmotion_config,
                 "text": caption["text"],
                 "token": caption["token"],
                 "metadata": _relative(stick_meta_path, run_dir),

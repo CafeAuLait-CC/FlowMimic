@@ -60,6 +60,32 @@ COMPARISON_MLD_GPU = int(os.environ.get("FLOWMIMIC_COMPARISON_MLD_GPU", "0"))
 COMPARISON_STICKMOTION_GPU = int(
     os.environ.get("FLOWMIMIC_COMPARISON_STICKMOTION_GPU", "0")
 )
+COMPARISON_MLD_CHECKPOINT = os.environ.get(
+    "FLOWMIMIC_COMPARISON_MLD_CHECKPOINT",
+    "runs/mld/mld/aist_ik263_mld_196_aistmvh_vae/checkpoints/epoch=2499.ckpt",
+)
+COMPARISON_MLD_CONFIG = os.environ.get(
+    "FLOWMIMIC_COMPARISON_MLD_CONFIG",
+    "baselines/mld/configs/mld_diffusion_aist_mvhvae.yaml",
+)
+COMPARISON_MLD_ASSETS_CONFIG = os.environ.get(
+    "FLOWMIMIC_COMPARISON_MLD_ASSETS_CONFIG",
+    "baselines/mld/configs/mld_assets_aist_aistmvh_stats.yaml",
+)
+COMPARISON_STICKMOTION_CHECKPOINT = os.environ.get(
+    "FLOWMIMIC_COMPARISON_STICKMOTION_CHECKPOINT",
+    (
+        "runs/stickmotion/human_ml3d/aist_remodiffuse_no_locus_260730/"
+        "epoch=591-step=25644.ckpt"
+    ),
+)
+COMPARISON_STICKMOTION_CONFIG = os.environ.get(
+    "FLOWMIMIC_COMPARISON_STICKMOTION_CONFIG",
+    (
+        "baselines/stickmotion/configs/"
+        "stickmotion_remodiffuse_aist_no_locus_eval.py"
+    ),
+)
 COMPARISON_BLENDER = shutil.which(
     os.environ.get("FLOWMIMIC_BLENDER", "blender")
 )
@@ -416,6 +442,16 @@ def _comparison_command(
         flow_solver,
         "--flow-ckpt",
         flow_checkpoint,
+        "--mld-ckpt",
+        COMPARISON_MLD_CHECKPOINT,
+        "--mld-config",
+        COMPARISON_MLD_CONFIG,
+        "--mld-assets-config",
+        COMPARISON_MLD_ASSETS_CONFIG,
+        "--stickmotion-ckpt",
+        COMPARISON_STICKMOTION_CHECKPOINT,
+        "--stickmotion-config",
+        COMPARISON_STICKMOTION_CONFIG,
         "--existing-flow-motion",
         str(motion_path),
         "--existing-flow-meta",
@@ -464,6 +500,8 @@ def _comparison_command(
         "stickmotion_source_frames": [start + index for index in sketch_frames],
         "visualization_mode": visualization_mode,
         "device": device or "configured CUDA device",
+        "mld_checkpoint": COMPARISON_MLD_CHECKPOINT,
+        "stickmotion_checkpoint": COMPARISON_STICKMOTION_CHECKPOINT,
         "source_result": str(result_dir.relative_to(OUTPUT_ROOT)),
     }
 

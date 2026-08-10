@@ -24,6 +24,10 @@ baselines/
     configs/                  # MLD AIST++ experiment configs
     scripts/                  # MLD train/eval entrypoints
     tools/                    # MLD preparation and export tools
+  motionhiflow/
+    configs/                  # MotionHiFlow AIST++ architecture/training config
+    scripts/                  # DDP-resumable train and canonical eval entrypoints
+    tools/                    # Fresh AIST++ preparation and train-only statistics
   stickmotion/
     configs/                  # StickMotion AIST++ experiment configs
     scripts/                  # StickMotion train/eval entrypoints
@@ -160,6 +164,9 @@ python flowmimic/tools/process_aist_text_tokens.py
 python flowmimic/tools/prepare_aist_t2m_datasets.py \
   --mld-out prepared/aist_mld_humanml3d \
   --stick-out prepared/aist_stickmotion
+
+python baselines/motionhiflow/tools/prepare_aist.py \
+  --output prepared/motionhiflow_aist_20260808
 ```
 
 The prepared MLD/StickMotion baseline motions are first-cropped to the configured max length, currently 196 frames, so their test protocol can be matched by FlowMimic with `--aist-splits test --aist-cameras 01 --aist-crop-mode first`.
@@ -388,11 +395,14 @@ Train-time eval in `train_flow.py` uses the same core evaluator. W&B logging is 
 
 ## Baseline Utilities
 
-MLD and StickMotion AIST training pipelines:
+MLD, StickMotion, and MotionHiFlow AIST training pipelines:
 
 ```bash
 bash baselines/mld/scripts/run_aist_mvh_pipeline.sh
 bash baselines/stickmotion/scripts/run_aist_no_locus.sh
+
+conda activate motionhiflow
+CUDA_VISIBLE_DEVICES=0,1 bash baselines/motionhiflow/scripts/launch.sh vae 2
 ```
 
 Canonical baseline evaluation uses the same official AIST test split, first-196 crop, frozen AIST T2M motion encoder, evaluator normalization, and physical-motion metrics as `eval_flow.py`:
@@ -407,7 +417,14 @@ python baselines/stickmotion/scripts/eval.py \
   --stickmotion-ckpt /path/to/stickmotion.ckpt \
   --replications 3 \
   --save-json output/eval/stickmotion.json
+
+conda run -n motionhiflow python baselines/motionhiflow/scripts/eval.py \
+  --checkpoint /path/to/motionhiflow_flow.pt \
+  --replications 10 \
+  --save-json output/eval/motionhiflow.json
 ```
+
+MotionHiFlow-specific architecture, fresh-statistics, DDP switching, W&B, and evaluation details are documented in `baselines/motionhiflow/README.md`.
 
 StickMotion sample export:
 
@@ -431,8 +448,8 @@ python flowmimic/tools/sample_aist_method_comparison.py \
   --flow-steps 50 \
   --flow-ckpt checkpoints/flow/vqflow_aist_zq16_unified_sparse_cfg5_260728/flow_round0_update68220.pt \
   --flow-use-ema \
-  --mld-ckpt /path/to/mld.ckpt \
-  --stickmotion-ckpt /path/to/no_locus_stickmotion.ckpt \
+  --mld-ckpt runs/mld/mld/aist_ik263_mld_196_aistmvh_vae/checkpoints/epoch=2499.ckpt \
+  --stickmotion-ckpt runs/stickmotion/human_ml3d/aist_remodiffuse_no_locus_260730/epoch=591-step=25644.ckpt \
   --visualization-mode rigged \
   --rigged-model web_view/assets/smpl22_rigged_calibrated.glb \
   --flow-gpu 0 \
@@ -440,7 +457,7 @@ python flowmimic/tools/sample_aist_method_comparison.py \
   --stickmotion-gpu 1
 ```
 
-The comparison uses a 196-frame clip beginning at `--start`. FlowMimic receives the requested number of uniformly spaced camera-specific pose conditions. MLD and StickMotion receive the same camera-matched caption, and StickMotion also receives its three generated stickman sketches. The selected StickMotion baseline disables its trajectory/locus branch. A locus track is still exported as a diagnostic reference, but it is not provided to the model during generation. The output bundle contains four Blender Z-up `[196, 22, 3]` arrays, the StickMotion sketch tracks and diagnostic locus, per-method metadata/logs, and `comparison_manifest.json`.
+The comparison uses a 196-frame clip beginning at `--start`. FlowMimic receives the requested number of uniformly spaced camera-specific pose conditions. MLD and StickMotion receive the same camera-matched caption, and StickMotion also receives its three generated stickman sketches. The selected MLD checkpoint uses its retrained AIST+MVHumanNet VAE and matched generator statistics. The selected StickMotion baseline disables its trajectory/locus branch. The output bundle contains four Blender Z-up `[196, 22, 3]` arrays, the StickMotion sketch tracks, per-method metadata/logs, and `comparison_manifest.json`.
 
 Load all four motions, the text, and the StickMotion sketches into one Blender scene:
 

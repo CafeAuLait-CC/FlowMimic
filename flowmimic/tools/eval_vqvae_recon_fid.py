@@ -47,6 +47,12 @@ def _physical_reconstruction_metrics(
     diff = reconstructed - reference
     joint_l2 = np.linalg.norm(diff, axis=-1)
     distal_l2 = joint_l2[..., list(DISTAL_JOINTS)]
+    reconstructed_root_relative = reconstructed - reconstructed[:, :, :1]
+    reference_root_relative = reference - reference[:, :, :1]
+    root_relative_l2 = np.linalg.norm(
+        reconstructed_root_relative - reference_root_relative, axis=-1
+    )
+    root_relative_distal_l2 = root_relative_l2[..., list(DISTAL_JOINTS)]
 
     reconstructed_velocity = np.diff(reconstructed, axis=1) * fps
     reference_velocity = np.diff(reference, axis=1) * fps
@@ -120,6 +126,8 @@ def _physical_reconstruction_metrics(
     return {
         "joint_l2": float(joint_l2.mean()),
         "distal_l2": float(distal_l2.mean()),
+        "root_relative_joint_l2": float(root_relative_l2.mean()),
+        "root_relative_distal_l2": float(root_relative_distal_l2.mean()),
         "joint_velocity_l2": float(velocity_error.mean()),
         "root_velocity_l2": float(root_velocity_error.mean()),
         "distal_velocity_l2": float(distal_velocity_error.mean()),
@@ -258,7 +266,9 @@ def main() -> None:
         mse_sum += float(diff.square().sum().item())
         mse_count += diff.numel()
 
-        reconstructed_raw = recon.detach().cpu().numpy()
+        # NumPy shares storage with a CPU tensor. Keep T2M's normalized `recon`
+        # intact while denormalizing a separate array for joint-space metrics.
+        reconstructed_raw = recon.detach().cpu().numpy().copy()
         reconstructed_raw[..., :CONT_END] = (
             reconstructed_raw[..., :CONT_END] * flow_std + flow_mean
         )

@@ -56,7 +56,9 @@
   "evaluator": {
     "t2m_motion_encoder_ckpt": "runs/aist_t2m_evaluator_deps/t2m/text_mot_match/model/finest.tar",
     "t2m_eval_mean_path": "runs/aist_t2m_evaluator_deps/t2m/Comp_v6_KLD01/meta/mean.npy",
-    "t2m_eval_std_path": "runs/aist_t2m_evaluator_deps/t2m/Comp_v6_KLD01/meta/std.npy"
+    "t2m_eval_std_path": "runs/aist_t2m_evaluator_deps/t2m/Comp_v6_KLD01/meta/std.npy",
+    "t2m_word_vectorizer_path": "motion-latent-diffusion/deps/glove",
+    "aist_eval_text_dir": "prepared/aist_mld_aistmvh_stats/texts"
   },
   "runtime": {
     "seed": 42,

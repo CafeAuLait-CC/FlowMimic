@@ -27,6 +27,10 @@ from flowmimic.src.config.config import load_config
 from flowmimic.src.data.openpose import load_aist_openpose, load_mvh_openpose
 from flowmimic.src.metrics import (
     T2MMotionFeatureExtractor,
+    T2MTextFeatureExtractor,
+    T2MWordVectorizer,
+    summarize_reprojection_distance,
+    summarize_text_motion_metrics,
     summarize_motion_feature_metrics,
 )
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
@@ -52,6 +56,7 @@ from flowmimic.src.model.vae.datasets.condition_sampling import (
 from flowmimic.src.model.vae.datasets.label_map_builder import build_genre_to_id
 from flowmimic.src.motion.process_motion import ik263_to_smpl22
 from flowmimic.src.motion.ik.utils.paramUtil import t2m_kinematic_chain
+from flowmimic.src.metrics.motion_quality_metrics import bone_length_variation
 
 
 @dataclass
@@ -412,11 +417,7 @@ def _foot_skate(joints, contact_logits, fps, threshold=0.5):
 
 
 def _bone_var(joints, edges):
-    lengths = []
-    for p, c in edges:
-        seg = np.linalg.norm(joints[:, c] - joints[:, p], axis=-1)
-        lengths.append(np.std(seg))
-    return float(np.mean(lengths)) if lengths else 0.0
+    return bone_length_variation(joints, edges)
 
 
 def _smoothness(joints, fps):
@@ -454,6 +455,35 @@ def _extract_t2m_features(extractor, motion_np, lengths, device, chunk=64):
         feats.append(feat.cpu().numpy())
         start = end
     return np.concatenate(feats, axis=0)
+
+
+def _extract_t2m_text_features(extractor, vectorizer, token_sequences, device, chunk=64):
+    features = []
+    for start in range(0, len(token_sequences), chunk):
+        words, positions, lengths = vectorizer.batch(
+            token_sequences[start : start + chunk]
+        )
+        with torch.inference_mode():
+            encoded = extractor.encode(
+                torch.from_numpy(words).to(device),
+                torch.from_numpy(positions).to(device),
+                torch.from_numpy(lengths).to(device),
+            )
+        features.append(encoded.cpu().numpy())
+    return np.concatenate(features, axis=0)
+
+
+def _read_eval_caption_tokens(text_root, identifier):
+    path = os.path.join(text_root, f"{identifier}.txt")
+    rows = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            fields = line.strip().split("#")
+            if len(fields) == 4 and fields[1].strip():
+                rows.append(fields[1].strip())
+    if not rows:
+        raise ValueError(f"No evaluator caption tokens in {path}")
+    return rows
 
 
 def _load_cond_batch(
@@ -797,6 +827,9 @@ def evaluate_dataset(
     multimodality_times=20,
     skip_empty_cond=True,
     guidance_scale=1.0,
+    text_extractor=None,
+    text_vectorizer=None,
+    text_root=None,
 ):
     print(f"Evaluating {name} (steps={steps})")
     mean, std = stats
@@ -815,12 +848,15 @@ def evaluate_dataset(
     feats_gen_list = []
     feats_ref = []
     feats_mm = []
+    text_feats = []
+    rpd_rows = []
     total_time_net = 0.0
     total_time_full = 0.0
     total_time_flow = 0.0
     total_time_vae = 0.0
     seq_count = 0
     rng = np.random.RandomState(seed)
+    text_rng = random.Random(seed)
     edges = _edges_from_chain(t2m_kinematic_chain)
 
     seen = 0
@@ -930,12 +966,52 @@ def evaluate_dataset(
         conf_np = conf_batch.cpu().numpy()
         tau_np = tau_cond.cpu().numpy()
         mask_np = mask_cond.cpu().numpy()
+        k2d_full_np = (
+            batch["k2d_full"][:batch_size].cpu().numpy()
+            if "k2d_full" in batch
+            else None
+        )
+        conf_full_np = (
+            batch["conf_full"][:batch_size].cpu().numpy()
+            if "conf_full" in batch
+            else None
+        )
+        cond_indices_np = (
+            batch["cond_indices"][:batch_size].cpu().numpy()
+            if "cond_indices" in batch
+            else None
+        )
         batch_records = []
         for i in range(batch_size):
             valid_mask = mask_np[i].astype(bool)
             k2d_i = k2d_np[i][valid_mask]
             conf_i = conf_np[i][valid_mask]
             tau_i = tau_np[i][valid_mask]
+            if (
+                k2d_full_np is not None
+                and conf_full_np is not None
+                and cond_indices_np is not None
+            ):
+                generated_rpd = summarize_reprojection_distance(
+                    joints[i],
+                    k2d_full_np[i],
+                    conf_full_np[i],
+                    cond_indices_np[i],
+                    mapping,
+                    computed,
+                )
+                reference_rpd = summarize_reprojection_distance(
+                    joints_ref[i],
+                    k2d_full_np[i],
+                    conf_full_np[i],
+                    cond_indices_np[i],
+                    mapping,
+                    computed,
+                )
+                generated_rpd.update(
+                    {f"{key}_ref": value for key, value in reference_rpd.items()}
+                )
+                rpd_rows.append(generated_rpd)
             err = _condition_error(
                 joints[i],
                 k2d_i,
@@ -951,7 +1027,11 @@ def evaluate_dataset(
                 batch_records.append(None)
                 continue
             skate = _foot_skate(joints[i], contact_logits[i], cfg.fps)
+            skate_ref = _foot_skate(
+                joints_ref[i], motion_ref_np[i, :, cont_end:], cfg.fps
+            )
             bone = _bone_var(joints[i], edges)
+            bone_ref = _bone_var(joints_ref[i], edges)
             smooth = _smoothness(joints[i], cfg.fps)
             smooth_ref = _smoothness(joints_ref[i], cfg.fps)
             record = {
@@ -966,7 +1046,12 @@ def evaluate_dataset(
                 "skate_left": skate["skate_left"],
                 "skate_right": skate["skate_right"],
                 "skate_mean": 0.5 * (skate["skate_left"] + skate["skate_right"]),
+                "skate_left_ref": skate_ref["skate_left"],
+                "skate_right_ref": skate_ref["skate_right"],
+                "skate_mean_ref": 0.5
+                * (skate_ref["skate_left"] + skate_ref["skate_right"]),
                 "bone_var": bone,
+                "bone_var_ref": bone_ref,
                 "accel_median": smooth["accel_median"],
                 "accel_p90": smooth["accel_p90"],
                 "jerk_median": smooth["jerk_median"],
@@ -999,6 +1084,28 @@ def evaluate_dataset(
             feats_ref.append(
                 _extract_t2m_features(metric_extractor, motion_eval_np, lengths, device)
             )
+            if (
+                text_extractor is not None
+                and text_vectorizer is not None
+                and text_root is not None
+                and name == "AIST"
+            ):
+                token_sequences = []
+                for meta in metas:
+                    identifier = os.path.splitext(os.path.basename(meta["path"]))[0]
+                    token_sequences.append(
+                        text_rng.choice(
+                            _read_eval_caption_tokens(text_root, identifier)
+                        )
+                    )
+                text_feats.append(
+                    _extract_t2m_text_features(
+                        text_extractor,
+                        text_vectorizer,
+                        token_sequences,
+                        device,
+                    )
+                )
             if multimodality_repeats > 1:
                 mm_batch = [feats_gen_list[-1]]
                 mm_joints = [np.asarray(joints)]
@@ -1095,6 +1202,10 @@ def evaluate_dataset(
         summary["aits_net"] = total_time_net / seq_count
         summary["aits_flow"] = total_time_flow / seq_count
         summary["aits_vae"] = total_time_vae / seq_count
+    if rpd_rows:
+        common_rpd_keys = set.intersection(*(set(row) for row in rpd_rows))
+        for key in common_rpd_keys:
+            summary[key] = float(np.mean([row[key] for row in rpd_rows]))
     if compute_dist and metric_extractor is not None and feats_gen_list and feats_ref:
         f_gen = np.concatenate(feats_gen_list, axis=0)
         f_ref = np.concatenate(feats_ref, axis=0)
@@ -1107,7 +1218,15 @@ def evaluate_dataset(
             multimodality_times=multimodality_times,
         )
         summary.update(metric_summary)
-        # Keep old key for downstream compatibility.
+        if text_feats:
+            summary.update(
+                summarize_text_motion_metrics(
+                    np.concatenate(text_feats, axis=0),
+                    f_gen,
+                    r_precision_batch_size=32,
+                    reference_motion_features=f_ref,
+                )
+            )
         summary["mmd"] = summary["mmdist"]
     return summary, results if save_per_sample else None
 
@@ -1328,6 +1447,9 @@ def main():
     flow.eval()
 
     t2m_extractor = None
+    t2m_text_extractor = None
+    t2m_word_vectorizer = None
+    aist_eval_text_root = None
     t2m_stats = None
     if not args.no_dist:
         t2m_ckpt = cfg.get("t2m_motion_encoder_ckpt")
@@ -1352,6 +1474,21 @@ def main():
         t2m_extractor = T2MMotionFeatureExtractor(input_size=cfg["d_in"]).to(args.device)
         t2m_extractor.load_pretrained(t2m_ckpt)
         t2m_extractor.eval()
+        t2m_glove_path = cfg.get("t2m_word_vectorizer_path")
+        aist_eval_text_root = cfg.get("aist_eval_text_dir")
+        if not t2m_glove_path or not os.path.isdir(t2m_glove_path):
+            raise FileNotFoundError(
+                f"T2M word vectorizer path not found: {t2m_glove_path}"
+            )
+        if not aist_eval_text_root or not os.path.isdir(aist_eval_text_root):
+            raise FileNotFoundError(
+                f"AIST evaluator text directory not found: {aist_eval_text_root}"
+            )
+        print(f"Loading T2M text evaluator and tokens: {t2m_glove_path}")
+        t2m_text_extractor = T2MTextFeatureExtractor().to(args.device)
+        t2m_text_extractor.load_pretrained(t2m_ckpt)
+        t2m_text_extractor.eval()
+        t2m_word_vectorizer = T2MWordVectorizer(t2m_glove_path)
         t2m_mean = np.load(t2m_mean_path).astype(np.float32)
         t2m_std = np.load(t2m_std_path).astype(np.float32)
         expected_t2m_dim = cfg["d_in"]
@@ -1453,6 +1590,7 @@ def main():
             camera_ids=aist_cameras,
             expand_cameras=True,
             include_cond=True,
+            include_full_cond=True,
             openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
             cond_frames_min=aist_cond_frames,
@@ -1563,6 +1701,9 @@ def main():
                     multimodality_repeats=eval_multimodality_repeats,
                     multimodality_times=eval_multimodality_times,
                     guidance_scale=args.guidance_scale,
+                    text_extractor=t2m_text_extractor,
+                    text_vectorizer=t2m_word_vectorizer,
+                    text_root=aist_eval_text_root,
                 )
                 rep_row = {
                     "dataset": dataset_name,
@@ -1634,6 +1775,11 @@ def main():
             "cam_mode": eval_cam_mode,
             "slack_seconds": eval_slack_seconds,
             "cond_drop_prob": eval_cond_drop_prob,
+            "metric_semantics": {
+                "pmfd": "paired generated/reference AIST T2M motion-feature distance",
+                "mmdist": "standard target-caption/generated-motion AIST T2M distance",
+                "rpd": "shared weak-perspective camera fitted on observed frames only",
+            },
         },
     }
     with open(save_json, "w", encoding="utf-8") as f:

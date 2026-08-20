@@ -83,6 +83,12 @@ def normalize_config(config):
     )
     _set_missing(cfg, "t2m_eval_mean_path", evaluator.get("t2m_eval_mean_path"))
     _set_missing(cfg, "t2m_eval_std_path", evaluator.get("t2m_eval_std_path"))
+    _set_missing(
+        cfg,
+        "t2m_word_vectorizer_path",
+        evaluator.get("t2m_word_vectorizer_path"),
+    )
+    _set_missing(cfg, "aist_eval_text_dir", evaluator.get("aist_eval_text_dir"))
 
     for key in (
         "seed",

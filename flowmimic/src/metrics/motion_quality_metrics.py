@@ -61,22 +61,42 @@ def foot_skate(
     }
 
 
+def bone_length_variation(joints: np.ndarray, edges) -> float:
+    """Mean temporal coefficient of variation over skeleton bones."""
+    lengths = np.stack(
+        [
+            np.linalg.norm(joints[:, child] - joints[:, parent], axis=-1)
+            for parent, child in edges
+        ],
+        axis=-1,
+    )
+    return float(
+        np.mean(np.std(lengths, axis=0) / (np.mean(lengths, axis=0) + 1e-8))
+    )
+
+
 def summarize_physical_motion(
     generated_joints: np.ndarray,
     reference_joints: np.ndarray,
     generated_contacts: np.ndarray,
+    reference_contacts: np.ndarray,
     fps: float,
 ) -> dict[str, float]:
     """Average per-sequence physical metrics using eval_flow.py semantics."""
     generated_rows = []
     reference_rows = []
     skate_rows = []
-    for generated, reference, contacts in zip(
-        generated_joints, reference_joints, generated_contacts
+    reference_skate_rows = []
+    for generated, reference, contacts, reference_contact in zip(
+        generated_joints,
+        reference_joints,
+        generated_contacts,
+        reference_contacts,
     ):
         generated_rows.append(motion_smoothness(generated, fps))
         reference_rows.append(motion_smoothness(reference, fps))
         skate_rows.append(foot_skate(generated, contacts, fps))
+        reference_skate_rows.append(foot_skate(reference, reference_contact, fps))
 
     output = {}
     for key in generated_rows[0]:
@@ -85,4 +105,13 @@ def summarize_physical_motion(
     output["skate_left"] = float(np.mean([row["skate_left"] for row in skate_rows]))
     output["skate_right"] = float(np.mean([row["skate_right"] for row in skate_rows]))
     output["skate_mean"] = 0.5 * (output["skate_left"] + output["skate_right"])
+    output["skate_left_ref"] = float(
+        np.mean([row["skate_left"] for row in reference_skate_rows])
+    )
+    output["skate_right_ref"] = float(
+        np.mean([row["skate_right"] for row in reference_skate_rows])
+    )
+    output["skate_mean_ref"] = 0.5 * (
+        output["skate_left_ref"] + output["skate_right_ref"]
+    )
     return output

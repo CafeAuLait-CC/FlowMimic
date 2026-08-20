@@ -69,6 +69,7 @@ class AISTDataset(Dataset):
         camera_ids=None,
         expand_cameras=False,
         include_cond=False,
+        include_full_cond=False,
         openpose_dir=None,
         cond_cache_root=None,
         cond_frames_min=None,
@@ -102,6 +103,7 @@ class AISTDataset(Dataset):
         self.camera_ids = list(camera_ids) if camera_ids else []
         self.expand_cameras = expand_cameras
         self.include_cond = include_cond
+        self.include_full_cond = include_full_cond
         self.openpose_dir = openpose_dir
         self.cond_cache_root = cond_cache_root
         self.cond_frames_min = cond_frames_min
@@ -240,6 +242,9 @@ class AISTDataset(Dataset):
                     [conf, np.zeros((pad_len, 25), dtype=np.float32)], axis=0
                 )
             t_len = k2d.shape[0]
+            if self.include_full_cond:
+                sample["k2d_full"] = torch.from_numpy(k2d.copy()).float()
+                sample["conf_full"] = torch.from_numpy(conf.copy()).float()
             k_frames, frame_budget = self._condition_frame_counts()
             sample_key = condition_sample_key(path, camera, start, self.seq_len)
             if self.cond_index_manifest is not None:

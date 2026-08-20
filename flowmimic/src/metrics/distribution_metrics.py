@@ -34,6 +34,85 @@ def calculate_matching_score(embedding1, embedding2, sum_all=False):
     return dist
 
 
+def calculate_top_k(sorted_indices, top_k):
+    """Return cumulative top-k matches for a paired retrieval matrix."""
+    size = sorted_indices.shape[0]
+    paired = np.arange(size)[:, None]
+    correct = np.zeros((size,), dtype=bool)
+    columns = []
+    for index in range(min(int(top_k), sorted_indices.shape[1])):
+        correct = correct | (sorted_indices[:, index : index + 1] == paired).reshape(-1)
+        columns.append(correct[:, None])
+    while len(columns) < int(top_k):
+        columns.append(correct[:, None])
+    return np.concatenate(columns, axis=1)
+
+
+def summarize_text_motion_metrics(
+    text_features,
+    motion_features,
+    *,
+    r_precision_batch_size=32,
+    top_k=3,
+    reference_motion_features=None,
+):
+    """Compute standard T2M matching distance and batch-wise R-precision.
+
+    R-precision follows the HumanML3D/T2M protocol: retrieval candidates are
+    restricted to deterministic contiguous batches, normally of size 32.
+    """
+    text_features = np.asarray(text_features)
+    motion_features = np.asarray(motion_features)
+    if text_features.ndim != 2 or motion_features.ndim != 2:
+        raise ValueError("Text and motion features must be [N,D]")
+    if text_features.shape != motion_features.shape:
+        raise ValueError(
+            "Text and motion features must have matching shape, got "
+            f"{text_features.shape} and {motion_features.shape}"
+        )
+    if r_precision_batch_size < 2:
+        raise ValueError("r_precision_batch_size must be at least 2")
+
+    def _retrieval(candidate_features):
+        matched_distance = calculate_matching_score(
+            text_features, candidate_features
+        )
+        correct = np.zeros((int(top_k),), dtype=np.float64)
+        count = 0
+        for start in range(0, len(text_features), int(r_precision_batch_size)):
+            end = min(start + int(r_precision_batch_size), len(text_features))
+            text_batch = text_features[start:end]
+            motion_batch = candidate_features[start:end]
+            distances = euclidean_distance_matrix(text_batch, motion_batch)
+            ranked = np.argsort(distances, axis=1)
+            batch_top_k = calculate_top_k(ranked, top_k)
+            correct[: batch_top_k.shape[1]] += batch_top_k.sum(axis=0)
+            count += end - start
+        return float(matched_distance.mean()), correct / max(count, 1)
+
+    mmdist, r_precision = _retrieval(motion_features)
+    output = {
+        "mmdist": mmdist,
+        "matching_score": mmdist,
+        "r_precision_n": int(len(text_features)),
+        "r_precision_batch_size": int(r_precision_batch_size),
+    }
+    for index, value in enumerate(r_precision, start=1):
+        output[f"r_precision_top_{index}"] = float(value)
+
+    if reference_motion_features is not None:
+        reference_motion_features = np.asarray(reference_motion_features)
+        if reference_motion_features.shape != text_features.shape:
+            raise ValueError("Reference motion features do not match text features")
+        reference_mmdist, reference_r_precision = _retrieval(
+            reference_motion_features
+        )
+        output["mmdist_ref"] = reference_mmdist
+        for index, value in enumerate(reference_r_precision, start=1):
+            output[f"r_precision_ref_top_{index}"] = float(value)
+    return output
+
+
 def calculate_diversity(activation, diversity_times):
     assert len(activation.shape) == 2
     assert activation.shape[0] > diversity_times
@@ -110,12 +189,15 @@ def summarize_motion_feature_metrics(
 
     mu_gen, cov_gen = calculate_activation_statistics(feats_gen)
     mu_ref, cov_ref = calculate_activation_statistics(feats_ref)
-    mmdist = float(calculate_matching_score(feats_gen, feats_ref).mean())
+    pmfd = float(calculate_matching_score(feats_gen, feats_ref).mean())
 
     metrics = {
         "fid": float(calculate_frechet_distance(mu_ref, cov_ref, mu_gen, cov_gen)),
-        "mmdist": mmdist,
-        "matching_score": mmdist,
+        "pmfd": pmfd,
+        # Backward-compatible aliases. Dedicated text-aware evaluators replace
+        # these two fields with standard text-motion matching metrics.
+        "mmdist": pmfd,
+        "matching_score": pmfd,
         "fid_n": int(feats_gen.shape[0]),
     }
 

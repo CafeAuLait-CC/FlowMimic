@@ -138,6 +138,7 @@ def main():
     # lightweight metadata below is written.
     state = torch.load(args.checkpoint, map_location="cpu")
     ckpt_metadata = _checkpoint_metadata(state)
+    reflow_metadata = _metadata_section(ckpt_metadata, "reflow")
     seq_len = args.seq_len or ckpt_metadata.get("seq_len") or config["seq_len"]
     openpose_stats_path = ckpt_metadata.get("openpose_stats_path") or config.get(
         "openpose_stats_path", "data/openpose_stats.npz"
@@ -565,6 +566,8 @@ def main():
         "solver_steps": args.steps,
         "solver": args.solver,
         "use_ema": args.use_ema,
+        "reflow_round": int(reflow_metadata.get("round", 0)),
+        "reflow_teacher_checkpoint": reflow_metadata.get("teacher_ckpt"),
         "sparse_indices": sample_idx_out,
         "condition_indices": sample_idx_out,
         "condition_frame_count": len(sample_idx_out),

@@ -383,3 +383,129 @@ class SparsePatternPhase1Curriculum:
             "eval_every_updates": self.eval_every_updates,
             "config": dict(self.config),
         }
+
+
+class ReflowRound1Curriculum:
+    """Fresh update schedule for strict round-1 teacher-pair training."""
+
+    def __init__(self, config, max_updates=None):
+        self.config = dict(config)
+        self.reference_updates_per_epoch = int(
+            self.config["reference_updates_per_epoch"]
+        )
+        self.warmup_end = int(self.config["warmup_end_update"])
+        self.hold_end = int(self.config["hold_end_update"])
+        self.decay_end = int(self.config["decay_end_update"])
+        self.max_updates = int(
+            max_updates
+            if max_updates is not None
+            else self.config.get("max_updates", self.decay_end)
+        )
+        self.optional_max_updates = int(
+            self.config.get("optional_max_updates", self.max_updates)
+        )
+        self.eval_every_updates = int(self.config["eval_every_updates"])
+        self.lr_peak = float(self.config["lr_peak"])
+        self.lr_final = float(self.config["lr_final"])
+        self.condition_weight_scale = float(
+            self.config.get("condition_weight_scale", 0.0)
+        )
+        self.condition_choices = tuple(
+            int(value) for value in self.config["condition_choices"]
+        )
+        self.condition_probs = self._probabilities("condition_probs")
+        self.condition_pattern_choices = tuple(
+            str(value) for value in self.config["condition_pattern_choices"]
+        )
+        self.condition_pattern_probs = self._probabilities(
+            "condition_pattern_probs"
+        )
+        self.condition_joint_quotas = tuple(
+            (
+                str(item["pattern"]),
+                int(item["count"]),
+                float(item["fraction"]),
+            )
+            for item in self.config.get("condition_joint_quotas", [])
+        )
+        self.solver_steps = tuple(
+            int(value) for value in self.config.get("solver_steps", [8])
+        )
+        self._validate()
+
+    def _probabilities(self, key):
+        values = tuple(float(value) for value in self.config[key])
+        total = sum(values)
+        if total <= 0.0:
+            raise ValueError(f"{key} must have a positive sum")
+        return tuple(value / total for value in values)
+
+    def _validate(self):
+        if self.reference_updates_per_epoch <= 0:
+            raise ValueError("reference_updates_per_epoch must be positive")
+        if not (0 < self.warmup_end <= self.hold_end < self.decay_end):
+            raise ValueError("Invalid round-1 learning-rate milestones")
+        if self.max_updates <= 0 or self.eval_every_updates <= 0:
+            raise ValueError("Invalid round-1 update bounds")
+        if self.optional_max_updates < self.max_updates:
+            raise ValueError("optional_max_updates cannot precede max_updates")
+        if len(self.condition_probs) != len(self.condition_choices):
+            raise ValueError("Condition choices/probabilities must match")
+        if len(self.condition_pattern_probs) != len(
+            self.condition_pattern_choices
+        ):
+            raise ValueError("Condition pattern choices/probabilities must match")
+        if not self.solver_steps:
+            raise ValueError("Round-1 solver-step schedule cannot be empty")
+        quota_total = 0.0
+        for pattern, count, fraction in self.condition_joint_quotas:
+            if pattern not in self.condition_pattern_choices:
+                raise ValueError(f"Unknown joint-quota pattern: {pattern}")
+            if count not in self.condition_choices:
+                raise ValueError(f"Unknown joint-quota condition count: {count}")
+            if fraction < 0.0:
+                raise ValueError("Joint-quota fractions cannot be negative")
+            quota_total += fraction
+        if quota_total > 1.0 + 1e-8:
+            raise ValueError("Joint-quota fractions cannot sum above one")
+
+    def state(self, completed_updates):
+        updates = max(0, int(completed_updates))
+        if updates < self.warmup_end:
+            phase = "reflow_warmup"
+            learning_rate = self.lr_peak * (updates + 1) / self.warmup_end
+        elif updates < self.hold_end:
+            phase = "reflow_hold"
+            learning_rate = self.lr_peak
+        elif updates < self.decay_end:
+            phase = "reflow_decay"
+            fraction = (updates - self.hold_end) / max(
+                self.decay_end - self.hold_end,
+                1,
+            )
+            learning_rate = _lerp(self.lr_peak, self.lr_final, fraction)
+        else:
+            phase = "reflow_optional_hold"
+            learning_rate = self.lr_final
+        return UnifiedRound0State(
+            completed_updates=updates,
+            phase=phase,
+            learning_rate=float(learning_rate),
+            condition_weight_scale=self.condition_weight_scale,
+            condition_choices=self.condition_choices,
+            condition_probs=self.condition_probs,
+            condition_pattern_choices=self.condition_pattern_choices,
+            condition_pattern_probs=self.condition_pattern_probs,
+            solver_steps=self.solver_steps,
+            condition_joint_quotas=self.condition_joint_quotas,
+        )
+
+    def metadata(self):
+        return {
+            "name": self.config.get("name", "reflow_round1"),
+            "max_updates": self.max_updates,
+            "optional_max_updates": self.optional_max_updates,
+            "reference_updates_per_epoch": self.reference_updates_per_epoch,
+            "eval_every_updates": self.eval_every_updates,
+            "config": dict(self.config),
+        }

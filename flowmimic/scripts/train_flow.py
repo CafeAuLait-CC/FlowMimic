@@ -51,6 +51,7 @@ from flowmimic.src.data.openpose import (
 )
 from flowmimic.src.metrics import T2MMotionFeatureExtractor
 from flowmimic.src.training.flow_curriculum import (
+    ReflowRound1Curriculum,
     SparsePatternPhase1Curriculum,
     UnifiedRound0Curriculum,
 )
@@ -317,6 +318,7 @@ def main():
             "cfg_phase2_true_null",
             "cfg_phase2_true_null_drop10",
             "cfg_phase2_control",
+            "reflow_round1",
         ),
         default=None,
         help="Use a named update-based training curriculum from config.json.",
@@ -340,6 +342,21 @@ def main():
     parser.add_argument("--use-ema-teacher", action="store_true")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/flow")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help=(
+            "Initialize model weights from a checkpoint while resetting epoch, "
+            "optimizer, EMA, and curriculum progress."
+        ),
+    )
+    parser.add_argument(
+        "--init-use-ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use EMA weights from --init-from when available.",
+    )
     parser.add_argument(
         "--lr-decay-epoch",
         type=int,
@@ -451,6 +468,10 @@ def main():
     )
     parser.add_argument("--async-eval-log-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.resume and args.init_from:
+        parser.error("--resume and --init-from are mutually exclusive")
+    if args.curriculum == "reflow_round1" and args.reflow_round != 1:
+        parser.error("--curriculum reflow_round1 requires --reflow-round 1")
     _apply_train_flow_config_defaults(args, config)
     curriculum = None
     curriculum_config = None
@@ -521,6 +542,33 @@ def main():
         args.cond_frames_max = max(initial_curriculum_state.condition_choices)
         args.lr = curriculum.lr_peak
         args.lr_decay_epoch = 999999
+    elif args.curriculum == "reflow_round1":
+        curriculum_config = (
+            config.get("flow", {}).get("curriculum", {}).get(args.curriculum)
+        )
+        if not curriculum_config:
+            raise ValueError("Missing flow.curriculum.reflow_round1 config")
+        curriculum = ReflowRound1Curriculum(
+            curriculum_config,
+            max_updates=args.max_updates,
+        )
+        initial_curriculum_state = curriculum.state(0)
+        args.cond_frame_choices = list(
+            initial_curriculum_state.condition_choices
+        )
+        dense_count = max(initial_curriculum_state.condition_choices)
+        args.cond_frame_choice_probs = [
+            1.0 if value == dense_count else 0.0
+            for value in initial_curriculum_state.condition_choices
+        ]
+        args.cond_frames_min = min(initial_curriculum_state.condition_choices)
+        args.cond_frames_max = max(initial_curriculum_state.condition_choices)
+        args.lr = curriculum.lr_peak
+        args.lr_decay_epoch = 999999
+        args.teacher_steps = int(curriculum_config["teacher_steps"])
+        args.teacher_solver = str(curriculum_config["teacher_solver"])
+        args.teacher_mode = str(curriculum_config["teacher_mode"])
+        args.p_teacher = float(curriculum_config["p_teacher"])
     relative_time_bias = bool(
         (curriculum_config or {}).get(
             "relative_time_bias",
@@ -681,6 +729,12 @@ def main():
                     "eval_condition_manifest": args.eval_condition_manifest,
                     "cond_lr_scale": args.cond_lr_scale,
                     "reflow_round": args.reflow_round,
+                    "init_from": args.init_from,
+                    "init_use_ema": args.init_use_ema,
+                    "teacher_ckpt": args.teacher_ckpt,
+                    "use_ema_teacher": args.use_ema_teacher,
+                    "teacher_steps": args.teacher_steps,
+                    "teacher_solver": args.teacher_solver,
                     "teacher_mode": args.teacher_mode,
                     "p_teacher": args.p_teacher,
                     "cond_frames_min": args.cond_frames_min
@@ -982,6 +1036,8 @@ def main():
     )
     flow.to(device)
     resume_state = None
+    init_state = None
+    source_model_state = None
     relative_time_migration = False
     latent_slot_adapter_migration = False
     true_null_migration = False
@@ -989,15 +1045,40 @@ def main():
         if is_main:
             print(f"Resuming from {args.resume}")
         resume_state = torch.load(args.resume, map_location=device)
-        resume_model_state = resume_state["model"]
+        source_model_state = resume_state["model"]
+    elif args.init_from:
+        if is_main:
+            print(f"Initializing a fresh training round from {args.init_from}")
+        init_state = torch.load(args.init_from, map_location="cpu")
+        source_model_state = (
+            init_state["ema"]
+            if args.init_use_ema and "ema" in init_state
+            else init_state["model"]
+        )
+        if is_main:
+            source_kind = (
+                "EMA" if args.init_use_ema and "ema" in init_state else "model"
+            )
+            print(f"Using {source_kind} weights; optimizer and progress start at zero")
+
+    if source_model_state is not None:
+        _validate_flow_checkpoint_contract(
+            "resume" if resume_state is not None else "initialization",
+            resume_state if resume_state is not None else init_state,
+            seq_len=seq_len,
+            latent_len=latent_len,
+            d_z=flow_d_z,
+            vae_ckpt=vae_ckpt_path,
+            latent_stats_path=latent_stats_path,
+        )
         source_uses_relative_time = flow_state_uses_relative_time_bias(
-            resume_model_state
+            source_model_state
         )
         source_uses_latent_slot_adapter = flow_state_uses_latent_slot_adapter(
-            resume_model_state
+            source_model_state
         )
         source_uses_true_null = flow_state_uses_true_null_condition(
-            resume_model_state
+            source_model_state
         )
         if source_uses_relative_time and not relative_time_bias:
             raise ValueError(
@@ -1025,7 +1106,7 @@ def main():
         )
         load_flow_state_dict(
             flow,
-            resume_model_state,
+            source_model_state,
             allow_relative_time_migration=relative_time_migration,
             allow_latent_slot_adapter_migration=latent_slot_adapter_migration,
             allow_true_null_migration=true_null_migration,
@@ -1045,7 +1126,9 @@ def main():
                 "Initialized learned true-null condition from a legacy flow "
                 "checkpoint"
             )
-    if latent_slot_adapter and (latent_slot_adapter_migration or not args.resume):
+    if latent_slot_adapter and (
+        latent_slot_adapter_migration or source_model_state is None
+    ):
         if not hasattr(vae, "latent_queries") or not hasattr(vae, "latent_pos"):
             raise ValueError(
                 "Latent-slot adapter initialization requires query-mode VQ-VAE slots"
@@ -1055,6 +1138,9 @@ def main():
         )
         if is_main:
             print("Initialized flow adapter slots from VQ-VAE query identities")
+    if init_state is not None:
+        source_model_state = None
+        init_state = None
     if match_relative_time_init_rng:
         for block in flow.flow.blocks:
             block.relative_time_bias = None
@@ -1310,7 +1396,16 @@ def main():
     if args.reflow_round >= 1:
         if not args.teacher_ckpt:
             raise ValueError("teacher_ckpt is required for reflow_round >= 1")
-        state = torch.load(args.teacher_ckpt, map_location=device)
+        state = torch.load(args.teacher_ckpt, map_location="cpu")
+        _validate_flow_checkpoint_contract(
+            "teacher",
+            state,
+            seq_len=seq_len,
+            latent_len=latent_len,
+            d_z=flow_d_z,
+            vae_ckpt=vae_ckpt_path,
+            latent_stats_path=latent_stats_path,
+        )
         teacher_state = (
             state["ema"]
             if args.use_ema_teacher and "ema" in state
@@ -1330,6 +1425,21 @@ def main():
             default_latent_len=latent_len,
             default_ffn_dim=latent_slot_adapter_ffn_dim,
         )
+        teacher_architecture = {
+            "relative_time_bias": teacher_relative_time_bias,
+            "latent_slot_adapter": teacher_latent_slot_adapter,
+            "true_null_condition": teacher_true_null_condition,
+        }
+        student_architecture = {
+            "relative_time_bias": relative_time_bias,
+            "latent_slot_adapter": latent_slot_adapter,
+            "true_null_condition": true_null_condition,
+        }
+        if teacher_architecture != student_architecture:
+            raise ValueError(
+                "Teacher/student flow architectures differ: "
+                f"teacher={teacher_architecture}, student={student_architecture}"
+            )
         teacher_flow = ConditionalRectFlow(
             d_z=flow_d_z,
             d_model=flow_cfg.get("d_model", 512),
@@ -1352,10 +1462,27 @@ def main():
             true_null_condition=teacher_true_null_condition,
         )
         load_flow_state_dict(teacher_flow, teacher_state)
-        teacher_flow.to(device)
+        teacher_flow.to(device).eval()
         teacher = Teacher(
             teacher_flow,
             solver_cfg={"num_steps": teacher_steps, "method": teacher_solver},
+        )
+        teacher_state = None
+        state = None
+    strict_reflow = (
+        teacher is not None
+        and args.reflow_round >= 1
+        and teacher_mode == "strict"
+    )
+    if is_main and teacher is not None:
+        print(
+            "Reflow teacher: checkpoint={} weights={} solver={} steps={} NFE={}".format(
+                args.teacher_ckpt,
+                "ema" if args.use_ema_teacher else "model",
+                teacher_solver,
+                teacher_steps,
+                teacher_steps * (2 if teacher_solver == "heun" else 1),
+            )
         )
 
     ema = EMA(flow_model, decay=ema_decay) if args.ema else None
@@ -1556,6 +1683,9 @@ def main():
         cfg_null_count = torch.zeros((), device=device)
         cfg_delta_l2_sum = torch.zeros((), device=device)
         cfg_delta_count = torch.zeros((), device=device)
+        teacher_target_std_sum = torch.zeros((), device=device)
+        teacher_displacement_rms_sum = torch.zeros((), device=device)
+        teacher_target_count = torch.zeros((), device=device)
         cfg_cond_time_loss_sums = torch.zeros(
             len(CFG_TIME_BIN_LABELS), device=device
         )
@@ -1664,38 +1794,52 @@ def main():
                 tau_cond,
                 mask_cond,
             ) = _merge_batches(batch)
-            motion = motion.to(device, non_blocking=non_blocking)
             domain_id = domain_id.to(device, non_blocking=non_blocking)
             style_id = style_id.to(device, non_blocking=non_blocking)
-            if audit_finite and not torch.isfinite(motion).all():
+            if (
+                not strict_reflow
+                and audit_finite
+                and not torch.isfinite(motion).all()
+            ):
                 if args.debug:
                     _debug_log("Warning: non-finite motion batch; skipping", epoch + 1)
                 bad_local = True
             if not bad_local:
                 t1 = time.perf_counter()
                 t_load += t1 - t0
-
-                with torch.no_grad():
-                    z_data = encode_motion_latent(
-                        vae,
-                        motion,
-                        domain_id,
-                        style_id,
-                        mask=mask.to(device, non_blocking=non_blocking),
+                if strict_reflow:
+                    z_data = None
+                    x0 = torch.randn(
+                        motion.shape[0],
+                        latent_len,
+                        flow_d_z,
+                        device=device,
                     )
-                if latent_mean is not None and latent_std is not None:
-                    z_data = (z_data - latent_mean) / (latent_std + 1e-6)
-                if audit_finite and not torch.isfinite(z_data).all():
-                    if args.debug:
-                        _debug_log("Warning: non-finite z_data; skipping", epoch + 1)
-                    bad_local = True
+                else:
+                    motion = motion.to(device, non_blocking=non_blocking)
+                    with torch.no_grad():
+                        z_data = encode_motion_latent(
+                            vae,
+                            motion,
+                            domain_id,
+                            style_id,
+                            mask=mask.to(device, non_blocking=non_blocking),
+                        )
+                    if latent_mean is not None and latent_std is not None:
+                        z_data = (z_data - latent_mean) / (latent_std + 1e-6)
+                    if audit_finite and not torch.isfinite(z_data).all():
+                        if args.debug:
+                            _debug_log(
+                                "Warning: non-finite z_data; skipping",
+                                epoch + 1,
+                            )
+                        bad_local = True
+                    x0 = torch.randn_like(z_data)
             if not bad_local:
                 t2 = time.perf_counter()
                 t_encode += t2 - t1
 
-                x0 = torch.randn_like(z_data)
-                t = torch.rand(z_data.shape[0], device=device)
-                x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
+                t = torch.rand(x0.shape[0], device=device)
                 if k2d_batch is None:
                     if args.debug:
                         _debug_log("Warning: missing k2d batch; skipping", epoch + 1)
@@ -1796,41 +1940,24 @@ def main():
                         conf_batch[drop_cond] = 0.0
 
                 if use_teacher:
-                    with torch.no_grad():
-                        style_t = flow_model.style_emb(
-                            style_id_cond,
-                            domain_id,
-                            apply_dropout=False,
-                        )
-                        g_t = flow_model.cond_mlp(
-                            torch.cat([g2d, style_t], dim=-1)
-                        )
-                        mem_t = mem
-                        tau_cond_t = tau_cond
-                        mask_cond_t = mask_cond
-                        if true_null_condition:
-                            (
-                                g_t,
-                                mem_t,
-                                tau_cond_t,
-                                mask_cond_t,
-                            ) = flow_model.apply_true_null_condition(
-                                g_t,
-                                mem,
-                                tau_cond,
-                                mask_cond,
-                                style_id,
-                                domain_id,
-                                drop_cond,
-                            )
-                        cond_batch = {
-                            "tau_out": tau_out,
-                            "tau_cond": tau_cond_t,
-                            "mem": mem_t,
-                            "g": g_t,
-                            "mem_mask": ~mask_cond_t,
-                        }
+                    cond_batch = teacher.build_condition_batch(
+                        k2d=k2d_batch,
+                        tau_cond=tau_cond,
+                        vis_mask=vis_batch,
+                        mask_cond=mask_cond,
+                        style_id=style_id,
+                        domain_id=domain_id,
+                        tau_out=tau_out,
+                        mean=k2d_mean,
+                        std=k2d_std,
+                        null_mask=drop_cond,
+                    )
                     z_data = teacher.generate_x1_hat(x0, cond_batch)
+                    teacher_target_std_sum += z_data.flatten(1).std(dim=1).sum()
+                    teacher_displacement_rms_sum += torch.sqrt(
+                        torch.mean((z_data - x0) ** 2, dim=(1, 2))
+                    ).sum()
+                    teacher_target_count += z_data.shape[0]
                     if not torch.isfinite(z_data).all():
                         if args.debug:
                             _debug_log(
@@ -2249,6 +2376,15 @@ def main():
         )
         if ddp:
             dist.all_reduce(cfg_stats, op=dist.ReduceOp.SUM)
+        teacher_stats = torch.stack(
+            [
+                teacher_target_std_sum,
+                teacher_displacement_rms_sum,
+                teacher_target_count,
+            ]
+        )
+        if ddp:
+            dist.all_reduce(teacher_stats, op=dist.ReduceOp.SUM)
         total_loss = stats[0].item()
         base_loss_sum = stats[1].item()
         smooth_weighted_sum = stats[2].item()
@@ -2268,6 +2404,9 @@ def main():
         cfg_null_count = int(cfg_stats[3].item())
         cfg_delta_l2_sum = cfg_stats[4].item()
         cfg_delta_count = int(cfg_stats[5].item())
+        teacher_target_std_sum = teacher_stats[0].item()
+        teacher_displacement_rms_sum = teacher_stats[1].item()
+        teacher_target_count = int(teacher_stats[2].item())
         cfg_offset = 6
         cfg_bin_count = len(CFG_TIME_BIN_LABELS)
         cfg_cond_time_loss_sums = cfg_stats[
@@ -2324,6 +2463,12 @@ def main():
                 cfg_cond_count + cfg_null_count, 1
             )
             cfg_delta_l2_avg = cfg_delta_l2_sum / max(cfg_delta_count, 1)
+            teacher_target_std_avg = teacher_target_std_sum / max(
+                teacher_target_count, 1
+            )
+            teacher_displacement_rms_avg = teacher_displacement_rms_sum / max(
+                teacher_target_count, 1
+            )
             print(f"Epoch {epoch + 1} avg_loss={total_loss_avg:.6f}")
             print(
                 (
@@ -2348,6 +2493,17 @@ def main():
                         cfg_null_loss_avg,
                         cfg_actual_null_fraction,
                         cfg_delta_l2_avg,
+                    )
+                )
+            if teacher_target_count > 0:
+                print(
+                    (
+                        "Epoch {} teacher_target_std={:.6f} "
+                        "teacher_displacement_rms={:.6f}"
+                    ).format(
+                        epoch + 1,
+                        teacher_target_std_avg,
+                        teacher_displacement_rms_avg,
                     )
                 )
             print(
@@ -2476,6 +2632,13 @@ def main():
                             wandb_metrics[f"loss/velocity_null_{label}"] = (
                                 cfg_null_time_loss_sums[bin_idx] / null_bin_count
                             )
+                if teacher_target_count > 0:
+                    wandb_metrics.update(
+                        {
+                            "reflow/teacher_target_std": teacher_target_std_avg,
+                            "reflow/teacher_displacement_rms": teacher_displacement_rms_avg,
+                        }
+                    )
                 wandb_run.log(
                     wandb_metrics,
                     step=epoch + 1,
@@ -2691,6 +2854,49 @@ def main():
         dist.destroy_process_group()
 
 
+def _validate_flow_checkpoint_contract(
+    label,
+    state,
+    *,
+    seq_len,
+    latent_len,
+    d_z,
+    vae_ckpt,
+    latent_stats_path,
+):
+    if not isinstance(state, dict):
+        raise ValueError(f"{label} checkpoint is not a state dictionary")
+    metadata = state.get("metadata") or {}
+    if not metadata:
+        raise ValueError(
+            f"{label} checkpoint has no metadata; cannot validate reflow contract"
+        )
+    expected_scalars = {
+        "seq_len": int(seq_len),
+        "latent_len": int(latent_len),
+        "d_z": int(d_z),
+    }
+    for key, expected in expected_scalars.items():
+        actual = metadata.get(key)
+        if actual is not None and int(actual) != expected:
+            raise ValueError(
+                f"{label} checkpoint {key}={actual} does not match {expected}"
+            )
+
+    expected_paths = {
+        "vae_ckpt": vae_ckpt,
+        "latent_stats_path": latent_stats_path,
+    }
+    for key, expected in expected_paths.items():
+        actual = metadata.get(key) or state.get(key)
+        if not actual or not expected:
+            continue
+        if os.path.realpath(actual) != os.path.realpath(expected):
+            raise ValueError(
+                f"{label} checkpoint {key}={actual} does not match {expected}"
+            )
+
+
 def _make_checkpoint_metadata(
     *,
     args,
@@ -2741,6 +2947,17 @@ def _make_checkpoint_metadata(
             "latent_slot_adapter_ffn_dim": int(latent_slot_adapter_ffn_dim),
             "latent_slot_adapter_lr_scale": float(latent_slot_adapter_lr_scale),
             "true_null_condition": bool(true_null_condition),
+        },
+        "reflow": {
+            "round": int(args.reflow_round),
+            "init_from": args.init_from,
+            "init_use_ema": bool(args.init_use_ema),
+            "teacher_ckpt": args.teacher_ckpt,
+            "use_ema_teacher": bool(args.use_ema_teacher),
+            "teacher_steps": int(args.teacher_steps),
+            "teacher_solver": args.teacher_solver,
+            "teacher_mode": args.teacher_mode,
+            "p_teacher": float(args.p_teacher),
         },
         "datasets": sorted(datasets),
         "aist_crop_mode": args.aist_crop_mode,

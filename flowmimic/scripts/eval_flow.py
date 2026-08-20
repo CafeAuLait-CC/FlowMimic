@@ -1344,6 +1344,9 @@ def main():
     print(f"Loading flow checkpoint metadata: {args.flow_ckpt}")
     state = torch.load(args.flow_ckpt, map_location=args.device)
     ckpt_metadata = _checkpoint_metadata(state)
+    reflow_metadata = ckpt_metadata.get("reflow", {})
+    if not isinstance(reflow_metadata, dict):
+        reflow_metadata = {}
     seq_len = args.seq_len or ckpt_metadata.get("seq_len") or cfg["seq_len"]
     vae_max_len = ckpt_metadata.get("vae_max_len") or cfg["seq_len"]
     if seq_len > vae_max_len:
@@ -1768,6 +1771,8 @@ def main():
             "guidance_scale": args.guidance_scale,
             "use_ema": args.use_ema,
             "flow_checkpoint": args.flow_ckpt,
+            "reflow_round": int(reflow_metadata.get("round", 0)),
+            "reflow_teacher_checkpoint": reflow_metadata.get("teacher_ckpt"),
             "vae_checkpoint": vae_ckpt,
             "stats_path": stats_path,
             "openpose_stats_path": openpose_stats_path,

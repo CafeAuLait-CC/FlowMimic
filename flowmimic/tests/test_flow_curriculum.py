@@ -1,6 +1,7 @@
 import unittest
 
 from flowmimic.src.training.flow_curriculum import (
+    ReflowRound1Curriculum,
     SparsePatternPhase1Curriculum,
     UnifiedRound0Curriculum,
 )
@@ -44,6 +45,28 @@ PHASE1_CONFIG = {
     "pattern_start_probs": [1.0, 0.0, 0.0],
     "pattern_final_probs": [0.50, 0.30, 0.20],
     "solver_steps": [8, 16],
+}
+
+REFLOW1_CONFIG = {
+    "name": "reflow_round1",
+    "reference_updates_per_epoch": 10,
+    "warmup_end_update": 10,
+    "hold_end_update": 100,
+    "decay_end_update": 150,
+    "max_updates": 150,
+    "optional_max_updates": 180,
+    "eval_every_updates": 20,
+    "lr_peak": 5e-5,
+    "lr_final": 2.5e-5,
+    "condition_weight_scale": 0.0,
+    "condition_choices": [196, 98, 49, 28, 14, 7],
+    "condition_probs": [0.30, 0.15, 0.20, 0.15, 0.12, 0.08],
+    "condition_pattern_choices": ["even", "random", "boundary_gap"],
+    "condition_pattern_probs": [0.50, 0.30, 0.20],
+    "condition_joint_quotas": [
+        {"pattern": "boundary_gap", "count": 7, "fraction": 0.08},
+    ],
+    "solver_steps": [8],
 }
 
 
@@ -189,6 +212,41 @@ class SparsePatternPhase1CurriculumTest(unittest.TestCase):
             state.condition_joint_quotas,
             (("boundary_gap", 7, 0.10), ("boundary_gap", 14, 0.05)),
         )
+
+
+class ReflowRound1CurriculumTest(unittest.TestCase):
+    def setUp(self):
+        self.curriculum = ReflowRound1Curriculum(REFLOW1_CONFIG)
+
+    def test_fresh_update_learning_rate_schedule(self):
+        self.assertAlmostEqual(self.curriculum.state(0).learning_rate, 5e-6)
+        self.assertAlmostEqual(self.curriculum.state(9).learning_rate, 5e-5)
+        self.assertAlmostEqual(self.curriculum.state(10).learning_rate, 5e-5)
+        self.assertAlmostEqual(self.curriculum.state(100).learning_rate, 5e-5)
+        self.assertAlmostEqual(self.curriculum.state(125).learning_rate, 3.75e-5)
+        self.assertAlmostEqual(self.curriculum.state(150).learning_rate, 2.5e-5)
+
+    def test_reflow_keeps_mature_condition_distribution(self):
+        for update in (0, 75, 175):
+            state = self.curriculum.state(update)
+            for actual, expected in zip(
+                state.condition_probs,
+                (0.30, 0.15, 0.20, 0.15, 0.12, 0.08),
+            ):
+                self.assertAlmostEqual(actual, expected)
+            for actual, expected in zip(
+                state.condition_pattern_probs,
+                (0.50, 0.30, 0.20),
+            ):
+                self.assertAlmostEqual(actual, expected)
+            self.assertEqual(state.condition_weight_scale, 0.0)
+            self.assertEqual(state.condition_joint_quotas, (("boundary_gap", 7, 0.08),))
+
+    def test_metadata_uses_new_round_bounds(self):
+        metadata = self.curriculum.metadata()
+        self.assertEqual(metadata["name"], "reflow_round1")
+        self.assertEqual(metadata["max_updates"], 150)
+        self.assertEqual(metadata["optional_max_updates"], 180)
 
 
 if __name__ == "__main__":

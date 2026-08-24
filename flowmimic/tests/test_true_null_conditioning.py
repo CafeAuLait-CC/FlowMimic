@@ -178,6 +178,39 @@ class TrueNullConditioningTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(diagnostics["guidance_delta_l2"]).all())
         self.assertTrue((diagnostics["guidance_delta_l2"] > 0).all())
 
+    def test_cfg_pair_returns_both_branches_with_gradients(self):
+        flow = _build_flow(True)
+        batch_size, token_count, width = 4, 5, 16
+        x_t = torch.randn(batch_size, 2, 8)
+        t_flow = torch.rand(batch_size)
+        tau_out = torch.linspace(0.0, 1.0, 2)
+        memory = torch.randn(batch_size, token_count, width)
+        global_context = torch.randn(batch_size, width)
+        tau_cond = torch.rand(batch_size, token_count)
+        style_id = torch.tensor([1, 2, 3, 1])
+        domain_id = torch.ones(batch_size, dtype=torch.long)
+
+        (v_cond, v_null), diagnostics = flow(
+            x_t,
+            t_flow,
+            tau_out,
+            mem=memory,
+            g=global_context,
+            mem_mask=torch.zeros(batch_size, token_count, dtype=torch.bool),
+            tau_cond=tau_cond,
+            style_id=style_id,
+            domain_id=domain_id,
+            return_cfg_pair=True,
+            return_cfg_diagnostics=True,
+        )
+
+        self.assertEqual(v_cond.shape, x_t.shape)
+        self.assertEqual(v_null.shape, x_t.shape)
+        self.assertEqual(diagnostics["guidance_delta_l2"].shape, (batch_size,))
+        (v_cond.square().mean() + v_null.square().mean()).backward()
+        self.assertIsNotNone(flow.null_memory.grad)
+        self.assertIsNotNone(flow.null_global.grad)
+
 
 if __name__ == "__main__":
     unittest.main()

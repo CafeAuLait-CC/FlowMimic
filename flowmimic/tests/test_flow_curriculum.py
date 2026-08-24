@@ -248,6 +248,24 @@ class ReflowRound1CurriculumTest(unittest.TestCase):
         self.assertEqual(metadata["max_updates"], 150)
         self.assertEqual(metadata["optional_max_updates"], 180)
 
+    def test_rollout_state_probability_ramps_by_update(self):
+        config = dict(REFLOW1_CONFIG)
+        config["rollout_state"] = {
+            "ramp_start_update": 50,
+            "ramp_end_update": 100,
+            "max_probability": 0.2,
+        }
+        curriculum = ReflowRound1Curriculum(config)
+        self.assertEqual(curriculum.state(50).reflow_rollout_probability, 0.0)
+        self.assertAlmostEqual(
+            curriculum.state(75).reflow_rollout_probability,
+            0.1,
+        )
+        self.assertAlmostEqual(
+            curriculum.state(100).reflow_rollout_probability,
+            0.2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

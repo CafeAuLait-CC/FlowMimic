@@ -30,7 +30,12 @@ from flowmimic.src.model.flow.checkpoint import (
 )
 from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
 from flowmimic.src.model.flow.teacher import EMA, Teacher
-from flowmimic.src.model.flow.solver import solve_flow
+from flowmimic.src.model.flow.solver import (
+    cfg_branch_preservation_loss,
+    combine_cfg_velocities,
+    solve_flow,
+    solve_flow_to_time,
+)
 from flowmimic.src.model.vae.datasets.dataset_aist import AISTDataset
 from flowmimic.src.model.vae.datasets.condition_sampling import CONDITION_PATTERNS
 from flowmimic.src.model.vae.datasets.dataset_mvh import MVHumanNetDataset
@@ -54,6 +59,11 @@ from flowmimic.src.training.flow_curriculum import (
     ReflowRound1Curriculum,
     SparsePatternPhase1Curriculum,
     UnifiedRound0Curriculum,
+)
+from flowmimic.src.training.reflow_sampling import (
+    FLOW_TIME_CATEGORY_NAMES,
+    normalized_flow_time_probabilities,
+    sample_reflow_times,
 )
 from flowmimic.scripts.eval_flow import _build_smpl22_to_body25, evaluate_dataset
 
@@ -232,6 +242,129 @@ def _apply_train_flow_config_defaults(args, config):
     args.async_eval_nice = int(flow_eval_cfg.get("async_eval_nice", 10))
 
 
+def _guidance_distribution(curriculum_config):
+    scales = tuple(
+        float(value)
+        for value in curriculum_config.get("teacher_guidance_scales", [])
+    )
+    probabilities = tuple(
+        float(value)
+        for value in curriculum_config.get("teacher_guidance_probs", [])
+    )
+    if not scales or len(scales) != len(probabilities):
+        raise ValueError(
+            "CFG-aware reflow requires matching teacher guidance scales/probabilities"
+        )
+    if any(probability < 0.0 for probability in probabilities):
+        raise ValueError("Teacher guidance probabilities cannot be negative")
+    total = sum(probabilities)
+    if total <= 0.0:
+        raise ValueError("Teacher guidance probabilities must have a positive sum")
+    return scales, tuple(probability / total for probability in probabilities)
+
+
+def _sample_guidance_scales(batch_size, scales, probabilities, device):
+    scale_tensor = torch.tensor(scales, dtype=torch.float32, device=device)
+    probability_tensor = torch.tensor(
+        probabilities,
+        dtype=torch.float32,
+        device=device,
+    )
+    indices = torch.multinomial(
+        probability_tensor,
+        int(batch_size),
+        replacement=True,
+    )
+    return scale_tensor.index_select(0, indices)
+
+
+def _subset_guided_condition_batch(cond_batch, rows, batch_size):
+    batch_keys = {
+        "tau_cond",
+        "mem",
+        "g",
+        "mem_mask",
+        "mem_uncond",
+        "g_uncond",
+        "mem_mask_uncond",
+        "tau_cond_uncond",
+        "guidance_scale",
+    }
+    subset = {}
+    for key, value in cond_batch.items():
+        if (
+            key in batch_keys
+            and torch.is_tensor(value)
+            and value.ndim > 0
+            and value.shape[0] == batch_size
+        ):
+            value = value[rows]
+        if torch.is_tensor(value):
+            value = value.detach()
+        subset[key] = value
+    return subset
+
+
+def _student_rollout_states(
+    flow_model,
+    x0,
+    end_time,
+    cond_batch,
+    rollout_rows,
+    solver_steps,
+    solver_method,
+    rollout_batch_size,
+):
+    """Generate detached partial student rollouts for selected batch rows."""
+    if not bool(rollout_rows.any()):
+        return x0.new_empty((0,) + x0.shape[1:]), rollout_rows
+    selected_indices = torch.nonzero(rollout_rows, as_tuple=False).flatten()
+    selected_steps = torch.tensor(
+        solver_steps,
+        dtype=torch.long,
+        device=x0.device,
+    )
+    assignments = selected_steps[
+        torch.randint(
+            selected_steps.numel(),
+            (selected_indices.numel(),),
+            device=x0.device,
+        )
+    ]
+    output = torch.empty_like(x0[selected_indices])
+    was_training = flow_model.training
+    flow_model.eval()
+    try:
+        with torch.no_grad():
+            for step_count in solver_steps:
+                step_rows = torch.nonzero(
+                    assignments == int(step_count),
+                    as_tuple=False,
+                ).flatten()
+                if step_rows.numel() == 0:
+                    continue
+                for start in range(0, step_rows.numel(), rollout_batch_size):
+                    local_rows = step_rows[start : start + rollout_batch_size]
+                    global_rows = selected_indices[local_rows]
+                    local_condition = _subset_guided_condition_batch(
+                        cond_batch,
+                        global_rows,
+                        x0.shape[0],
+                    )
+                    output[local_rows] = solve_flow_to_time(
+                        flow_model.flow,
+                        x0[global_rows],
+                        local_condition,
+                        end_time[global_rows],
+                        num_steps=int(step_count),
+                        method=solver_method,
+                    )
+    finally:
+        if was_training:
+            flow_model.train()
+    return output.detach(), selected_indices
+
+
 def main():
     config = load_config()
     flow_cfg = config.get("flow", {})
@@ -319,6 +452,11 @@ def main():
             "cfg_phase2_true_null_drop10",
             "cfg_phase2_control",
             "reflow_round1",
+            "reflow_round1_cfg_aware",
+            "reflow_round1_cfg_deploy_only",
+            "reflow_round1_cfg_branch_preserve",
+            "reflow_round1_cfg_branch_preserve_w002",
+            "reflow_round1_cfg5_endpoint_rollout",
         ),
         default=None,
         help="Use a named update-based training curriculum from config.json.",
@@ -470,8 +608,15 @@ def main():
     args = parser.parse_args()
     if args.resume and args.init_from:
         parser.error("--resume and --init-from are mutually exclusive")
-    if args.curriculum == "reflow_round1" and args.reflow_round != 1:
-        parser.error("--curriculum reflow_round1 requires --reflow-round 1")
+    if args.curriculum in (
+        "reflow_round1",
+        "reflow_round1_cfg_aware",
+        "reflow_round1_cfg_deploy_only",
+        "reflow_round1_cfg_branch_preserve",
+        "reflow_round1_cfg_branch_preserve_w002",
+        "reflow_round1_cfg5_endpoint_rollout",
+    ) and args.reflow_round != 1:
+        parser.error("reflow round-1 curricula require --reflow-round 1")
     _apply_train_flow_config_defaults(args, config)
     curriculum = None
     curriculum_config = None
@@ -542,12 +687,19 @@ def main():
         args.cond_frames_max = max(initial_curriculum_state.condition_choices)
         args.lr = curriculum.lr_peak
         args.lr_decay_epoch = 999999
-    elif args.curriculum == "reflow_round1":
+    elif args.curriculum in (
+        "reflow_round1",
+        "reflow_round1_cfg_aware",
+        "reflow_round1_cfg_deploy_only",
+        "reflow_round1_cfg_branch_preserve",
+        "reflow_round1_cfg_branch_preserve_w002",
+        "reflow_round1_cfg5_endpoint_rollout",
+    ):
         curriculum_config = (
             config.get("flow", {}).get("curriculum", {}).get(args.curriculum)
         )
         if not curriculum_config:
-            raise ValueError("Missing flow.curriculum.reflow_round1 config")
+            raise ValueError(f"Missing flow.curriculum.{args.curriculum} config")
         curriculum = ReflowRound1Curriculum(
             curriculum_config,
             max_updates=args.max_updates,
@@ -569,6 +721,26 @@ def main():
         args.teacher_solver = str(curriculum_config["teacher_solver"])
         args.teacher_mode = str(curriculum_config["teacher_mode"])
         args.p_teacher = float(curriculum_config["p_teacher"])
+    args.teacher_target_mode = str(
+        (curriculum_config or {}).get("teacher_target_mode", "branchwise")
+    )
+    args.teacher_guidance_scales = list(
+        (curriculum_config or {}).get("teacher_guidance_scales", [])
+    )
+    args.teacher_guidance_probs = list(
+        (curriculum_config or {}).get("teacher_guidance_probs", [])
+    )
+    args.reflow_branch_preservation_weight = float(
+        (curriculum_config or {}).get("branch_preservation_weight", 0.0)
+    )
+    args.reflow_flow_time_sampling = dict(
+        (curriculum_config or {}).get("flow_time_sampling", {})
+    )
+    args.reflow_rollout_state = dict(
+        (curriculum_config or {}).get("rollout_state", {})
+    )
+    if args.reflow_flow_time_sampling:
+        normalized_flow_time_probabilities(args.reflow_flow_time_sampling)
     relative_time_bias = bool(
         (curriculum_config or {}).get(
             "relative_time_bias",
@@ -736,6 +908,12 @@ def main():
                     "teacher_steps": args.teacher_steps,
                     "teacher_solver": args.teacher_solver,
                     "teacher_mode": args.teacher_mode,
+                    "teacher_target_mode": args.teacher_target_mode,
+                    "teacher_guidance_scales": args.teacher_guidance_scales,
+                    "teacher_guidance_probs": args.teacher_guidance_probs,
+                    "reflow_branch_preservation_weight": (
+                        args.reflow_branch_preservation_weight
+                    ),
                     "p_teacher": args.p_teacher,
                     "cond_frames_min": args.cond_frames_min
                     if args.cond_frames_min is not None
@@ -1474,6 +1652,48 @@ def main():
         and args.reflow_round >= 1
         and teacher_mode == "strict"
     )
+    teacher_target_mode = args.teacher_target_mode
+    cfg_aware_reflow = strict_reflow and teacher_target_mode == "guided"
+    teacher_guidance_scales = ()
+    teacher_guidance_probs = ()
+    if cfg_aware_reflow:
+        if not true_null_condition:
+            raise ValueError("CFG-aware reflow requires true-null conditioning")
+        teacher_guidance_scales, teacher_guidance_probs = _guidance_distribution(
+            curriculum_config
+        )
+    reflow_time_sampling = args.reflow_flow_time_sampling
+    reflow_rollout_config = args.reflow_rollout_state
+    endpoint_aware_reflow = bool(reflow_time_sampling)
+    rollout_max_probability = float(
+        reflow_rollout_config.get("max_probability", 0.0)
+    )
+    rollout_solver_steps = tuple(
+        int(value) for value in reflow_rollout_config.get("solver_steps", [1])
+    )
+    rollout_solver_method = str(
+        reflow_rollout_config.get("solver_method", "heun")
+    )
+    rollout_batch_size = int(reflow_rollout_config.get("batch_size", 16))
+    if endpoint_aware_reflow and not cfg_aware_reflow:
+        raise ValueError("Endpoint-aware flow-time sampling requires CFG-aware reflow")
+    if rollout_max_probability > 0.0 and not cfg_aware_reflow:
+        raise ValueError("Student rollout-state training requires CFG-aware reflow")
+    if rollout_max_probability < 0.0 or rollout_max_probability > 1.0:
+        raise ValueError("Rollout-state probability must lie in [0, 1]")
+    if not rollout_solver_steps or any(value <= 0 for value in rollout_solver_steps):
+        raise ValueError("Rollout solver steps must be positive")
+    if rollout_solver_method not in ("euler", "heun"):
+        raise ValueError("Rollout solver method must be euler or heun")
+    if rollout_batch_size <= 0:
+        raise ValueError("Rollout-state batch size must be positive")
+    branch_preservation_weight = args.reflow_branch_preservation_weight
+    if branch_preservation_weight < 0.0:
+        raise ValueError("Reflow branch-preservation weight cannot be negative")
+    if branch_preservation_weight > 0.0 and not cfg_aware_reflow:
+        raise ValueError("Branch preservation requires CFG-aware reflow")
+    if branch_preservation_weight > 0.0 and args.p_teacher != 1.0:
+        raise ValueError("Branch preservation requires p_teacher=1")
     if is_main and teacher is not None:
         print(
             "Reflow teacher: checkpoint={} weights={} solver={} steps={} NFE={}".format(
@@ -1481,9 +1701,46 @@ def main():
                 "ema" if args.use_ema_teacher else "model",
                 teacher_solver,
                 teacher_steps,
-                teacher_steps * (2 if teacher_solver == "heun" else 1),
+                teacher_steps
+                * (2 if teacher_solver == "heun" else 1)
+                * (2 if cfg_aware_reflow else 1),
             )
         )
+        if cfg_aware_reflow:
+            print(
+                "CFG-aware reflow: scales={} probabilities={}".format(
+                    teacher_guidance_scales,
+                    teacher_guidance_probs,
+                )
+            )
+            if endpoint_aware_reflow:
+                print(
+                    "Reflow flow-time sampling: {}".format(
+                        ",".join(
+                            f"{name}:{probability:.3f}"
+                            for name, probability in zip(
+                                FLOW_TIME_CATEGORY_NAMES,
+                                normalized_flow_time_probabilities(
+                                    reflow_time_sampling
+                                ),
+                            )
+                        )
+                    )
+                )
+            if rollout_max_probability > 0.0:
+                print(
+                "Reflow rollout states: max_prob={} steps={} solver={}".format(
+                    rollout_max_probability,
+                    rollout_solver_steps,
+                    f"{rollout_solver_method} batch={rollout_batch_size}",
+                )
+                )
+            if branch_preservation_weight > 0.0:
+                print(
+                    "CFG branch preservation: weight={} local_teacher_NFE=2".format(
+                        branch_preservation_weight
+                    )
+                )
 
     ema = EMA(flow_model, decay=ema_decay) if args.ema else None
     if ema is not None and args.resume and ema_state is not None:
@@ -1673,6 +1930,10 @@ def main():
         base_loss_terms = []
         smooth_weighted_terms = []
         cond_weighted_terms = []
+        branch_preservation_terms = []
+        branch_preservation_weighted_terms = []
+        branch_cond_terms = []
+        branch_null_terms = []
         total_count = 0
         smooth_acc_terms = []
         smooth_jerk_terms = []
@@ -1686,6 +1947,14 @@ def main():
         teacher_target_std_sum = torch.zeros((), device=device)
         teacher_displacement_rms_sum = torch.zeros((), device=device)
         teacher_target_count = torch.zeros((), device=device)
+        guided_scale_loss_sums = torch.zeros(
+            len(teacher_guidance_scales),
+            device=device,
+        )
+        guided_scale_counts = torch.zeros(
+            len(teacher_guidance_scales),
+            device=device,
+        )
         cfg_cond_time_loss_sums = torch.zeros(
             len(CFG_TIME_BIN_LABELS), device=device
         )
@@ -1698,6 +1967,11 @@ def main():
         cfg_null_time_counts = torch.zeros(
             len(CFG_TIME_BIN_LABELS), device=device
         )
+        reflow_time_category_counts = torch.zeros(
+            len(FLOW_TIME_CATEGORY_NAMES), device=device
+        )
+        reflow_rollout_count = torch.zeros((), device=device)
+        reflow_rollout_eligible_count = torch.zeros((), device=device)
         smooth_count = 0
         cond_count = 0
         bad_streak = 0
@@ -1774,6 +2048,11 @@ def main():
             bad_local = False
             loss = None
             drop_cond = None
+            guidance_scales = None
+            reflow_time_categories = None
+            rollout_rows = None
+            teacher_v_cond = None
+            teacher_v_null = None
             audit_finite = (
                 args.debug
                 or args.finite_check_every <= 1
@@ -1839,7 +2118,15 @@ def main():
                 t2 = time.perf_counter()
                 t_encode += t2 - t1
 
-                t = torch.rand(x0.shape[0], device=device)
+                if endpoint_aware_reflow:
+                    t, reflow_time_categories = sample_reflow_times(
+                        x0.shape[0],
+                        reflow_time_sampling,
+                        device,
+                        dtype=x0.dtype,
+                    )
+                else:
+                    t = torch.rand(x0.shape[0], device=device)
                 if k2d_batch is None:
                     if args.debug:
                         _debug_log("Warning: missing k2d batch; skipping", epoch + 1)
@@ -1940,18 +2227,38 @@ def main():
                         conf_batch[drop_cond] = 0.0
 
                 if use_teacher:
-                    cond_batch = teacher.build_condition_batch(
-                        k2d=k2d_batch,
-                        tau_cond=tau_cond,
-                        vis_mask=vis_batch,
-                        mask_cond=mask_cond,
-                        style_id=style_id,
-                        domain_id=domain_id,
-                        tau_out=tau_out,
-                        mean=k2d_mean,
-                        std=k2d_std,
-                        null_mask=drop_cond,
-                    )
+                    if cfg_aware_reflow:
+                        guidance_scales = _sample_guidance_scales(
+                            x0.shape[0],
+                            teacher_guidance_scales,
+                            teacher_guidance_probs,
+                            device,
+                        )
+                        cond_batch = teacher.build_guided_condition_batch(
+                            k2d=k2d_batch,
+                            tau_cond=tau_cond,
+                            vis_mask=vis_batch,
+                            mask_cond=mask_cond,
+                            style_id=style_id,
+                            domain_id=domain_id,
+                            tau_out=tau_out,
+                            guidance_scale=guidance_scales,
+                            mean=k2d_mean,
+                            std=k2d_std,
+                        )
+                    else:
+                        cond_batch = teacher.build_condition_batch(
+                            k2d=k2d_batch,
+                            tau_cond=tau_cond,
+                            vis_mask=vis_batch,
+                            mask_cond=mask_cond,
+                            style_id=style_id,
+                            domain_id=domain_id,
+                            tau_out=tau_out,
+                            mean=k2d_mean,
+                            std=k2d_std,
+                            null_mask=drop_cond,
+                        )
                     z_data = teacher.generate_x1_hat(x0, cond_batch)
                     teacher_target_std_sum += z_data.flatten(1).std(dim=1).sum()
                     teacher_displacement_rms_sum += torch.sqrt(
@@ -1968,30 +2275,112 @@ def main():
 
             if not bad_local:
                 x_t = (1 - t[:, None, None]) * x0 + t[:, None, None] * z_data
+                rollout_probability = (
+                    curriculum_step_state.reflow_rollout_probability
+                    if curriculum_step_state is not None
+                    else 0.0
+                )
+                if cfg_aware_reflow and rollout_probability > 0.0:
+                    rollout_eligible = t > 0.0
+                    rollout_rows = (
+                        torch.rand(x0.shape[0], device=device)
+                        < rollout_probability
+                    ) & rollout_eligible
+                    if bool(rollout_rows.any()):
+                        with torch.no_grad():
+                            (
+                                rollout_null_g,
+                                rollout_null_mem,
+                                rollout_null_mask,
+                                rollout_null_tau,
+                            ) = flow_model.encode_null_condition(
+                                style_id,
+                                domain_id,
+                            )
+                        student_rollout_condition = {
+                            "tau_out": tau_out,
+                            "tau_cond": tau_cond,
+                            "mem": mem,
+                            "g": g,
+                            "mem_mask": ~mask_cond,
+                            "mem_uncond": rollout_null_mem,
+                            "g_uncond": rollout_null_g,
+                            "mem_mask_uncond": rollout_null_mask,
+                            "tau_cond_uncond": rollout_null_tau,
+                            "guidance_scale": guidance_scales,
+                        }
+                        rollout_states, rollout_indices = _student_rollout_states(
+                            flow_model,
+                            x0,
+                            t,
+                            student_rollout_condition,
+                            rollout_rows,
+                            rollout_solver_steps,
+                            rollout_solver_method,
+                            rollout_batch_size,
+                        )
+                        x_t = x_t.clone()
+                        x_t[rollout_indices] = rollout_states
+                        x_t = x_t.detach()
+                        del rollout_states, student_rollout_condition
+                if branch_preservation_weight > 0.0:
+                    teacher_v_cond, teacher_v_null = teacher.predict_cfg_pair(
+                        x_t,
+                        t,
+                        cond_batch,
+                    )
                 t3 = time.perf_counter()
                 t_cond += t3 - t2
-                flow_output = flow(
-                    x_t,
-                    t,
-                    tau_out,
-                    mem=mem,
-                    g=g,
-                    mem_mask=~mask_cond,
-                    tau_cond=tau_cond,
-                    null_mask=drop_cond if true_null_condition else None,
-                    style_id=style_id if true_null_condition else None,
-                    domain_id=domain_id if true_null_condition else None,
-                    return_cfg_diagnostics=true_null_condition,
-                )
-                if true_null_condition:
-                    v_pred, cfg_forward_diagnostics = flow_output
+                if cfg_aware_reflow:
+                    flow_output = flow(
+                        x_t,
+                        t,
+                        tau_out,
+                        mem=mem,
+                        g=g,
+                        mem_mask=~mask_cond,
+                        tau_cond=tau_cond,
+                        style_id=style_id,
+                        domain_id=domain_id,
+                        return_cfg_diagnostics=True,
+                        return_cfg_pair=True,
+                    )
+                    (v_cond, v_null), cfg_forward_diagnostics = flow_output
+                    v_pred = combine_cfg_velocities(
+                        v_cond,
+                        v_null,
+                        guidance_scales,
+                    )
                 else:
-                    v_pred = flow_output
-                    cfg_forward_diagnostics = None
+                    flow_output = flow(
+                        x_t,
+                        t,
+                        tau_out,
+                        mem=mem,
+                        g=g,
+                        mem_mask=~mask_cond,
+                        tau_cond=tau_cond,
+                        null_mask=drop_cond if true_null_condition else None,
+                        style_id=style_id if true_null_condition else None,
+                        domain_id=domain_id if true_null_condition else None,
+                        return_cfg_diagnostics=true_null_condition,
+                    )
+                    if true_null_condition:
+                        v_pred, cfg_forward_diagnostics = flow_output
+                    else:
+                        v_pred = flow_output
+                        cfg_forward_diagnostics = None
                 target = z_data - x0
                 if audit_finite and (
                     not torch.isfinite(v_pred).all()
                     or not torch.isfinite(target).all()
+                    or (
+                        teacher_v_cond is not None
+                        and (
+                            not torch.isfinite(teacher_v_cond).all()
+                            or not torch.isfinite(teacher_v_null).all()
+                        )
+                    )
                 ):
                     if args.debug:
                         _debug_log(
@@ -2008,6 +2397,23 @@ def main():
                 )
                 base_loss = base_loss_per_sample.mean()
                 loss = base_loss
+                branch_loss = None
+                branch_cond_loss = None
+                branch_null_loss = None
+                branch_weighted_loss = None
+                if branch_preservation_weight > 0.0:
+                    (
+                        branch_loss,
+                        branch_cond_loss,
+                        branch_null_loss,
+                    ) = cfg_branch_preservation_loss(
+                        v_cond,
+                        v_null,
+                        teacher_v_cond,
+                        teacher_v_null,
+                    )
+                    branch_weighted_loss = branch_preservation_weight * branch_loss
+                    loss = loss + branch_weighted_loss
                 smooth_acc = None
                 smooth_jerk = None
                 cond_match_loss = None
@@ -2277,6 +2683,13 @@ def main():
             total_loss_terms.append(loss.detach())
             base_loss_terms.append(base_loss.detach())
             total_count += 1
+            if branch_loss is not None:
+                branch_preservation_terms.append(branch_loss.detach())
+                branch_preservation_weighted_terms.append(
+                    branch_weighted_loss.detach()
+                )
+                branch_cond_terms.append(branch_cond_loss.detach())
+                branch_null_terms.append(branch_null_loss.detach())
             if smooth_weighted_loss is not None:
                 smooth_weighted_terms.append(smooth_weighted_loss.detach())
             if cond_weighted_loss is not None:
@@ -2290,7 +2703,24 @@ def main():
                 cond_match_terms.append(cond_match_loss.detach())
                 cond_count += 1
             if true_null_condition:
-                null_rows = drop_cond
+                if cfg_aware_reflow:
+                    for scale_index, scale_value in enumerate(
+                        teacher_guidance_scales
+                    ):
+                        scale_rows = torch.isclose(
+                            guidance_scales,
+                            guidance_scales.new_tensor(scale_value),
+                        )
+                        guided_scale_loss_sums[scale_index] += (
+                            base_loss_per_sample.detach()[scale_rows].sum()
+                        )
+                        guided_scale_counts[scale_index] += scale_rows.sum()
+                    null_rows = torch.isclose(
+                        guidance_scales,
+                        guidance_scales.new_tensor(0.0),
+                    )
+                else:
+                    null_rows = drop_cond
                 cond_rows = ~null_rows
                 detached_sample_loss = base_loss_per_sample.detach()
                 cfg_cond_loss_sum += detached_sample_loss[cond_rows].sum()
@@ -2304,7 +2734,11 @@ def main():
                 for bin_idx, (lower, upper) in enumerate(
                     zip(CFG_TIME_BIN_EDGES[:-1], CFG_TIME_BIN_EDGES[1:])
                 ):
-                    time_rows = (detached_t >= lower) & (detached_t < upper)
+                    time_rows = (detached_t >= lower) & (
+                        (detached_t <= upper)
+                        if bin_idx == len(CFG_TIME_BIN_LABELS) - 1
+                        else (detached_t < upper)
+                    )
                     cond_time_rows = time_rows & cond_rows
                     null_time_rows = time_rows & null_rows
                     cfg_cond_time_loss_sums[bin_idx] += detached_sample_loss[
@@ -2315,6 +2749,14 @@ def main():
                     ].sum()
                     cfg_cond_time_counts[bin_idx] += cond_time_rows.sum()
                     cfg_null_time_counts[bin_idx] += null_time_rows.sum()
+            if reflow_time_categories is not None:
+                reflow_time_category_counts += torch.bincount(
+                    reflow_time_categories,
+                    minlength=len(FLOW_TIME_CATEGORY_NAMES),
+                ).to(dtype=reflow_time_category_counts.dtype)
+            if rollout_rows is not None:
+                reflow_rollout_count += rollout_rows.sum()
+                reflow_rollout_eligible_count += (t > 0.0).sum()
             if save_every_steps and optimizer_updates % save_every_steps == 0:
                 state = _flow_checkpoint_state(
                     flow_model,
@@ -2385,6 +2827,30 @@ def main():
         )
         if ddp:
             dist.all_reduce(teacher_stats, op=dist.ReduceOp.SUM)
+            if guided_scale_loss_sums.numel() > 0:
+                dist.all_reduce(guided_scale_loss_sums, op=dist.ReduceOp.SUM)
+                dist.all_reduce(guided_scale_counts, op=dist.ReduceOp.SUM)
+        branch_stats = torch.stack(
+            [
+                _sum_epoch_terms(branch_preservation_terms),
+                _sum_epoch_terms(branch_preservation_weighted_terms),
+                _sum_epoch_terms(branch_cond_terms),
+                _sum_epoch_terms(branch_null_terms),
+                torch.tensor(len(branch_preservation_terms), device=device),
+            ]
+        )
+        if ddp:
+            dist.all_reduce(branch_stats, op=dist.ReduceOp.SUM)
+        reflow_sampling_stats = torch.cat(
+            [
+                reflow_time_category_counts,
+                torch.stack(
+                    [reflow_rollout_count, reflow_rollout_eligible_count]
+                ),
+            ]
+        )
+        if ddp:
+            dist.all_reduce(reflow_sampling_stats, op=dist.ReduceOp.SUM)
         total_loss = stats[0].item()
         base_loss_sum = stats[1].item()
         smooth_weighted_sum = stats[2].item()
@@ -2407,6 +2873,18 @@ def main():
         teacher_target_std_sum = teacher_stats[0].item()
         teacher_displacement_rms_sum = teacher_stats[1].item()
         teacher_target_count = int(teacher_stats[2].item())
+        guided_scale_loss_sums = guided_scale_loss_sums.tolist()
+        guided_scale_counts = guided_scale_counts.tolist()
+        branch_loss_sum = branch_stats[0].item()
+        branch_weighted_sum = branch_stats[1].item()
+        branch_cond_sum = branch_stats[2].item()
+        branch_null_sum = branch_stats[3].item()
+        branch_count = int(branch_stats[4].item())
+        reflow_time_category_counts = reflow_sampling_stats[
+            : len(FLOW_TIME_CATEGORY_NAMES)
+        ].tolist()
+        reflow_rollout_count = reflow_sampling_stats[-2].item()
+        reflow_rollout_eligible_count = reflow_sampling_stats[-1].item()
         cfg_offset = 6
         cfg_bin_count = len(CFG_TIME_BIN_LABELS)
         cfg_cond_time_loss_sums = cfg_stats[
@@ -2469,6 +2947,26 @@ def main():
             teacher_displacement_rms_avg = teacher_displacement_rms_sum / max(
                 teacher_target_count, 1
             )
+            guided_scale_loss_avgs = [
+                loss_sum / max(count, 1)
+                for loss_sum, count in zip(
+                    guided_scale_loss_sums,
+                    guided_scale_counts,
+                )
+            ]
+            branch_loss_avg = branch_loss_sum / max(branch_count, 1)
+            branch_weighted_avg = branch_weighted_sum / max(branch_count, 1)
+            branch_cond_avg = branch_cond_sum / max(branch_count, 1)
+            branch_null_avg = branch_null_sum / max(branch_count, 1)
+            reflow_time_total = sum(reflow_time_category_counts)
+            reflow_time_fractions = [
+                count / max(reflow_time_total, 1.0)
+                for count in reflow_time_category_counts
+            ]
+            reflow_rollout_fraction = reflow_rollout_count / max(
+                reflow_rollout_eligible_count,
+                1.0,
+            )
             print(f"Epoch {epoch + 1} avg_loss={total_loss_avg:.6f}")
             print(
                 (
@@ -2504,6 +3002,58 @@ def main():
                         epoch + 1,
                         teacher_target_std_avg,
                         teacher_displacement_rms_avg,
+                    )
+                )
+            if cfg_aware_reflow:
+                print(
+                    "Epoch {} guided_scale_mse={}".format(
+                        epoch + 1,
+                        ",".join(
+                            "{}:{:.6f}".format(scale, value)
+                            for scale, value in zip(
+                                teacher_guidance_scales,
+                                guided_scale_loss_avgs,
+                            )
+                        ),
+                    )
+                )
+            if endpoint_aware_reflow:
+                print(
+                    "Epoch {} reflow_time_fractions={}".format(
+                        epoch + 1,
+                        ",".join(
+                            f"{name}:{value:.4f}"
+                            for name, value in zip(
+                                FLOW_TIME_CATEGORY_NAMES,
+                                reflow_time_fractions,
+                            )
+                        ),
+                    )
+                )
+            if rollout_max_probability > 0.0:
+                rollout_target = (
+                    curriculum_end_state.reflow_rollout_probability
+                    if curriculum_end_state is not None
+                    else 0.0
+                )
+                print(
+                    "Epoch {} reflow_rollout_fraction={:.4f} target={:.4f}".format(
+                        epoch + 1,
+                        reflow_rollout_fraction,
+                        rollout_target,
+                    )
+                )
+            if branch_count > 0:
+                print(
+                    (
+                        "Epoch {} branch_preservation={:.6f} weighted={:.6f} "
+                        "cond={:.6f} null={:.6f}"
+                    ).format(
+                        epoch + 1,
+                        branch_loss_avg,
+                        branch_weighted_avg,
+                        branch_cond_avg,
+                        branch_null_avg,
                     )
                 )
             print(
@@ -2637,6 +3187,47 @@ def main():
                         {
                             "reflow/teacher_target_std": teacher_target_std_avg,
                             "reflow/teacher_displacement_rms": teacher_displacement_rms_avg,
+                        }
+                    )
+                if cfg_aware_reflow:
+                    for scale, value, count in zip(
+                        teacher_guidance_scales,
+                        guided_scale_loss_avgs,
+                        guided_scale_counts,
+                    ):
+                        if count <= 0:
+                            continue
+                        scale_label = str(scale).replace(".", "p")
+                        wandb_metrics[
+                            f"reflow/guided_velocity_mse_s{scale_label}"
+                        ] = value
+                if endpoint_aware_reflow:
+                    for name, value in zip(
+                        FLOW_TIME_CATEGORY_NAMES,
+                        reflow_time_fractions,
+                    ):
+                        wandb_metrics[f"reflow/time_fraction_{name}"] = value
+                if rollout_max_probability > 0.0:
+                    wandb_metrics.update(
+                        {
+                            "reflow/rollout_state_fraction": reflow_rollout_fraction,
+                            "schedule/reflow_rollout_probability": (
+                                curriculum_end_state.reflow_rollout_probability
+                                if curriculum_end_state is not None
+                                else 0.0
+                            ),
+                        }
+                    )
+                if branch_count > 0:
+                    wandb_metrics.update(
+                        {
+                            "reflow/branch_preservation_mse": branch_loss_avg,
+                            "reflow/branch_preservation_weighted": branch_weighted_avg,
+                            "reflow/branch_cond_mse": branch_cond_avg,
+                            "reflow/branch_null_mse": branch_null_avg,
+                            "reflow/branch_preservation_weight": (
+                                branch_preservation_weight
+                            ),
                         }
                     )
                 wandb_run.log(
@@ -2958,6 +3549,14 @@ def _make_checkpoint_metadata(
             "teacher_solver": args.teacher_solver,
             "teacher_mode": args.teacher_mode,
             "p_teacher": float(args.p_teacher),
+            "teacher_target_mode": args.teacher_target_mode,
+            "teacher_guidance_scales": list(args.teacher_guidance_scales),
+            "teacher_guidance_probs": list(args.teacher_guidance_probs),
+            "branch_preservation_weight": float(
+                args.reflow_branch_preservation_weight
+            ),
+            "flow_time_sampling": dict(args.reflow_flow_time_sampling),
+            "rollout_state": dict(args.reflow_rollout_state),
         },
         "datasets": sorted(datasets),
         "aist_crop_mode": args.aist_crop_mode,

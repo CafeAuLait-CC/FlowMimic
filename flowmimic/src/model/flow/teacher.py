@@ -109,6 +109,83 @@ class Teacher:
         }
 
     @torch.no_grad()
+    def build_guided_condition_batch(
+        self,
+        *,
+        k2d,
+        tau_cond,
+        vis_mask,
+        mask_cond,
+        style_id,
+        domain_id,
+        tau_out,
+        guidance_scale,
+        mean=None,
+        std=None,
+    ):
+        """Encode matching conditional/null memories for guided transport."""
+        cond_batch = self.build_condition_batch(
+            k2d=k2d,
+            tau_cond=tau_cond,
+            vis_mask=vis_mask,
+            mask_cond=mask_cond,
+            style_id=style_id,
+            domain_id=domain_id,
+            tau_out=tau_out,
+            mean=mean,
+            std=std,
+        )
+        null_g, null_mem, null_mem_mask, null_tau = self.model.encode_null_condition(
+            style_id,
+            domain_id,
+        )
+        cond_batch.update(
+            {
+                "mem_uncond": null_mem,
+                "g_uncond": null_g,
+                "mem_mask_uncond": null_mem_mask,
+                "tau_cond_uncond": null_tau,
+                "guidance_scale": guidance_scale,
+            }
+        )
+        return cond_batch
+
+    @torch.no_grad()
     def generate_x1_hat(self, x0, cond_batch):
         self.model.eval()
         return solve_flow(self.model, x0, cond_batch, **self.solver_cfg)
+
+    @torch.no_grad()
+    def predict_cfg_pair(self, x_t, t_flow, cond_batch):
+        """Evaluate frozen conditional/null fields at one shared guided point."""
+        required = (
+            "tau_out",
+            "tau_cond",
+            "mem",
+            "g",
+            "mem_uncond",
+            "g_uncond",
+        )
+        missing = [key for key in required if key not in cond_batch]
+        if missing:
+            raise ValueError(f"Guided condition batch is missing fields: {missing}")
+        self.model.eval()
+        v_cond = self.model.flow(
+            x_t,
+            t_flow,
+            cond_batch["tau_out"],
+            cond_batch["mem"],
+            cond_batch["g"],
+            mem_mask=cond_batch.get("mem_mask"),
+            tau_cond=cond_batch["tau_cond"],
+        )
+        v_uncond = self.model.flow(
+            x_t,
+            t_flow,
+            cond_batch["tau_out"],
+            cond_batch["mem_uncond"],
+            cond_batch["g_uncond"],
+            mem_mask=cond_batch.get("mem_mask_uncond"),
+            tau_cond=cond_batch.get("tau_cond_uncond", cond_batch["tau_cond"]),
+        )
+        return v_cond, v_uncond

@@ -151,6 +151,7 @@ class ConditionalRectFlow(nn.Module):
         mem_mask=None,
         null_mask=None,
         return_cfg_diagnostics=False,
+        return_cfg_pair=False,
     ):
         if mem is None or g is None:
             if any(value is None for value in (k2d, tau_cond, style_id, domain_id)):
@@ -172,6 +173,35 @@ class ConditionalRectFlow(nn.Module):
             mem_mask=mem_mask,
             tau_cond=tau_cond,
         )
+        if return_cfg_pair:
+            if not self.true_null_condition:
+                raise RuntimeError("CFG pairs require true-null conditioning")
+            if style_id is None or domain_id is None:
+                raise ValueError(
+                    "style_id and domain_id are required for a CFG pair"
+                )
+            null_g, null_mem, null_mem_mask, null_tau = self.encode_null_condition(
+                style_id,
+                domain_id,
+            )
+            null_pred = self.flow(
+                x_t,
+                t_flow,
+                tau_out,
+                null_mem,
+                null_g,
+                mem_mask=null_mem_mask,
+                tau_cond=null_tau,
+            )
+            if return_cfg_diagnostics:
+                guidance_delta_l2 = torch.linalg.vector_norm(
+                    pred.detach().flatten(1) - null_pred.detach().flatten(1),
+                    dim=1,
+                )
+                return (pred, null_pred), {
+                    "guidance_delta_l2": guidance_delta_l2
+                }
+            return pred, null_pred
         if not self.true_null_condition:
             if return_cfg_diagnostics:
                 return pred, {"guidance_delta_l2": pred.new_empty((0,))}

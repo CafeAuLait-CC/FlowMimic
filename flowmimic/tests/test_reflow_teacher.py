@@ -74,6 +74,39 @@ class ReflowTeacherTest(unittest.TestCase):
         self.assertFalse(bool(cond["mem_mask"][1, 0]))
         self.assertTrue(bool(cond["mem_mask"][1, 1:].all()))
 
+    def test_guided_teacher_supports_per_row_scales(self):
+        raw = self._raw_condition()
+        raw.pop("null_mask")
+        scales = torch.tensor([2.5, 1.0, 0.0])
+        cond = self.teacher.build_guided_condition_batch(
+            **raw,
+            guidance_scale=scales,
+        )
+        self.assertEqual(tuple(cond["mem_uncond"].shape), (3, 1, 32))
+        torch.testing.assert_close(cond["guidance_scale"], scales)
+        output = self.teacher.generate_x1_hat(torch.randn(3, 4, 8), cond)
+        self.assertEqual(tuple(output.shape), (3, 4, 8))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_guided_teacher_exposes_frozen_local_branch_velocities(self):
+        raw = self._raw_condition()
+        raw.pop("null_mask")
+        cond = self.teacher.build_guided_condition_batch(
+            **raw,
+            guidance_scale=torch.full((3,), 2.5),
+        )
+        x_t = torch.randn(3, 4, 8, requires_grad=True)
+        t_flow = torch.rand(3)
+
+        v_cond, v_null = self.teacher.predict_cfg_pair(x_t, t_flow, cond)
+
+        self.assertEqual(tuple(v_cond.shape), (3, 4, 8))
+        self.assertEqual(tuple(v_null.shape), (3, 4, 8))
+        self.assertFalse(v_cond.requires_grad)
+        self.assertFalse(v_null.requires_grad)
+        self.assertTrue(torch.isfinite(v_cond).all())
+        self.assertTrue(torch.isfinite(v_null).all())
+
 
 if __name__ == "__main__":
     unittest.main()

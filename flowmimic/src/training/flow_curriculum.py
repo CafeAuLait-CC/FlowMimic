@@ -30,6 +30,7 @@ class UnifiedRound0State:
     condition_pattern_probs: tuple
     solver_steps: tuple
     condition_joint_quotas: tuple = ()
+    reflow_rollout_probability: float = 0.0
 
 
 class UnifiedRound0Curriculum:
@@ -431,6 +432,16 @@ class ReflowRound1Curriculum:
         self.solver_steps = tuple(
             int(value) for value in self.config.get("solver_steps", [8])
         )
+        rollout_config = self.config.get("rollout_state", {})
+        self.rollout_ramp_start = int(
+            rollout_config.get("ramp_start_update", self.max_updates)
+        )
+        self.rollout_ramp_end = int(
+            rollout_config.get("ramp_end_update", self.max_updates)
+        )
+        self.rollout_max_probability = float(
+            rollout_config.get("max_probability", 0.0)
+        )
         self._validate()
 
     def _probabilities(self, key):
@@ -457,6 +468,14 @@ class ReflowRound1Curriculum:
             raise ValueError("Condition pattern choices/probabilities must match")
         if not self.solver_steps:
             raise ValueError("Round-1 solver-step schedule cannot be empty")
+        if not 0.0 <= self.rollout_max_probability <= 1.0:
+            raise ValueError("Rollout-state probability must lie in [0, 1]")
+        if self.rollout_max_probability > 0.0 and not (
+            0 <= self.rollout_ramp_start
+            < self.rollout_ramp_end
+            <= self.max_updates
+        ):
+            raise ValueError("Invalid rollout-state ramp milestones")
         quota_total = 0.0
         for pattern, count, fraction in self.condition_joint_quotas:
             if pattern not in self.condition_pattern_choices:
@@ -487,6 +506,15 @@ class ReflowRound1Curriculum:
         else:
             phase = "reflow_optional_hold"
             learning_rate = self.lr_final
+        if self.rollout_max_probability <= 0.0 or updates <= self.rollout_ramp_start:
+            rollout_probability = 0.0
+        elif updates >= self.rollout_ramp_end:
+            rollout_probability = self.rollout_max_probability
+        else:
+            rollout_probability = self.rollout_max_probability * (
+                (updates - self.rollout_ramp_start)
+                / max(self.rollout_ramp_end - self.rollout_ramp_start, 1)
+            )
         return UnifiedRound0State(
             completed_updates=updates,
             phase=phase,
@@ -498,6 +526,7 @@ class ReflowRound1Curriculum:
             condition_pattern_probs=self.condition_pattern_probs,
             solver_steps=self.solver_steps,
             condition_joint_quotas=self.condition_joint_quotas,
+            reflow_rollout_probability=float(rollout_probability),
         )
 
     def metadata(self):

@@ -25,13 +25,19 @@
     <section class="panel form-panel">
       <h2>Generate</h2>
       <div class="form-grid">
+        <label>Checkpoint Preset
+          <select id="checkpointPreset">
+            <option value="">Custom checkpoint</option>
+          </select>
+        </label>
+
         <label>Model Name
-          <input id="modelName" list="model-name-list" placeholder="reflow_0_solver" />
+          <input id="modelName" list="model-name-list" placeholder="deployed" />
           <datalist id="model-name-list"></datalist>
         </label>
 
         <label>Model Filename
-          <input id="modelFilename" value="flow_round0_last.pt" placeholder="flow_round0_last.pt" />
+          <input id="modelFilename" value="round0.pt" placeholder="round0.pt" />
         </label>
 
         <label>Sample Path (optional)
@@ -77,9 +83,9 @@
                 class="guidance-slider"
                 type="range"
                 min="0"
-                max="3"
+                max="5"
                 step="0.05"
-                value="1"
+                value="5"
                 list="guidanceScaleMarks"
                 aria-label="CFG guidance scale"
               />
@@ -88,12 +94,13 @@
                 <option value="1.0"></option>
                 <option value="1.2"></option>
                 <option value="2.5"></option>
+                <option value="5.0"></option>
               </datalist>
               <div class="guidance-ticks" aria-hidden="true">
-                <span style="--tick-position: 26.667%">0.8</span>
-                <span style="--tick-position: 33.333%">1.0</span>
-                <span class="recommended" style="--tick-position: 40%" title="Balanced preset">1.2</span>
-                <span class="recommended" style="--tick-position: 83.333%" title="Quality-first preset">2.5</span>
+                <span class="guidance-tick-low" style="--tick-position: 16%">0.8</span>
+                <span class="guidance-tick-one" style="--tick-position: 20%">1.0</span>
+                <span style="--tick-position: 50%">2.5</span>
+                <span class="recommended guidance-tick-end" style="--tick-position: 100%" title="Selected deployment scale">5.0</span>
               </div>
             </div>
             <label class="guidance-number-field" for="guidanceScaleInput">
@@ -102,9 +109,9 @@
                 id="guidanceScaleInput"
                 type="number"
                 min="0"
-                max="3"
+                max="5"
                 step="0.05"
-                value="1"
+                value="5"
                 inputmode="decimal"
               />
             </label>
@@ -116,7 +123,8 @@
         <summary>Advanced options</summary>
         <div class="form-grid advanced-grid">
           <label>VAE Checkpoint (optional)
-            <input id="vaeCheckpoint" placeholder="checkpoints/vae/.../motion_vae_best.pt" />
+            <input id="vaeCheckpoint" list="vae-checkpoint-list" placeholder="Resolved from flow checkpoint metadata" />
+            <datalist id="vae-checkpoint-list"></datalist>
           </label>
 
           <label>Dataset

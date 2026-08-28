@@ -243,6 +243,30 @@ main {
   background: #9aa39f;
 }
 
+.guidance-ticks .guidance-tick-low {
+  transform: translateX(-100%);
+}
+
+.guidance-ticks .guidance-tick-low::before {
+  left: 100%;
+}
+
+.guidance-ticks .guidance-tick-one {
+  transform: none;
+}
+
+.guidance-ticks .guidance-tick-one::before {
+  left: 0;
+}
+
+.guidance-ticks .guidance-tick-end {
+  transform: translateX(-100%);
+}
+
+.guidance-ticks .guidance-tick-end::before {
+  left: 100%;
+}
+
 .guidance-ticks .recommended {
   color: var(--accent);
   font-weight: 700;

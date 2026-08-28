@@ -273,10 +273,12 @@ function buildMotionViewportClass(THREE, OrbitControls, rigTemplate, cloneRig) {
 }
 
 const els = {
+  checkpointPreset: document.getElementById("checkpointPreset"),
   modelName: document.getElementById("modelName"),
   modelNameList: document.getElementById("model-name-list"),
   modelFilename: document.getElementById("modelFilename"),
   vaeCheckpoint: document.getElementById("vaeCheckpoint"),
+  vaeCheckpointList: document.getElementById("vae-checkpoint-list"),
   dataset: document.getElementById("dataset"),
   samplePath: document.getElementById("samplePath"),
   camera: document.getElementById("camera"),
@@ -369,11 +371,11 @@ let generationMotionLoaded = false;
 let generationStage = "";
 let viewportsReady = false;
 const FORM_STATE_KEY = "flowmimic_web_form_state_v1";
-const FORM_STATE_VERSION = 4;
+const FORM_STATE_VERSION = 5;
 let defaultsCache = {
   default_steps: 8,
   default_solver: "heun",
-  default_guidance_scale: 1.0,
+  default_guidance_scale: 5.0,
   default_condition_pattern: "even",
   default_dataset: "aist",
   default_style_id: null,
@@ -381,7 +383,32 @@ let defaultsCache = {
   default_vae_checkpoint: "",
   configured_vae_checkpoint: "",
   rigged_model_url: "./assets/smpl22_rigged_calibrated.glb",
+  checkpoint_presets: [],
 };
+
+function checkpointPresetById(id) {
+  return (defaultsCache.checkpoint_presets || []).find((item) => item.id === id) || null;
+}
+
+function syncCheckpointPreset() {
+  const preset = (defaultsCache.checkpoint_presets || []).find(
+    (item) => item.model_name === els.modelName.value.trim()
+      && item.model_filename === els.modelFilename.value.trim()
+  );
+  els.checkpointPreset.value = preset?.id || "";
+}
+
+function applyCheckpointPreset(id, persist = true) {
+  const preset = checkpointPresetById(id);
+  if (!preset) return;
+  els.modelName.value = preset.model_name;
+  els.modelFilename.value = preset.model_filename;
+  els.vaeCheckpoint.value = "";
+  els.steps.value = String(preset.steps);
+  renderGuidanceScale(preset.guidance_scale);
+  els.useEma.checked = true;
+  if (persist) saveFormState();
+}
 
 function appendLog(text) {
   if (!text) return;
@@ -683,6 +710,7 @@ function setComparisonSource(data) {
 function getFormState() {
   return {
     version: FORM_STATE_VERSION,
+    checkpointPreset: els.checkpointPreset.value,
     modelName: els.modelName.value,
     modelFilename: els.modelFilename.value,
     vaeCheckpoint: els.vaeCheckpoint.value,
@@ -706,6 +734,9 @@ function getFormState() {
 
 function applyFormState(state) {
   if (!state || typeof state !== "object") return;
+  if (typeof state.checkpointPreset === "string") {
+    els.checkpointPreset.value = state.checkpointPreset;
+  }
   if (typeof state.modelName === "string") els.modelName.value = state.modelName;
   if (typeof state.modelFilename === "string") els.modelFilename.value = state.modelFilename;
   if (typeof state.vaeCheckpoint === "string") els.vaeCheckpoint.value = state.vaeCheckpoint;
@@ -741,6 +772,7 @@ function applyFormState(state) {
     const input = els.visualizationModes.find((item) => item.value === state.visualizationMode);
     if (input) input.checked = true;
   }
+  syncCheckpointPreset();
 }
 
 function saveFormState() {
@@ -888,7 +920,7 @@ function applyReplicateCommand(cmd) {
   els.camera.value = a.camera || "";
   els.conditionFrames.value = a["cond-frames"] || "";
   els.conditionPattern.value = a["cond-pattern"] || "even";
-  renderGuidanceScale(a["guidance-scale"] || defaultsCache.default_guidance_scale || 1.0);
+  renderGuidanceScale(a["guidance-scale"] || defaultsCache.default_guidance_scale || 5.0);
   els.steps.value = a.steps || "8";
   els.solver.value = a.solver || "heun";
   setStyleSelectValue(a["style-id"] || "");
@@ -961,9 +993,23 @@ async function loadDefaults() {
   };
   latestResultAvailable = Boolean(data.last_meta_exists);
   updateResultRequestControls();
+  els.checkpointPreset.innerHTML = '<option value="">Custom checkpoint</option>';
+  for (const preset of data.checkpoint_presets || []) {
+    const opt = document.createElement("option");
+    opt.value = preset.id;
+    opt.textContent = preset.label;
+    els.checkpointPreset.appendChild(opt);
+  }
+  els.vaeCheckpointList.innerHTML = "";
+  for (const alias of data.vae_checkpoint_aliases || []) {
+    const opt = document.createElement("option");
+    opt.value = alias.path;
+    opt.label = alias.label;
+    els.vaeCheckpointList.appendChild(opt);
+  }
   els.vaeCheckpoint.value = data.default_vae_checkpoint || "";
   els.conditionPattern.value = data.default_condition_pattern || "even";
-  renderGuidanceScale(data.default_guidance_scale ?? 1.0);
+  renderGuidanceScale(data.default_guidance_scale ?? 5.0);
   els.steps.value = data.default_steps || 8;
   els.solver.value = data.default_solver || "heun";
   els.dataset.value = data.default_dataset || "aist";
@@ -989,11 +1035,13 @@ async function loadDefaults() {
       els.modelNameList.appendChild(opt);
     }
     if (Array.isArray(data.model_names) && data.model_names.length > 0) {
-      const preferred = data.model_names.find((x) => x.includes("reflow_0_solver"));
+      const preferred = data.model_names.find((x) => x === "deployed")
+        || data.model_names.find((x) => x.includes("reflow_0_solver"));
       els.modelName.value = data.default_model_name || preferred || data.model_names[data.model_names.length - 1];
     }
   }
-  els.modelFilename.value = data.default_model_filename || "flow_round0_last.pt";
+  els.modelFilename.value = data.default_model_filename || "round0.pt";
+  els.checkpointPreset.value = data.default_checkpoint_preset || "";
 }
 
 function resetArgsKeepCheckpoints() {
@@ -1004,7 +1052,7 @@ function resetArgsKeepCheckpoints() {
     ? ""
     : String(defaultsCache.default_condition_frames);
   els.conditionPattern.value = defaultsCache.default_condition_pattern || "even";
-  renderGuidanceScale(defaultsCache.default_guidance_scale ?? 1.0);
+  renderGuidanceScale(defaultsCache.default_guidance_scale ?? 5.0);
   els.steps.value = String(defaultsCache.default_steps || 8);
   els.solver.value = defaultsCache.default_solver || "heun";
   els.styleId.value = defaultsCache.default_style_id == null ? "" : String(defaultsCache.default_style_id);
@@ -1623,7 +1671,7 @@ async function onGenerate() {
     return;
   }
   if (parseGuidanceScale(payload.guidance_scale) == null) {
-    appendLog("CFG guidance must be between 0.0 and 3.0.");
+    appendLog("CFG guidance must be between 0.0 and 5.0.");
     els.guidanceScaleInput.reportValidity();
     return;
   }
@@ -1746,7 +1794,15 @@ els.guidanceScaleSlider.addEventListener("input", onGuidanceSliderInput);
 els.guidanceScaleSlider.addEventListener("change", onGuidanceSliderInput);
 els.guidanceScaleInput.addEventListener("input", () => onGuidanceNumberInput(false));
 els.guidanceScaleInput.addEventListener("change", () => onGuidanceNumberInput(true));
+els.checkpointPreset.addEventListener("change", () => {
+  applyCheckpointPreset(els.checkpointPreset.value);
+});
+for (const el of [els.modelName, els.modelFilename]) {
+  el.addEventListener("input", syncCheckpointPreset);
+  el.addEventListener("change", syncCheckpointPreset);
+}
 [
+  els.checkpointPreset,
   els.modelName,
   els.modelFilename,
   els.vaeCheckpoint,

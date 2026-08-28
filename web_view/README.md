@@ -33,8 +33,10 @@ URL prefix is configurable with env var `FLOWMIMIC_BASE_PATH` (default: `/flowmi
   - `flowmimic/scripts/sample_flow.py`
   - `flowmimic/tools/extract_cond_media.py`
 - `Condition Frames` selects the condition-token count; leaving it at `checkpoint default` preserves the checkpoint's evaluation density.
+- `Checkpoint Preset` exposes stable aliases for the selected deployed models. `Deployed Round 0` resolves to `checkpoints/flow/deployed/round0.pt`; `Deployed Reflow Round 1` resolves to `checkpoints/flow/deployed/reflow1.pt`. The server recreates these git-ignored symlinks when their local checkpoint targets are available. Round 1 uses the same sampling path as Round 0 and defaults to one-step Heun inference. Both presets use EMA and CFG `5.0`.
+- The matched deployed autoencoder is also available as `checkpoints/vqvae/deployed/motion_vqvae.pt`. Normally leave `VAE Checkpoint` blank so the sampler reads the matched VQ-VAE and latent-statistics paths from flow-checkpoint metadata.
 - `Condition Pattern` selects even, random, or boundary-gap condition timestamps. The chosen pattern and indices are preserved in `result_meta.json` and the replicate command.
-- `CFG Guidance` supports synchronized slider and exact numeric entry from 0.0 to 3.0. Scale 1.0 preserves the conditional prediction, 1.2 is the balanced preset, and 2.5 is the evaluated quality-first preset.
+- `CFG Guidance` supports synchronized slider and exact numeric entry from 0.0 to 5.0. Scale 1.0 preserves the conditional prediction, while 5.0 is the selected deployment scale for the current Round 0 and Reflow Round 1 checkpoints.
 - The web module currently assumes output root is `output/flow`.
 - **Generate** starts a persisted background job under `output/flow/generation_jobs/`. Once the sampler resolves the clip and condition indices, condition-media extraction runs in parallel with flow inference, so the page can show the selected frames and video before the generated motion is ready.
 - **Load Last** restores the run referenced by `output/flow/last` without rerunning sampling or condition-media extraction. It also restores the newest completed MLD/StickMotion comparison for the same sample path and clip start.

@@ -89,6 +89,73 @@ COMPARISON_STICKMOTION_CONFIG = os.environ.get(
 COMPARISON_BLENDER = shutil.which(
     os.environ.get("FLOWMIMIC_BLENDER", "blender")
 )
+DEPLOYED_CHECKPOINT_PRESETS = [
+    {
+        "id": "round0",
+        "label": "Deployed Round 0",
+        "model_name": "deployed",
+        "model_filename": "round0.pt",
+        "steps": 8,
+        "guidance_scale": 5.0,
+    },
+    {
+        "id": "reflow1",
+        "label": "Deployed Reflow Round 1",
+        "model_name": "deployed",
+        "model_filename": "reflow1.pt",
+        "steps": 1,
+        "guidance_scale": 5.0,
+    },
+]
+DEPLOYED_VAE_ALIASES = [
+    {
+        "label": "Deployed Motion VQ-VAE",
+        "path": "checkpoints/vqvae/deployed/motion_vqvae.pt",
+    }
+]
+DEPLOYED_CHECKPOINT_ALIAS_TARGETS = {
+    ROOT_DIR / "checkpoints" / "flow" / "deployed" / "round0.pt": (
+        ROOT_DIR
+        / "checkpoints"
+        / "flow"
+        / "vqflow_aist_zq16_unified_sparse_cfg5_260728"
+        / "flow_round0_update68220.pt"
+    ),
+    ROOT_DIR / "checkpoints" / "flow" / "deployed" / "reflow1.pt": (
+        ROOT_DIR
+        / "checkpoints"
+        / "flow"
+        / "vqflow_aist_zq16_reflow1_cfg5_endpoint_rollout_260822"
+        / "flow_round1_update33334.pt"
+    ),
+    ROOT_DIR / "checkpoints" / "vqvae" / "deployed" / "motion_vqvae.pt": (
+        ROOT_DIR
+        / "checkpoints"
+        / "vqvae"
+        / "aist_mvh_len196_latent16_code1024_visible_retrain_to200_ddp2_retry_260717"
+        / "motion_vqvae_epoch200.pt"
+    ),
+}
+
+
+def _ensure_deployed_checkpoint_aliases() -> None:
+    logger = logging.getLogger(__name__)
+    for alias, target in DEPLOYED_CHECKPOINT_ALIAS_TARGETS.items():
+        if alias.is_symlink():
+            if alias.resolve(strict=False) != target.resolve(strict=False):
+                logger.warning("Checkpoint alias has an unexpected target: %s", alias)
+            continue
+        if alias.exists():
+            logger.warning("Checkpoint alias path is not a symlink: %s", alias)
+            continue
+        if not target.is_file():
+            logger.warning("Cannot create checkpoint alias; target is missing: %s", target)
+            continue
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        alias.symlink_to(Path(os.path.relpath(target, alias.parent)))
+
+
+_ensure_deployed_checkpoint_aliases()
 BASE_PATH = os.environ.get("FLOWMIMIC_BASE_PATH", "/flowmimic").strip()
 if BASE_PATH in ("", "/"):
     BASE_PATH = ""
@@ -1134,16 +1201,19 @@ def defaults() -> dict:
     return {
         "checkpoints": _list_checkpoints(),
         "model_names": _list_model_names(),
-        "default_checkpoint": "",
-        "default_model_name": "",
-        "default_model_filename": "flow_round0_last.pt",
+        "checkpoint_presets": DEPLOYED_CHECKPOINT_PRESETS,
+        "vae_checkpoint_aliases": DEPLOYED_VAE_ALIASES,
+        "default_checkpoint": "checkpoints/flow/deployed/round0.pt",
+        "default_checkpoint_preset": "round0",
+        "default_model_name": "deployed",
+        "default_model_filename": "round0.pt",
         "default_vae_checkpoint": "",
         "configured_vae_checkpoint": cfg.get("vae_ckpt", ""),
         "default_condition_frames": None,
         "default_condition_pattern": "even",
         "default_steps": 8,
         "default_solver": "heun",
-        "default_guidance_scale": 1.0,
+        "default_guidance_scale": 5.0,
         "default_dataset": "aist",
         "default_device": "",
         "default_style_id": None,
@@ -1398,10 +1468,10 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks) -> dict:
         model_filename = _validate_rel_component(model_filename, "model_filename")
         checkpoint = f"checkpoints/flow/{model_name}/{model_filename}"
 
-    if not math.isfinite(req.guidance_scale) or not 0.0 <= req.guidance_scale <= 3.0:
+    if not math.isfinite(req.guidance_scale) or not 0.0 <= req.guidance_scale <= 5.0:
         raise HTTPException(
             status_code=400,
-            detail="guidance_scale must be a finite value between 0.0 and 3.0",
+            detail="guidance_scale must be a finite value between 0.0 and 5.0",
         )
     device = _validate_device(req.device, "device")
     generated_motion_name = _validate_rel_component(req.out, "output name")

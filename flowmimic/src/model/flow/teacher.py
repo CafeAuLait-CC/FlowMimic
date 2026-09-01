@@ -59,20 +59,17 @@ class Teacher:
     ):
         """Encode raw conditions with the frozen teacher's own modules."""
         self.model.eval()
-        g2d, memory, _ = self.model.cond_encoder(
+        global_context, memory, _ = self.model.encode_cond(
             k2d,
             tau_cond,
+            style_id,
+            domain_id,
+            apply_style_dropout=False,
             vis_mask=vis_mask,
             mask_cond=mask_cond,
             mean=mean,
             std=std,
         )
-        style = self.model.style_emb(
-            style_id,
-            domain_id,
-            apply_dropout=False,
-        )
-        global_context = self.model.cond_mlp(torch.cat([g2d, style], dim=-1))
 
         if null_mask is None:
             null_mask = torch.zeros(

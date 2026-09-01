@@ -24,8 +24,10 @@ class FlowNet(nn.Module):
         latent_slot_adapter=False,
         latent_slot_adapter_heads=8,
         latent_slot_adapter_ffn_dim=1024,
+        use_condition_memory=True,
     ):
         super().__init__()
+        self.use_condition_memory = bool(use_condition_memory)
         self.in_proj = nn.Linear(d_z, d_model)
         self.out_proj = nn.Linear(d_model, d_z)
         self.tau_embed = TimeEmbed(d_model)
@@ -51,6 +53,7 @@ class FlowNet(nn.Module):
                     dropout=dropout,
                     relative_time_bias=relative_time_bias,
                     relative_time_hidden_dim=relative_time_hidden_dim,
+                    use_condition_memory=self.use_condition_memory,
                 )
                 for _ in range(n_layers)
             ]
@@ -69,8 +72,15 @@ class FlowNet(nn.Module):
         # x_t: [B,T,Dz], t_flow: [B] or [B,T], tau_out: [T] or [B,T]
         b, t, _ = x_t.shape
         h = self.in_proj(x_t)
-        if self.slot_condition_adapter is not None:
+        if self.slot_condition_adapter is not None and self.use_condition_memory:
             h = h + self.slot_condition_adapter(mem, mem_mask)
+        elif self.slot_condition_adapter is not None:
+            h = h + self._zero_parameter_link(
+                h,
+                self.slot_condition_adapter,
+            )
+        if not self.use_condition_memory:
+            h = h + mem.sum() * 0.0
         if tau_out.dim() == 1:
             tau_out = tau_out.unsqueeze(0).expand(b, -1)
         if tau_cond is not None and tau_cond.dim() == 1:
@@ -91,3 +101,10 @@ class FlowNet(nn.Module):
             )
 
         return self.out_proj(h)
+
+    @staticmethod
+    def _zero_parameter_link(reference, module):
+        link = reference.new_zeros(())
+        for parameter in module.parameters():
+            link = link + parameter.reshape(-1)[0] * 0.0
+        return link

@@ -28,7 +28,10 @@ from flowmimic.src.model.flow.checkpoint import (
     infer_relative_time_hidden_dim,
     load_flow_state_dict,
 )
-from flowmimic.src.model.flow.rect_flow import ConditionalRectFlow
+from flowmimic.src.model.flow.rect_flow import (
+    POSE_CONDITIONING_MODES,
+    ConditionalRectFlow,
+)
 from flowmimic.src.model.flow.teacher import EMA, Teacher
 from flowmimic.src.model.flow.solver import (
     cfg_branch_preservation_loss,
@@ -97,6 +100,8 @@ def _apply_train_flow_config_defaults(args, config):
         args.latent_stats_path = config.get(
             "latent_stats_path", "data/latent_stats.npz"
         )
+    if args.pose_conditioning is None:
+        args.pose_conditioning = flow_cfg.get("pose_conditioning", "full")
 
     args.vae_latent_len = flow_cfg.get("vae_latent_len")
     args.vae_latent_token_mode = flow_cfg.get("vae_latent_token_mode")
@@ -402,6 +407,15 @@ def main():
         help="Optional comma-separated sampling weights for --cond-frame-choices.",
     )
     parser.add_argument("--cond-drop-prob", type=float, default=None)
+    parser.add_argument(
+        "--pose-conditioning",
+        choices=POSE_CONDITIONING_MODES,
+        default=None,
+        help=(
+            "Pose information paths used by the flow: full (M+g), "
+            "memory_only (M), global_only (g), or style_only (neither)."
+        ),
+    )
     parser.add_argument("--cond-frame-drop-prob", type=float, default=None)
     parser.add_argument(
         "--cond-frame-drop-start-epoch",
@@ -1211,6 +1225,7 @@ def main():
         latent_slot_adapter_heads=latent_slot_adapter_heads,
         latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
         true_null_condition=true_null_condition,
+        pose_conditioning=args.pose_conditioning,
     )
     flow.to(device)
     resume_state = None
@@ -1248,6 +1263,7 @@ def main():
             d_z=flow_d_z,
             vae_ckpt=vae_ckpt_path,
             latent_stats_path=latent_stats_path,
+            pose_conditioning=args.pose_conditioning,
         )
         source_uses_relative_time = flow_state_uses_relative_time_bias(
             source_model_state
@@ -1356,6 +1372,7 @@ def main():
             f"cond_frame_drop_mode={args.cond_frame_drop_mode}; "
             f"cfg_drop_prob={args.cfg_drop_prob}; cfg_start_epoch={args.cfg_start_epoch}; "
             f"ema_enabled={args.ema}; ema_decay={ema_decay}; "
+            f"pose_conditioning={args.pose_conditioning}; "
             f"curriculum={args.curriculum or 'none'}; "
             f"lr_decay_epoch={lr_decay_epoch}; "
             f"solver_reg_subbatch_size={solver_reg_subbatch_size or 'full'}; "
@@ -1575,6 +1592,11 @@ def main():
         if not args.teacher_ckpt:
             raise ValueError("teacher_ckpt is required for reflow_round >= 1")
         state = torch.load(args.teacher_ckpt, map_location="cpu")
+        teacher_pose_conditioning = (
+            (state.get("metadata") or {})
+            .get("flow_architecture", {})
+            .get("pose_conditioning", "full")
+        )
         _validate_flow_checkpoint_contract(
             "teacher",
             state,
@@ -1583,6 +1605,7 @@ def main():
             d_z=flow_d_z,
             vae_ckpt=vae_ckpt_path,
             latent_stats_path=latent_stats_path,
+            pose_conditioning=teacher_pose_conditioning,
         )
         teacher_state = (
             state["ema"]
@@ -1607,11 +1630,13 @@ def main():
             "relative_time_bias": teacher_relative_time_bias,
             "latent_slot_adapter": teacher_latent_slot_adapter,
             "true_null_condition": teacher_true_null_condition,
+            "pose_conditioning": teacher_pose_conditioning,
         }
         student_architecture = {
             "relative_time_bias": relative_time_bias,
             "latent_slot_adapter": latent_slot_adapter,
             "true_null_condition": true_null_condition,
+            "pose_conditioning": args.pose_conditioning,
         }
         if teacher_architecture != student_architecture:
             raise ValueError(
@@ -1638,6 +1663,7 @@ def main():
             latent_slot_adapter_heads=latent_slot_adapter_heads,
             latent_slot_adapter_ffn_dim=teacher_slot_config["ffn_dim"],
             true_null_condition=teacher_true_null_condition,
+            pose_conditioning=teacher_pose_conditioning,
         )
         load_flow_state_dict(teacher_flow, teacher_state)
         teacher_flow.to(device).eval()
@@ -2214,7 +2240,7 @@ def main():
                 style = flow_model.style_emb(
                     style_id_cond, domain_id, apply_dropout=not use_teacher
                 )
-                g = flow_model.cond_mlp(torch.cat([g2d, style], dim=-1))
+                g = flow_model.combine_pose_style(g2d, style)
                 if true_null_condition:
                     if drop_cond is None:
                         drop_cond = torch.zeros(
@@ -3454,6 +3480,7 @@ def _validate_flow_checkpoint_contract(
     d_z,
     vae_ckpt,
     latent_stats_path,
+    pose_conditioning,
 ):
     if not isinstance(state, dict):
         raise ValueError(f"{label} checkpoint is not a state dictionary")
@@ -3486,6 +3513,18 @@ def _validate_flow_checkpoint_contract(
             raise ValueError(
                 f"{label} checkpoint {key}={actual} does not match {expected}"
             )
+
+    actual_pose_conditioning = (
+        metadata.get("flow_architecture", {}).get(
+            "pose_conditioning",
+            "full",
+        )
+    )
+    if actual_pose_conditioning != pose_conditioning:
+        raise ValueError(
+            f"{label} checkpoint pose_conditioning={actual_pose_conditioning} "
+            f"does not match {pose_conditioning}"
+        )
 
 
 def _make_checkpoint_metadata(
@@ -3538,6 +3577,7 @@ def _make_checkpoint_metadata(
             "latent_slot_adapter_ffn_dim": int(latent_slot_adapter_ffn_dim),
             "latent_slot_adapter_lr_scale": float(latent_slot_adapter_lr_scale),
             "true_null_condition": bool(true_null_condition),
+            "pose_conditioning": args.pose_conditioning,
         },
         "reflow": {
             "round": int(args.reflow_round),

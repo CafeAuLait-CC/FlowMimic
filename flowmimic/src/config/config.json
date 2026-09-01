@@ -89,7 +89,8 @@
       "latent_slot_adapter_heads": 8,
       "latent_slot_adapter_ffn_dim": 1024,
       "latent_slot_adapter_lr_scale": 1.0,
-      "true_null_condition": false
+      "true_null_condition": false,
+      "pose_conditioning": "full"
     },
     "optimization": {
       "lr": 2e-4,

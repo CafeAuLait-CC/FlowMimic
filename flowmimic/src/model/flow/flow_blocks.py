@@ -125,8 +125,10 @@ class FlowBlock(nn.Module):
         dropout=0.1,
         relative_time_bias=False,
         relative_time_hidden_dim=32,
+        use_condition_memory=True,
     ):
         super().__init__()
+        self.use_condition_memory = bool(use_condition_memory)
         self.adaln = AdaLN(d_model, cond_dim)
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -162,33 +164,46 @@ class FlowBlock(nn.Module):
         attn_out, _ = self.self_attn(h, h, h, key_padding_mask=None, need_weights=False)
         x = x + self.dropout(attn_out)
 
-        h = self.norm2(x)
-        attn_mask = None
-        key_padding_mask = mem_mask
-        if self.relative_time_bias is not None:
-            if tau_out is None or tau_cond is None:
-                raise ValueError(
-                    "Relative-time attention requires tau_out and tau_cond"
+        if self.use_condition_memory:
+            h = self.norm2(x)
+            attn_mask = None
+            key_padding_mask = mem_mask
+            if self.relative_time_bias is not None:
+                if tau_out is None or tau_cond is None:
+                    raise ValueError(
+                        "Relative-time attention requires tau_out and tau_cond"
+                    )
+                attn_mask = self.relative_time_bias(
+                    tau_out,
+                    tau_cond,
+                    key_padding_mask=mem_mask,
+                    dtype=h.dtype,
                 )
-            attn_mask = self.relative_time_bias(
-                tau_out,
-                tau_cond,
-                key_padding_mask=mem_mask,
-                dtype=h.dtype,
+                # The padding mask is already represented by additive -inf bias.
+                key_padding_mask = None
+            cross_out, _ = self.cross_attn(
+                h,
+                mem,
+                mem,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                need_weights=False,
             )
-            # The padding mask is already represented by additive -inf bias.
-            key_padding_mask = None
-        cross_out, _ = self.cross_attn(
-            h,
-            mem,
-            mem,
-            key_padding_mask=key_padding_mask,
-            attn_mask=attn_mask,
-            need_weights=False,
-        )
-        gate = self.gate(cond).unsqueeze(1)
-        x = x + self.dropout(cross_out * gate)
+            gate = self.gate(cond).unsqueeze(1)
+            x = x + self.dropout(cross_out * gate)
+        else:
+            x = x + self._condition_memory_parameter_link(x)
 
         h = self.norm3(x)
         x = x + self.dropout(self.ffn(h))
         return x
+
+    def _condition_memory_parameter_link(self, reference):
+        link = reference.new_zeros(())
+        modules = [self.norm2, self.cross_attn, self.gate]
+        if self.relative_time_bias is not None:
+            modules.append(self.relative_time_bias)
+        for module in modules:
+            for parameter in module.parameters():
+                link = link + parameter.reshape(-1)[0] * 0.0
+        return link

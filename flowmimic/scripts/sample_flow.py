@@ -408,6 +408,7 @@ def main():
         default_ffn_dim=flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
     )
     flow_architecture = state.get("metadata", {}).get("flow_architecture", {})
+    pose_conditioning = flow_architecture.get("pose_conditioning", "full")
     flow = ConditionalRectFlow(
         d_z=d_z,
         d_model=flow_cfg.get("d_model", 512),
@@ -433,6 +434,7 @@ def main():
         ),
         latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
         true_null_condition=true_null_condition,
+        pose_conditioning=pose_conditioning,
     )
     load_flow_state_dict(flow, flow_state)
     flow.to(device)
@@ -474,7 +476,7 @@ def main():
     style_id = torch.tensor([style_id_value], device=device)
     domain_id = torch.tensor([domain_id_value], device=device)
     style = flow.style_emb(style_id, domain_id, apply_dropout=False)
-    g = flow.cond_mlp(torch.cat([g, style], dim=-1))
+    g = flow.combine_pose_style(g, style)
 
     cond_batch = {
         "tau_out": tau_out,
@@ -505,9 +507,7 @@ def main():
             style_uncond = flow.style_emb(
                 torch.zeros_like(style_id), domain_id, apply_dropout=False
             )
-            g_uncond = flow.cond_mlp(
-                torch.cat([g2d_uncond, style_uncond], dim=-1)
-            )
+            g_uncond = flow.combine_pose_style(g2d_uncond, style_uncond)
             mem_mask_uncond = None
             tau_cond_uncond = cond["tau_cond"]
         cond_batch.update(
@@ -567,6 +567,7 @@ def main():
         "solver": args.solver,
         "use_ema": args.use_ema,
         "reflow_round": int(reflow_metadata.get("round", 0)),
+        "pose_conditioning": pose_conditioning,
         "reflow_teacher_checkpoint": reflow_metadata.get("teacher_ckpt"),
         "sparse_indices": sample_idx_out,
         "condition_indices": sample_idx_out,

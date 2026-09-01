@@ -6,6 +6,14 @@ from flowmimic.src.model.flow.flow_net import FlowNet
 from flowmimic.src.model.flow.style_embed import StyleEmbedding
 
 
+POSE_CONDITIONING_MODES = (
+    "full",
+    "memory_only",
+    "global_only",
+    "style_only",
+)
+
+
 class ConditionalRectFlow(nn.Module):
     def __init__(
         self,
@@ -29,8 +37,17 @@ class ConditionalRectFlow(nn.Module):
         latent_slot_adapter_heads=8,
         latent_slot_adapter_ffn_dim=1024,
         true_null_condition=False,
+        pose_conditioning="full",
     ):
         super().__init__()
+        if pose_conditioning not in POSE_CONDITIONING_MODES:
+            raise ValueError(
+                f"Unknown pose conditioning mode {pose_conditioning!r}; "
+                f"expected one of {POSE_CONDITIONING_MODES}"
+            )
+        self.pose_conditioning = pose_conditioning
+        self.use_pose_memory = pose_conditioning in ("full", "memory_only")
+        self.use_pose_global = pose_conditioning in ("full", "global_only")
         self.true_null_condition = bool(true_null_condition)
         self.cond_encoder = CondEncoder2D(
             num_joints=num_joints_2d,
@@ -59,6 +76,7 @@ class ConditionalRectFlow(nn.Module):
             latent_slot_adapter=latent_slot_adapter,
             latent_slot_adapter_heads=latent_slot_adapter_heads,
             latent_slot_adapter_ffn_dim=latent_slot_adapter_ffn_dim,
+            use_condition_memory=self.use_pose_memory,
         )
         if self.true_null_condition:
             self.null_memory = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -76,7 +94,7 @@ class ConditionalRectFlow(nn.Module):
             domain_id,
             apply_dropout=False,
         )
-        global_context = self.cond_mlp(torch.cat([pose_global, style], dim=-1))
+        global_context = self.combine_pose_style(pose_global, style)
         memory_mask = torch.zeros(
             (batch_size, 1),
             dtype=torch.bool,
@@ -129,10 +147,34 @@ class ConditionalRectFlow(nn.Module):
         mask_out[null_mask, 0] = True
         return global_out, memory_out, tau_out, mask_out
 
-    def encode_cond(self, k2d, tau_cond, style_id, domain_id, apply_style_dropout=True, vis_mask=None):
-        g_2d, mem, vis_mask = self.cond_encoder(k2d, tau_cond, vis_mask=vis_mask)
+    def combine_pose_style(self, pose_global, style):
+        """Build global context while preserving matched ablation parameters."""
+        if not self.use_pose_global:
+            pose_global = pose_global * 0.0
+        return self.cond_mlp(torch.cat([pose_global, style], dim=-1))
+
+    def encode_cond(
+        self,
+        k2d,
+        tau_cond,
+        style_id,
+        domain_id,
+        apply_style_dropout=True,
+        vis_mask=None,
+        mask_cond=None,
+        mean=None,
+        std=None,
+    ):
+        g_2d, mem, vis_mask = self.cond_encoder(
+            k2d,
+            tau_cond,
+            vis_mask=vis_mask,
+            mask_cond=mask_cond,
+            mean=mean,
+            std=std,
+        )
         style = self.style_emb(style_id, domain_id, apply_dropout=apply_style_dropout)
-        g = self.cond_mlp(torch.cat([g_2d, style], dim=-1))
+        g = self.combine_pose_style(g_2d, style)
         return g, mem, vis_mask
 
     def forward(

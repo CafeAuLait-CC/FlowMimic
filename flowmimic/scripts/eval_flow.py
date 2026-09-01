@@ -671,7 +671,7 @@ def _generate_batch(
             std=k2d_std,
         )
         style = flow.style_emb(style_id, domain_id, apply_dropout=False)
-        g = flow.cond_mlp(torch.cat([g2d, style], dim=-1))
+        g = flow.combine_pose_style(g2d, style)
         cond_batch = {
             "tau_out": tau_out,
             "tau_cond": tau_cond,
@@ -701,9 +701,7 @@ def _generate_batch(
                 style_uncond = flow.style_emb(
                     torch.zeros_like(style_id), domain_id, apply_dropout=False
                 )
-                g_uncond = flow.cond_mlp(
-                    torch.cat([g2d_uncond, style_uncond], dim=-1)
-                )
+                g_uncond = flow.combine_pose_style(g2d_uncond, style_uncond)
                 mem_mask_uncond = ~mask_cond
                 tau_cond_uncond = tau_cond
             cond_batch.update(
@@ -1414,6 +1412,7 @@ def main():
         default_ffn_dim=flow_cfg.get("latent_slot_adapter_ffn_dim", 1024),
     )
     flow_architecture = ckpt_metadata.get("flow_architecture", {})
+    pose_conditioning = flow_architecture.get("pose_conditioning", "full")
     flow = ConditionalRectFlow(
         d_z=d_z,
         d_model=flow_cfg.get("d_model", 512),
@@ -1439,6 +1438,7 @@ def main():
         ),
         latent_slot_adapter_ffn_dim=slot_adapter_config["ffn_dim"],
         true_null_condition=true_null_condition,
+        pose_conditioning=pose_conditioning,
     ).to(args.device)
     print(f"Loading flow model: {args.flow_ckpt}")
     if args.use_ema and "ema" not in state:
@@ -1447,6 +1447,7 @@ def main():
     print(f"Relative-time attention: enabled={relative_time_bias}")
     print(f"Latent-slot adapter: enabled={latent_slot_adapter}")
     print(f"True-null condition: enabled={true_null_condition}")
+    print(f"Pose conditioning: {pose_conditioning}")
     flow.eval()
 
     t2m_extractor = None

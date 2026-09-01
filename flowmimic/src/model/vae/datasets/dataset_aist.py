@@ -71,6 +71,7 @@ class AISTDataset(Dataset):
         include_cond=False,
         include_full_cond=False,
         openpose_dir=None,
+        condition_loader=None,
         cond_cache_root=None,
         cond_frames_min=None,
         cond_frames_max=None,
@@ -105,6 +106,7 @@ class AISTDataset(Dataset):
         self.include_cond = include_cond
         self.include_full_cond = include_full_cond
         self.openpose_dir = openpose_dir
+        self.condition_loader = condition_loader
         self.cond_cache_root = cond_cache_root
         self.cond_frames_min = cond_frames_min
         self.cond_frames_max = cond_frames_max
@@ -209,19 +211,31 @@ class AISTDataset(Dataset):
             "meta": meta,
         }
         if self.include_cond:
-            if not self.openpose_dir:
-                raise ValueError("openpose_dir is required when include_cond=True")
-            from flowmimic.src.data.openpose import load_aist_openpose
+            if self.condition_loader is not None:
+                k2d, vis, conf = self.condition_loader(
+                    path,
+                    src_fps=self.src_fps,
+                    target_fps=self.target_fps,
+                    camera=camera,
+                    return_conf=True,
+                )
+            else:
+                if not self.openpose_dir:
+                    raise ValueError(
+                        "openpose_dir is required when include_cond=True and no "
+                        "condition_loader is provided"
+                    )
+                from flowmimic.src.data.openpose import load_aist_openpose
 
-            k2d, vis, conf = load_aist_openpose(
-                path,
-                self.openpose_dir,
-                src_fps=self.src_fps,
-                target_fps=self.target_fps,
-                cache_root=self.cond_cache_root,
-                camera=camera,
-                return_conf=True,
-            )
+                k2d, vis, conf = load_aist_openpose(
+                    path,
+                    self.openpose_dir,
+                    src_fps=self.src_fps,
+                    target_fps=self.target_fps,
+                    cache_root=self.cond_cache_root,
+                    camera=camera,
+                    return_conf=True,
+                )
             if k2d is None:
                 k2d = np.zeros((self.seq_len, 25, 2), dtype=np.float32)
                 vis = np.zeros((self.seq_len, 25), dtype=np.float32)

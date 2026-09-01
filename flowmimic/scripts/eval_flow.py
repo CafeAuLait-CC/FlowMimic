@@ -1,8 +1,10 @@
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import os
+from pathlib import Path
 import random
 import sys
 import warnings
@@ -101,6 +103,36 @@ def _aist_paths_for_splits(cfg, split_names):
 
 def _parse_csv(value):
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _conda_env_python(env_name, override=None):
+    if override:
+        path = Path(os.path.expandvars(os.path.expanduser(override))).resolve()
+    else:
+        prefix = Path(os.environ.get("CONDA_PREFIX", sys.prefix)).resolve()
+        envs_dir = prefix.parent if prefix.parent.name == "envs" else prefix / "envs"
+        path = envs_dir / env_name / "bin" / "python"
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise FileNotFoundError(
+            f"Python for MediaPipe environment was not found or executable: {path}. "
+            "Pass --mediapipe-python or activate FlowMimic from a sibling Conda env."
+        )
+    return str(path)
+
+
+def _runtime_mediapipe_provider_class():
+    module_path = Path(ROOT_DIR) / "mediapipe" / "runtime_condition_provider.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(f"MediaPipe runtime provider not found: {module_path}")
+    spec = importlib.util.spec_from_file_location(
+        "flowmimic_runtime_mediapipe",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load MediaPipe runtime provider: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.RuntimeMediaPipeAISTProvider
 
 
 def _build_aist_condition_manifest(
@@ -1296,6 +1328,29 @@ def main():
         help="Comma-separated AIST cameras for eval. Defaults to config aist_cameras.",
     )
     parser.add_argument(
+        "--condition-pose-source",
+        choices=("openpose", "mediapipe"),
+        default="openpose",
+        help="AIST 2D pose source. MediaPipe is extracted from videos at runtime.",
+    )
+    parser.add_argument("--mediapipe-python", type=str, default=None)
+    parser.add_argument(
+        "--mediapipe-workers",
+        type=int,
+        default=8,
+        help="Parallel runtime extractors used for RAM-only MediaPipe preloading.",
+    )
+    parser.add_argument(
+        "--mediapipe-model",
+        type=str,
+        default="mediapipe/models/pose_landmarker_heavy.task",
+    )
+    parser.add_argument(
+        "--aist-video-dir",
+        type=str,
+        default="data/AIST++/Videos",
+    )
+    parser.add_argument(
         "--datasets",
         type=str,
         default=flow_eval_cfg.get("datasets", "AIST,MVH"),
@@ -1517,14 +1572,47 @@ def main():
     mvh_dirs = _read_lines(cfg["mvh_split_val"]) if "MVH" in requested_datasets else []
     genre_to_id = build_genre_to_id(cfg.get("aist_genres", []))
     loaders = []
+    runtime_condition_provider = None
     condition_manifest_path = None
     condition_manifest_sha256 = None
     if "AIST" in requested_datasets:
+        if args.condition_pose_source == "mediapipe":
+            if args.aist_crop_mode != "first":
+                raise ValueError(
+                    "Runtime MediaPipe evaluation currently requires "
+                    "--aist-crop-mode first"
+                )
+            provider_class = _runtime_mediapipe_provider_class()
+            runtime_condition_provider = provider_class(
+                python_executable=_conda_env_python(
+                    "flowmimic-mediapipe",
+                    args.mediapipe_python,
+                ),
+                model_path=args.mediapipe_model,
+                video_dir=args.aist_video_dir,
+                max_target_frames=seq_len,
+            )
+            print(
+                "AIST condition source: runtime MediaPipe "
+                f"({args.mediapipe_model}); filesystem pose cache disabled"
+            )
+        else:
+            print("AIST condition source: cached OpenPose")
         aist_cameras = (
             _parse_csv(args.aist_cameras)
             if args.aist_cameras is not None
             else cfg.get("aist_cameras", ["01", "02", "08", "09"])
         )
+        if runtime_condition_provider is not None:
+            runtime_condition_provider.preload(
+                [
+                    (motion_path, camera)
+                    for motion_path in aist_paths
+                    for camera in aist_cameras
+                ],
+                target_fps=cfg.get("target_fps", 30),
+                workers=args.mediapipe_workers,
+            )
         aist_cond_frames = args.cond_frames or flow_cfg.get("cond_frames_min", 7)
         condition_manifest_entries = None
         if args.condition_manifest and args.save_condition_manifest:
@@ -1596,6 +1684,7 @@ def main():
             include_cond=True,
             include_full_cond=True,
             openpose_dir=cfg.get("aist_openpose_dir", "data/AIST++/Annotations/openpose"),
+            condition_loader=runtime_condition_provider,
             cond_cache_root=cfg.get("cond_cache_root", "data/cached_cond"),
             cond_frames_min=aist_cond_frames,
             cond_frames_max=aist_cond_frames,
@@ -1732,6 +1821,9 @@ def main():
             row.update(_aggregate_replication_rows(reps_for_group))
             summary_rows.append(row)
 
+    if runtime_condition_provider is not None:
+        runtime_condition_provider.close()
+
     print(f"Writing outputs: {save_csv}, {save_json}, {save_plot}")
     os.makedirs(os.path.dirname(save_csv), exist_ok=True)
     fieldnames = ["dataset", "steps"] + sorted(
@@ -1767,6 +1859,18 @@ def main():
             "cond_frames": args.cond_frames,
             "cond_pattern": args.cond_pattern,
             "cond_pattern_seed": args.cond_pattern_seed,
+            "condition_pose_source": args.condition_pose_source,
+            "mediapipe_model": (
+                args.mediapipe_model
+                if args.condition_pose_source == "mediapipe"
+                else None
+            ),
+            "mediapipe_cache": "memory_only",
+            "mediapipe_workers": (
+                args.mediapipe_workers
+                if args.condition_pose_source == "mediapipe"
+                else None
+            ),
             "condition_manifest": condition_manifest_path,
             "condition_manifest_sha256": condition_manifest_sha256,
             "guidance_scale": args.guidance_scale,

@@ -22,7 +22,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from flowmimic.src.data.dataloader import blender_to_yup
 from flowmimic.src.config.config import load_config
 
@@ -86,6 +86,27 @@ COMPARISON_STICKMOTION_CONFIG = os.environ.get(
         "stickmotion_remodiffuse_aist_no_locus_eval.py"
     ),
 )
+COMPARISON_MOTIONHIFLOW_GPU = int(
+    os.environ.get("FLOWMIMIC_COMPARISON_MOTIONHIFLOW_GPU", "0")
+)
+COMPARISON_FLOODDIFFUSION_GPU = int(
+    os.environ.get("FLOWMIMIC_COMPARISON_FLOODDIFFUSION_GPU", "0")
+)
+COMPARISON_MOTIONHIFLOW_CHECKPOINT = os.environ.get(
+    "FLOWMIMIC_COMPARISON_MOTIONHIFLOW_CHECKPOINT",
+    (
+        "checkpoints/motionhiflow/"
+        "motionhiflow_aist_fresh_bias25_bf16_20260808/flow/best_val.pt"
+    ),
+)
+COMPARISON_FLOODDIFFUSION_CHECKPOINT = os.environ.get(
+    "FLOWMIMIC_COMPARISON_FLOODDIFFUSION_CHECKPOINT",
+    (
+        "checkpoints/flooddiffusion/flooddiffusion_aist_z4_20260817/"
+        "diffusion/update_0025000.pt"
+    ),
+)
+COMPARISON_BASELINES = ("mld", "stickmotion", "motionhiflow", "flooddiffusion")
 COMPARISON_BLENDER = shutil.which(
     os.environ.get("FLOWMIMIC_BLENDER", "blender")
 )
@@ -269,6 +290,9 @@ class ComparisonBlendRequest(BaseModel):
     stickmotion_sketch_frames: list[int]
     caption_index: int
     caption_text: str
+    baselines: list[
+        Literal["mld", "stickmotion", "motionhiflow", "flooddiffusion"]
+    ] = Field(default_factory=lambda: list(COMPARISON_BASELINES))
     visualization_mode: Literal["skeleton", "rigged"] = "skeleton"
     device: str | None = None
 
@@ -441,6 +465,7 @@ def _comparison_command(
     sketch_frames: list[int],
     caption_index: int,
     caption_text: str,
+    baselines: list[str],
     visualization_mode: Literal["skeleton", "rigged"],
     device: str | None,
 ) -> tuple[list[str], dict]:
@@ -459,7 +484,7 @@ def _comparison_command(
         raise ValueError(f"{sample_id} is not in the AIST++ test or validation split")
     seq_len = int(meta.get("seq_len") or 0)
     if seq_len != 196:
-        raise ValueError(f"StickMotion comparison requires seq_len=196, got {seq_len}")
+        raise ValueError(f"Baseline comparison requires seq_len=196, got {seq_len}")
     start = int(meta.get("start") or 0)
     camera = str(meta.get("camera") or "")
     if not camera:
@@ -483,6 +508,8 @@ def _comparison_command(
     command = [
         sys.executable,
         str(COMPARISON_SCRIPT),
+        "--baselines",
+        *baselines,
         "--split",
         split,
         "--sample-id",
@@ -519,6 +546,10 @@ def _comparison_command(
         COMPARISON_STICKMOTION_CHECKPOINT,
         "--stickmotion-config",
         COMPARISON_STICKMOTION_CONFIG,
+        "--motionhiflow-ckpt",
+        COMPARISON_MOTIONHIFLOW_CHECKPOINT,
+        "--flooddiffusion-ckpt",
+        COMPARISON_FLOODDIFFUSION_CHECKPOINT,
         "--existing-flow-motion",
         str(motion_path),
         "--existing-flow-meta",
@@ -539,6 +570,10 @@ def _comparison_command(
                 str(COMPARISON_MLD_GPU),
                 "--stickmotion-gpu",
                 str(COMPARISON_STICKMOTION_GPU),
+                "--motionhiflow-gpu",
+                str(COMPARISON_MOTIONHIFLOW_GPU),
+                "--flooddiffusion-gpu",
+                str(COMPARISON_FLOODDIFFUSION_GPU),
             ]
         )
     else:
@@ -547,6 +582,10 @@ def _comparison_command(
                 "--mld-device",
                 device,
                 "--stickmotion-device",
+                device,
+                "--motionhiflow-device",
+                device,
+                "--flooddiffusion-device",
                 device,
             ]
         )
@@ -563,12 +602,15 @@ def _comparison_command(
         "condition_frames": condition_frames,
         "caption_index": caption_index,
         "caption_text": caption_text,
+        "baselines": baselines,
         "stickmotion_sketch_frames": sketch_frames,
         "stickmotion_source_frames": [start + index for index in sketch_frames],
         "visualization_mode": visualization_mode,
         "device": device or "configured CUDA device",
         "mld_checkpoint": COMPARISON_MLD_CHECKPOINT,
         "stickmotion_checkpoint": COMPARISON_STICKMOTION_CHECKPOINT,
+        "motionhiflow_checkpoint": COMPARISON_MOTIONHIFLOW_CHECKPOINT,
+        "flooddiffusion_checkpoint": COMPARISON_FLOODDIFFUSION_CHECKPOINT,
         "source_result": str(result_dir.relative_to(OUTPUT_ROOT)),
     }
 
@@ -581,6 +623,7 @@ def _run_comparison_job(
     sketch_frames: list[int],
     caption_index: int,
     caption_text: str,
+    baselines: list[str],
     visualization_mode: Literal["skeleton", "rigged"],
     device: str | None,
 ) -> None:
@@ -597,6 +640,7 @@ def _run_comparison_job(
             sketch_frames,
             caption_index,
             caption_text,
+            baselines,
             visualization_mode,
             device,
         )
@@ -631,6 +675,10 @@ def _run_comparison_job(
                     stage = "Generating MLD motion"
                 elif line.startswith("[stickmotion]"):
                     stage = "Generating StickMotion motion and sketches"
+                elif line.startswith("[motionhiflow]"):
+                    stage = "Generating MotionHiFlow motion"
+                elif line.startswith("[flooddiffusion]"):
+                    stage = "Generating FloodDiffusion motion"
                 elif line.startswith("[blender]"):
                     stage = "Building Blender scene"
                 if stage and stage != status.get("stage"):
@@ -1267,8 +1315,17 @@ def create_comparison_job(
             status_code=404, detail="FlowMimic motion or metadata is missing"
         )
 
+    baselines = list(dict.fromkeys(req.baselines))
+    if not baselines:
+        raise HTTPException(status_code=400, detail="Select at least one baseline")
+    if "flooddiffusion" in baselines and device == "cpu":
+        raise HTTPException(
+            status_code=400, detail="FloodDiffusion comparison requires a CUDA device"
+        )
     frames = [int(index) for index in req.stickmotion_sketch_frames]
-    if len(frames) != 3 or len(set(frames)) != 3:
+    if "stickmotion" in baselines and (
+        len(frames) != 3 or len(set(frames)) != 3
+    ):
         raise HTTPException(
             status_code=400,
             detail="Select three distinct StickMotion sketch frames",
@@ -1278,7 +1335,9 @@ def create_comparison_job(
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid FlowMimic metadata") from exc
     seq_len = int(meta.get("seq_len") or 0)
-    if any(index < 0 or index >= seq_len for index in frames):
+    if "stickmotion" in baselines and any(
+        index < 0 or index >= seq_len for index in frames
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"StickMotion sketch frames must be within [0, {seq_len - 1}]",
@@ -1311,6 +1370,7 @@ def create_comparison_job(
             frames,
             req.caption_index,
             caption_text,
+            baselines,
             req.visualization_mode,
             device,
         )
@@ -1332,6 +1392,7 @@ def create_comparison_job(
         frames,
         req.caption_index,
         caption_text,
+        baselines,
         req.visualization_mode,
         device,
     )
@@ -1370,43 +1431,67 @@ def comparison_job_results(job_id: str) -> dict:
     if not manifest_path.is_file():
         raise HTTPException(status_code=404, detail="Comparison manifest not found")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    required = {
-        "reference_motion": bundle_dir / "reference.npy",
-        "mld_motion": bundle_dir / "mld.npy",
-        "stickmotion_motion": bundle_dir / "stickmotion.npy",
-        "stickman_tracks": bundle_dir / "stickman_tracks.npy",
-    }
-    missing = [name for name, path in required.items() if not path.is_file()]
-    if missing:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Comparison artifacts are missing: {', '.join(missing)}",
+    reference_path = bundle_dir / "reference.npy"
+    if not reference_path.is_file():
+        raise HTTPException(status_code=500, detail="Reference motion is missing")
+    methods = manifest.get("methods", {})
+    baseline_results = []
+    for item in manifest.get("motions", []):
+        key = str(item.get("key") or "")
+        if key in {"reference", "flowmimic"}:
+            continue
+        relative_path = Path(str(item.get("path") or ""))
+        motion_path = (bundle_dir / relative_path).resolve()
+        if bundle_dir not in motion_path.parents or not motion_path.is_file():
+            raise HTTPException(
+                status_code=500, detail=f"Motion artifact is missing for {key}"
+            )
+        method = methods.get(key, {})
+        baseline_results.append(
+            {
+                "key": key,
+                "label": item.get("label") or method.get("label") or key,
+                "motion": _load_motion(motion_path),
+                "text": method.get(
+                    "text", manifest.get("caption", {}).get("text", "")
+                ),
+            }
         )
-    tracks = np.load(required["stickman_tracks"]).astype(np.float32)
-    if tracks.ndim != 4 or tracks.shape[1:] != (6, 64, 2):
-        raise HTTPException(
-            status_code=500, detail=f"Unexpected StickMotion tracks: {tracks.shape}"
-        )
-    stick = manifest.get("methods", {}).get("stickmotion", {})
-    mld = manifest.get("methods", {}).get("mld", {})
-    return {
+    if not baseline_results:
+        raise HTTPException(status_code=500, detail="No baseline motions were generated")
+
+    response = {
         "job_id": job_id,
         "sample_id": manifest.get("sample_id", ""),
         "clip_start": manifest.get("clip_start", 0),
-        "reference_motion": _load_motion(required["reference_motion"]),
-        "mld_motion": _load_motion(required["mld_motion"]),
-        "stickmotion_motion": _load_motion(required["stickmotion_motion"]),
-        "mld_text": mld.get("text", manifest.get("caption", {}).get("text", "")),
-        "stickmotion_text": stick.get(
-            "text", manifest.get("caption", {}).get("text", "")
-        ),
-        "stickman_tracks": tracks.tolist(),
-        "stickman_frame_indices": stick.get("stickman_frame_indices", []),
-        "stickman_source_frame_indices": stick.get(
-            "stickman_source_frame_indices", []
-        ),
+        "reference_motion": _load_motion(reference_path),
+        "caption": manifest.get("caption", {}).get("text", ""),
+        "baselines": baseline_results,
         "manifest_url": _file_url(manifest_path),
     }
+    stick = methods.get("stickmotion")
+    if stick and stick.get("stickman_tracks"):
+        tracks_path = (bundle_dir / str(stick["stickman_tracks"])).resolve()
+        if bundle_dir not in tracks_path.parents or not tracks_path.is_file():
+            raise HTTPException(
+                status_code=500, detail="StickMotion sketch tracks are missing"
+            )
+        tracks = np.load(tracks_path).astype(np.float32)
+        if tracks.ndim != 4 or tracks.shape[1:] != (6, 64, 2):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected StickMotion tracks: {tracks.shape}",
+            )
+        response.update(
+            {
+                "stickman_tracks": tracks.tolist(),
+                "stickman_frame_indices": stick.get("stickman_frame_indices", []),
+                "stickman_source_frame_indices": stick.get(
+                    "stickman_source_frame_indices", []
+                ),
+            }
+        )
+    return response
 
 
 @app.get(_prefix("/api/results/latest"))

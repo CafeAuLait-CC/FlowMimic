@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an aligned FlowMimic/MLD/StickMotion AIST++ comparison bundle."""
+"""Generate an aligned FlowMimic and selected-baseline AIST++ bundle."""
 
 from __future__ import annotations
 
@@ -47,6 +47,21 @@ DEFAULT_STICKMOTION_CHECKPOINT = (
     "runs/stickmotion/human_ml3d/aist_remodiffuse_no_locus_260730/"
     "epoch=591-step=25644.ckpt"
 )
+DEFAULT_MOTIONHIFLOW_CHECKPOINT = (
+    "checkpoints/motionhiflow/"
+    "motionhiflow_aist_fresh_bias25_bf16_20260808/flow/best_val.pt"
+)
+DEFAULT_FLOODDIFFUSION_CHECKPOINT = (
+    "checkpoints/flooddiffusion/flooddiffusion_aist_z4_20260817/"
+    "diffusion/update_0025000.pt"
+)
+BASELINE_KEYS = ("mld", "stickmotion", "motionhiflow", "flooddiffusion")
+BASELINE_LABELS = {
+    "mld": "MLD",
+    "stickmotion": "StickMotion",
+    "motionhiflow": "MotionHiFlow",
+    "flooddiffusion": "FloodDiffusion",
+}
 
 
 def _resolve(workspace: Path, value: str) -> Path:
@@ -244,6 +259,13 @@ def _blender_executable(override: str | None) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--baselines",
+        nargs="+",
+        choices=BASELINE_KEYS,
+        default=list(BASELINE_KEYS),
+        help="Baseline motions to generate and include in the scene.",
+    )
     parser.add_argument("--split", choices=("test", "val"), default="test")
     parser.add_argument("--sample-id", default=None)
     parser.add_argument("--sample-index", type=int, default=0)
@@ -280,17 +302,35 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STICKMOTION_CHECKPOINT,
     )
     parser.add_argument("--stickmotion-config", default=DEFAULT_STICKMOTION_CONFIG)
+    parser.add_argument(
+        "--motionhiflow-ckpt", default=DEFAULT_MOTIONHIFLOW_CHECKPOINT
+    )
+    parser.add_argument("--motionhiflow-vae-ckpt", default=None)
+    parser.add_argument("--motionhiflow-steps", type=int, default=20)
+    parser.add_argument("--motionhiflow-guidance-scale", type=float, default=4.0)
+    parser.add_argument(
+        "--flooddiffusion-ckpt", default=DEFAULT_FLOODDIFFUSION_CHECKPOINT
+    )
+    parser.add_argument("--flooddiffusion-vae-ckpt", default=None)
+    parser.add_argument("--flooddiffusion-steps", type=int, default=10)
+    parser.add_argument("--flooddiffusion-guidance-scale", type=float, default=5.0)
     parser.add_argument("--existing-flow-motion", default=None)
     parser.add_argument("--existing-flow-meta", default=None)
     parser.add_argument("--flow-gpu", type=int, default=0)
     parser.add_argument("--mld-gpu", type=int, default=0)
     parser.add_argument("--stickmotion-gpu", type=int, default=0)
+    parser.add_argument("--motionhiflow-gpu", type=int, default=0)
+    parser.add_argument("--flooddiffusion-gpu", type=int, default=0)
     parser.add_argument("--flow-device", default=None)
     parser.add_argument("--mld-device", default=None)
     parser.add_argument("--stickmotion-device", default=None)
+    parser.add_argument("--motionhiflow-device", default=None)
+    parser.add_argument("--flooddiffusion-device", default=None)
     parser.add_argument("--flow-python", default=None)
     parser.add_argument("--mld-python", default=None)
     parser.add_argument("--stickmotion-python", default=None)
+    parser.add_argument("--motionhiflow-python", default=None)
+    parser.add_argument("--flooddiffusion-python", default=None)
     parser.add_argument("--output-root", default="output/aist_method_comparisons")
     parser.add_argument("--run-dir", default=None)
     parser.add_argument("--launch-blender", action="store_true")
@@ -314,14 +354,32 @@ def parse_args() -> argparse.Namespace:
         help="SMPL22 GLB used when --visualization-mode=rigged.",
     )
     args = parser.parse_args()
+    args.baselines = list(dict.fromkeys(args.baselines))
+    selected = set(args.baselines)
     try:
         args.flow_python = _conda_env_python(
             "flowmimic-310", args.flow_python, "FLOWMIMIC_PYTHON"
         )
-        args.mld_python = _conda_env_python("mld", args.mld_python, "MLD_PYTHON")
-        args.stickmotion_python = _conda_env_python(
-            "stickmotion", args.stickmotion_python, "STICKMOTION_PYTHON"
-        )
+        if selected.intersection({"mld", "stickmotion"}):
+            args.mld_python = _conda_env_python(
+                "mld", args.mld_python, "MLD_PYTHON"
+            )
+        if "stickmotion" in selected:
+            args.stickmotion_python = _conda_env_python(
+                "stickmotion", args.stickmotion_python, "STICKMOTION_PYTHON"
+            )
+        if "motionhiflow" in selected:
+            args.motionhiflow_python = _conda_env_python(
+                "motionhiflow",
+                args.motionhiflow_python,
+                "MOTIONHIFLOW_PYTHON",
+            )
+        if "flooddiffusion" in selected:
+            args.flooddiffusion_python = _conda_env_python(
+                "flooddiffusion",
+                args.flooddiffusion_python,
+                "FLOODDIFFUSION_PYTHON",
+            )
         args.blender = _blender_executable(args.blender)
     except FileNotFoundError as exc:
         parser.error(str(exc))
@@ -331,10 +389,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     workspace = WORKSPACE
+    selected_baselines = set(args.baselines)
     flow_device, flow_env = _device_runtime(args.flow_device, args.flow_gpu)
-    mld_device, mld_env = _device_runtime(args.mld_device, args.mld_gpu)
-    stickmotion_device, stickmotion_env = _device_runtime(
-        args.stickmotion_device, args.stickmotion_gpu
+    mld_device, mld_env = (
+        _device_runtime(args.mld_device, args.mld_gpu)
+        if "mld" in selected_baselines
+        else (None, None)
+    )
+    stickmotion_device, stickmotion_env = (
+        _device_runtime(args.stickmotion_device, args.stickmotion_gpu)
+        if "stickmotion" in selected_baselines
+        else (None, None)
+    )
+    motionhiflow_device, motionhiflow_env = (
+        _device_runtime(args.motionhiflow_device, args.motionhiflow_gpu)
+        if "motionhiflow" in selected_baselines
+        else (None, None)
+    )
+    flooddiffusion_device, flooddiffusion_env = (
+        _device_runtime(args.flooddiffusion_device, args.flooddiffusion_gpu)
+        if "flooddiffusion" in selected_baselines
+        else (None, None)
     )
     default_rigged_model = (
         workspace / "web_view" / "assets" / "smpl22_rigged_calibrated.glb"
@@ -355,9 +430,13 @@ def main() -> None:
     stickmotion_sketch_frames = args.stickmotion_sketch_frames or [
         int(p * args.seq_len) for p in (0.125, 0.5, 0.875)
     ]
-    if len(set(stickmotion_sketch_frames)) != len(stickmotion_sketch_frames):
+    if "stickmotion" in selected_baselines and len(
+        set(stickmotion_sketch_frames)
+    ) != len(stickmotion_sketch_frames):
         raise ValueError("stickmotion sketch frames must be distinct")
-    if any(index < 0 or index >= args.seq_len for index in stickmotion_sketch_frames):
+    if "stickmotion" in selected_baselines and any(
+        index < 0 or index >= args.seq_len for index in stickmotion_sketch_frames
+    ):
         raise ValueError(
             f"stickmotion sketch frames must be within [0, {args.seq_len - 1}]"
         )
@@ -388,7 +467,7 @@ def main() -> None:
             raise ValueError("--caption-text must contain visible text")
         if len(confirmed_text) > 1000:
             raise ValueError("--caption-text must not exceed 1000 characters")
-        if confirmed_text != selected_text:
+        if confirmed_text != selected_text and "stickmotion" in selected_baselines:
             caption["token"] = _tokenize_caption(
                 args.mld_python, workspace, confirmed_text
             )
@@ -423,7 +502,7 @@ def main() -> None:
     np.save(reference_path, yup_to_blender(reference).astype(np.float32))
 
     initial_manifest = {
-        "version": 1,
+        "version": 2,
         "status": "running",
         "sample_id": sample_id,
         "split": args.split,
@@ -432,6 +511,7 @@ def main() -> None:
         "clip_start": args.start,
         "seq_len": args.seq_len,
         "seed": args.seed,
+        "selected_baselines": args.baselines,
         "caption": caption,
         "source_motion": str(motion_path.relative_to(workspace)),
     }
@@ -538,80 +618,227 @@ def main() -> None:
         shutil.copy2(flow_source_dir / "result_meta.json", flow_meta_path)
     flow_meta = json.loads(flow_meta_path.read_text(encoding="utf-8"))
 
-    mld_path = run_dir / "mld.npy"
-    mld_meta_path = run_dir / "mld_meta.json"
-    mld_command = [
-        args.mld_python,
-        "baselines/mld/tools/export_aist_sample.py",
-        "--text",
-        caption["text"],
-        "--length",
-        str(args.seq_len),
-        "--sample-id",
-        sample_id,
-        "--seed",
-        str(args.seed),
-        "--device",
-        mld_device,
-        "--ckpt",
-        args.mld_ckpt,
-        "--cfg",
-        args.mld_config,
-        "--cfg-assets",
-        args.mld_assets_config,
-        "--output",
-        str(mld_path),
-        "--meta",
-        str(mld_meta_path),
-    ]
-    _run("mld", mld_command, workspace, mld_env, run_dir / "mld.log")
+    baseline_motion_entries = []
+    baseline_methods = {}
 
-    stick_path = run_dir / "stickmotion.npy"
-    stick_ref_path = run_dir / "stickmotion_reference.npy"
-    tracks_path = run_dir / "stickman_tracks.npy"
-    stick_meta_path = run_dir / "stickmotion_meta.json"
-    stick_command = [
-        args.stickmotion_python,
-        "baselines/stickmotion/tools/export_aist_sample.py",
-        "--sample-id",
-        sample_id,
-        "--split",
-        args.split,
-        "--text",
-        caption["text"],
-        "--token",
-        caption["token"],
-        "--start",
-        str(args.start),
-        "--length",
-        str(args.seq_len),
-        "--sketch-frames",
-        *[str(index) for index in stickmotion_sketch_frames],
-        "--seed",
-        str(args.seed),
-        "--device",
-        stickmotion_device,
-        "--ckpt",
-        args.stickmotion_ckpt,
-        "--config",
-        args.stickmotion_config,
-        "--output",
-        str(stick_path),
-        "--reference-output",
-        str(stick_ref_path),
-        "--tracks-output",
-        str(tracks_path),
-        "--meta",
-        str(stick_meta_path),
-    ]
-    _run(
-        "stickmotion",
-        stick_command,
-        workspace,
-        stickmotion_env,
-        run_dir / "stickmotion.log",
-    )
-    stick_meta = json.loads(stick_meta_path.read_text(encoding="utf-8"))
+    if "mld" in selected_baselines:
+        assert mld_device is not None and mld_env is not None
+        mld_path = run_dir / "mld.npy"
+        mld_meta_path = run_dir / "mld_meta.json"
+        mld_command = [
+            args.mld_python,
+            "baselines/mld/tools/export_aist_sample.py",
+            "--text",
+            caption["text"],
+            "--length",
+            str(args.seq_len),
+            "--sample-id",
+            sample_id,
+            "--seed",
+            str(args.seed),
+            "--device",
+            mld_device,
+            "--ckpt",
+            args.mld_ckpt,
+            "--cfg",
+            args.mld_config,
+            "--cfg-assets",
+            args.mld_assets_config,
+            "--output",
+            str(mld_path),
+            "--meta",
+            str(mld_meta_path),
+        ]
+        _run("mld", mld_command, workspace, mld_env, run_dir / "mld.log")
+        baseline_motion_entries.append(
+            {"key": "mld", "label": BASELINE_LABELS["mld"], "path": _relative(mld_path, run_dir)}
+        )
+        baseline_methods["mld"] = {
+            "label": BASELINE_LABELS["mld"],
+            "checkpoint": args.mld_ckpt,
+            "config": args.mld_config,
+            "assets_config": args.mld_assets_config,
+            "text": caption["text"],
+            "metadata": _relative(mld_meta_path, run_dir),
+        }
+
+    if "stickmotion" in selected_baselines:
+        assert stickmotion_device is not None and stickmotion_env is not None
+        stick_path = run_dir / "stickmotion.npy"
+        stick_ref_path = run_dir / "stickmotion_reference.npy"
+        tracks_path = run_dir / "stickman_tracks.npy"
+        stick_meta_path = run_dir / "stickmotion_meta.json"
+        stick_command = [
+            args.stickmotion_python,
+            "baselines/stickmotion/tools/export_aist_sample.py",
+            "--sample-id",
+            sample_id,
+            "--split",
+            args.split,
+            "--text",
+            caption["text"],
+            "--token",
+            caption["token"],
+            "--start",
+            str(args.start),
+            "--length",
+            str(args.seq_len),
+            "--sketch-frames",
+            *[str(index) for index in stickmotion_sketch_frames],
+            "--seed",
+            str(args.seed),
+            "--device",
+            stickmotion_device,
+            "--ckpt",
+            args.stickmotion_ckpt,
+            "--config",
+            args.stickmotion_config,
+            "--output",
+            str(stick_path),
+            "--reference-output",
+            str(stick_ref_path),
+            "--tracks-output",
+            str(tracks_path),
+            "--meta",
+            str(stick_meta_path),
+        ]
+        _run(
+            "stickmotion",
+            stick_command,
+            workspace,
+            stickmotion_env,
+            run_dir / "stickmotion.log",
+        )
+        stick_meta = json.loads(stick_meta_path.read_text(encoding="utf-8"))
+        baseline_motion_entries.append(
+            {
+                "key": "stickmotion",
+                "label": BASELINE_LABELS["stickmotion"],
+                "path": _relative(stick_path, run_dir),
+            }
+        )
+        baseline_methods["stickmotion"] = {
+            "label": BASELINE_LABELS["stickmotion"],
+            "checkpoint": args.stickmotion_ckpt,
+            "config": args.stickmotion_config,
+            "text": caption["text"],
+            "token": caption["token"],
+            "metadata": _relative(stick_meta_path, run_dir),
+            "stickman_tracks": _relative(tracks_path, run_dir),
+            "stickman_frame_indices": stick_meta["stickman_frame_indices"],
+            "stickman_source_frame_indices": stick_meta[
+                "stickman_source_frame_indices"
+            ],
+            "locus_used_for_generation": stick_meta["locus_used_for_generation"],
+        }
+
+    if "motionhiflow" in selected_baselines:
+        assert motionhiflow_device is not None and motionhiflow_env is not None
+        motionhiflow_path = run_dir / "motionhiflow.npy"
+        motionhiflow_meta_path = run_dir / "motionhiflow_meta.json"
+        motionhiflow_command = [
+            args.motionhiflow_python,
+            "baselines/motionhiflow/tools/export_sample.py",
+            "--text",
+            caption["text"],
+            "--length",
+            str(args.seq_len),
+            "--seed",
+            str(args.seed),
+            "--device",
+            motionhiflow_device,
+            "--checkpoint",
+            args.motionhiflow_ckpt,
+            "--steps",
+            str(args.motionhiflow_steps),
+            "--guidance-scale",
+            str(args.motionhiflow_guidance_scale),
+            "--output",
+            str(motionhiflow_path),
+            "--meta",
+            str(motionhiflow_meta_path),
+        ]
+        if args.motionhiflow_vae_ckpt:
+            motionhiflow_command.extend(
+                ["--vae-checkpoint", args.motionhiflow_vae_ckpt]
+            )
+        _run(
+            "motionhiflow",
+            motionhiflow_command,
+            workspace,
+            motionhiflow_env,
+            run_dir / "motionhiflow.log",
+        )
+        baseline_motion_entries.append(
+            {
+                "key": "motionhiflow",
+                "label": BASELINE_LABELS["motionhiflow"],
+                "path": _relative(motionhiflow_path, run_dir),
+            }
+        )
+        baseline_methods["motionhiflow"] = {
+            "label": BASELINE_LABELS["motionhiflow"],
+            "checkpoint": args.motionhiflow_ckpt,
+            "vae_checkpoint": args.motionhiflow_vae_ckpt,
+            "steps": args.motionhiflow_steps,
+            "guidance_scale": args.motionhiflow_guidance_scale,
+            "text": caption["text"],
+            "metadata": _relative(motionhiflow_meta_path, run_dir),
+        }
+
+    if "flooddiffusion" in selected_baselines:
+        assert flooddiffusion_device is not None and flooddiffusion_env is not None
+        flood_path = run_dir / "flooddiffusion.npy"
+        flood_meta_path = run_dir / "flooddiffusion_meta.json"
+        flood_command = [
+            args.flooddiffusion_python,
+            "baselines/flooddiffusion/tools/export_sample.py",
+            "--text",
+            caption["text"],
+            "--length",
+            str(args.seq_len),
+            "--seed",
+            str(args.seed),
+            "--device",
+            flooddiffusion_device,
+            "--checkpoint",
+            args.flooddiffusion_ckpt,
+            "--steps",
+            str(args.flooddiffusion_steps),
+            "--guidance-scale",
+            str(args.flooddiffusion_guidance_scale),
+            "--output",
+            str(flood_path),
+            "--meta",
+            str(flood_meta_path),
+        ]
+        if args.flooddiffusion_vae_ckpt:
+            flood_command.extend(
+                ["--vae-checkpoint", args.flooddiffusion_vae_ckpt]
+            )
+        _run(
+            "flooddiffusion",
+            flood_command,
+            workspace,
+            flooddiffusion_env,
+            run_dir / "flooddiffusion.log",
+        )
+        baseline_motion_entries.append(
+            {
+                "key": "flooddiffusion",
+                "label": BASELINE_LABELS["flooddiffusion"],
+                "path": _relative(flood_path, run_dir),
+            }
+        )
+        baseline_methods["flooddiffusion"] = {
+            "label": BASELINE_LABELS["flooddiffusion"],
+            "checkpoint": args.flooddiffusion_ckpt,
+            "vae_checkpoint": args.flooddiffusion_vae_ckpt,
+            "steps": args.flooddiffusion_steps,
+            "guidance_scale": args.flooddiffusion_guidance_scale,
+            "text": caption["text"],
+            "metadata": _relative(flood_meta_path, run_dir),
+        }
 
     manifest = {
         **initial_manifest,
@@ -638,12 +865,7 @@ def main() -> None:
                 "label": "FlowMimic",
                 "path": _relative(flow_path, run_dir),
             },
-            {"key": "mld", "label": "MLD", "path": _relative(mld_path, run_dir)},
-            {
-                "key": "stickmotion",
-                "label": "StickMotion",
-                "path": _relative(stick_path, run_dir),
-            },
+            *baseline_motion_entries,
         ],
         "methods": {
             "flowmimic": {
@@ -653,26 +875,7 @@ def main() -> None:
                 "use_ema": args.flow_use_ema,
                 "metadata": _relative(flow_meta_path, run_dir),
             },
-            "mld": {
-                "checkpoint": args.mld_ckpt,
-                "config": args.mld_config,
-                "assets_config": args.mld_assets_config,
-                "text": caption["text"],
-                "metadata": _relative(mld_meta_path, run_dir),
-            },
-            "stickmotion": {
-                "checkpoint": args.stickmotion_ckpt,
-                "config": args.stickmotion_config,
-                "text": caption["text"],
-                "token": caption["token"],
-                "metadata": _relative(stick_meta_path, run_dir),
-                "stickman_tracks": _relative(tracks_path, run_dir),
-                "stickman_frame_indices": stick_meta["stickman_frame_indices"],
-                "stickman_source_frame_indices": stick_meta[
-                    "stickman_source_frame_indices"
-                ],
-                "locus_used_for_generation": stick_meta["locus_used_for_generation"],
-            },
+            **baseline_methods,
         },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

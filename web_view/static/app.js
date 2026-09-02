@@ -29,6 +29,13 @@ ORIENTATION_EDGE.set(15, [12, 15]);
 ORIENTATION_EDGE.set(20, [18, 20]);
 ORIENTATION_EDGE.set(21, [19, 21]);
 
+const BASELINE_VIEW_CONFIG = {
+  mld: { canvas: "mldCanvas", joint: 0xe36b32, bone: 0x9e3f1e },
+  stickmotion: { canvas: "stickmotionCanvas", joint: 0x9a67b2, bone: 0x633974 },
+  motionhiflow: { canvas: "motionhiflowCanvas", joint: 0xe8b33a, bone: 0x8f680f },
+  flooddiffusion: { canvas: "flooddiffusionCanvas", joint: 0x35a7b4, bone: 0x176b78 },
+};
+
 class NullViewport {
   setMotion(_motion) {}
   setVisualizationMode(_mode) {}
@@ -335,14 +342,18 @@ const els = {
   baselinePanel: document.getElementById("baselinePanel"),
   baselineSampleMeta: document.getElementById("baselineSampleMeta"),
   baselineCaption: document.getElementById("baselineCaption"),
+  baselineConditions: document.getElementById("baselineConditions"),
+  baselineCards: [...document.querySelectorAll("[data-baseline-card]")],
+  baselineMethodInputs: [...document.querySelectorAll('input[name="comparisonBaseline"]')],
+  stickmotionOptions: document.getElementById("stickmotionOptions"),
   stickSketchGrid: document.getElementById("stickSketchGrid"),
 };
 
 let genView = new NullViewport();
 let condView = new NullViewport();
-let mldView = new NullViewport();
-let stickmotionView = new NullViewport();
-let MotionViewportType = null;
+let baselineViews = new Map(
+  Object.keys(BASELINE_VIEW_CONFIG).map((key) => [key, new NullViewport()])
+);
 let currentVisualizationMode = "skeleton";
 let currentReplicateCommand = "";
 let styleNameById = new Map([[0, "Unknown"]]);
@@ -491,6 +502,12 @@ function selectedSketchFrames() {
   return sketchFrameInputs().map((input) => parseOptionalInt(input.value));
 }
 
+function selectedBaselineKeys() {
+  return els.baselineMethodInputs
+    .filter((input) => input.checked)
+    .map((input) => input.value);
+}
+
 function updateComparisonCaptionMeta() {
   if (!currentComparisonCaption) {
     els.comparisonTextMeta.textContent = comparisonCaptionLoading
@@ -510,9 +527,18 @@ function updateComparisonControls() {
   const hasCaption = Boolean(
     currentComparisonCaption && els.comparisonText.value.trim()
   );
-  els.buildBlendBtn.disabled =
-    comparisonBusy || comparisonCaptionLoading || !currentComparisonSource || !hasCaption;
+  const baselines = selectedBaselineKeys();
+  const stickmotionSelected = baselines.includes("stickmotion");
+  els.buildBlendBtn.disabled = comparisonBusy
+    || comparisonCaptionLoading
+    || !currentComparisonSource
+    || !hasCaption
+    || baselines.length === 0;
+  els.stickmotionOptions.hidden = !stickmotionSelected;
   sketchFrameInputs().forEach((input) => {
+    input.disabled = comparisonBusy || !stickmotionSelected;
+  });
+  els.baselineMethodInputs.forEach((input) => {
     input.disabled = comparisonBusy;
   });
   els.comparisonDevice.disabled = comparisonBusy;
@@ -600,7 +626,7 @@ async function loadRandomComparisonCaption(excludeCurrent = false) {
 }
 
 function updateSketchSourceFrames() {
-  if (!currentComparisonSource) {
+  if (!currentComparisonSource || !selectedBaselineKeys().includes("stickmotion")) {
     els.stickSourceFrames.textContent = "";
     return;
   }
@@ -616,13 +642,17 @@ function updateSketchSourceFrames() {
 
 function clearBaselineResults() {
   els.baselinePanel.hidden = true;
+  els.baselinePanel.removeAttribute("data-baseline-count");
   els.baselineSampleMeta.textContent = "";
   els.baselineCaption.textContent = "";
   els.stickSketchGrid.innerHTML = "";
+  els.baselineConditions.hidden = true;
+  els.baselineCards.forEach((card) => {
+    card.hidden = true;
+  });
   els.baselineBlendDownload.hidden = true;
   els.baselineBlendDownload.removeAttribute("href");
-  mldView.setMotion(null);
-  stickmotionView.setMotion(null);
+  baselineViews.forEach((viewport) => viewport.setMotion(null));
   currentBaselineIdentity = null;
 }
 
@@ -955,17 +985,22 @@ async function initViewports() {
       rigTemplate,
       rigTemplate ? SkeletonUtils.clone : null
     );
-    MotionViewportType = MotionViewport;
     genView = new MotionViewport("genCanvas", 0x0f5f94, 0x264653);
     condView = new MotionViewport("condCanvas", 0x2d7a64, 0x28594d);
+    baselineViews = new Map(
+      Object.entries(BASELINE_VIEW_CONFIG).map(([key, config]) => [
+        key,
+        new MotionViewport(config.canvas, config.joint, config.bone),
+      ])
+    );
     setVisualizationMode(currentVisualizationMode, false);
     appendLog(rigTemplate ? "3D viewer ready with skeleton and rigged models." : "3D skeleton viewer ready.");
   } catch (err) {
     genView = new NullViewport();
     condView = new NullViewport();
-    mldView = new NullViewport();
-    stickmotionView = new NullViewport();
-    MotionViewportType = null;
+    baselineViews = new Map(
+      Object.keys(BASELINE_VIEW_CONFIG).map((key) => [key, new NullViewport()])
+    );
     appendLog(`3D viewer disabled (failed to load three.js): ${err}`);
   }
 }
@@ -977,7 +1012,7 @@ function setVisualizationMode(mode, persist = true) {
   for (const input of els.visualizationModes) {
     input.checked = input.value === currentVisualizationMode;
   }
-  for (const viewport of [genView, condView, mldView, stickmotionView]) {
+  for (const viewport of [genView, condView, ...baselineViews.values()]) {
     viewport.setVisualizationMode(currentVisualizationMode);
   }
   if (persist) saveFormState();
@@ -1284,10 +1319,12 @@ function drawPaths(canvas, paths, color, lineWidth = 2) {
 
 function renderStickMotionConditions(data) {
   els.stickSketchGrid.innerHTML = "";
+  const tracksList = data.stickman_tracks || [];
+  els.baselineConditions.hidden = tracksList.length === 0;
   const localFrames = data.stickman_frame_indices || [];
   const sourceFrames = data.stickman_source_frame_indices || [];
   const canvases = [];
-  for (let index = 0; index < (data.stickman_tracks || []).length; index += 1) {
+  for (let index = 0; index < tracksList.length; index += 1) {
     const figure = document.createElement("figure");
     figure.className = "stick-sketch";
     const canvas = document.createElement("canvas");
@@ -1300,7 +1337,7 @@ function renderStickMotionConditions(data) {
       : `Frame ${local} | source ${source}`;
     figure.append(canvas, caption);
     els.stickSketchGrid.appendChild(figure);
-    canvases.push([canvas, data.stickman_tracks[index]]);
+    canvases.push([canvas, tracksList[index]]);
   }
   window.requestAnimationFrame(() => {
     for (const [canvas, tracks] of canvases) {
@@ -1316,19 +1353,26 @@ async function loadComparisonResults(resultsUrl, { scroll = true } = {}) {
     throw new Error(comparisonErrorText(data, `Result request failed (${res.status})`));
   }
   els.baselinePanel.hidden = false;
-  if (MotionViewportType && mldView instanceof NullViewport) {
-    mldView = new MotionViewportType("mldCanvas", 0xe36b32, 0x9e3f1e);
-    stickmotionView = new MotionViewportType("stickmotionCanvas", 0x9a67b2, 0x633974);
-    mldView.setVisualizationMode(currentVisualizationMode);
-    stickmotionView.setVisualizationMode(currentVisualizationMode);
-  }
   els.baselineSampleMeta.textContent = `${data.sample_id} | start ${data.clip_start}`;
   currentBaselineIdentity = `${data.sample_id}::${Number(data.clip_start || 0)}`;
-  els.baselineCaption.textContent = data.mld_text === data.stickmotion_text
-    ? data.mld_text
-    : `MLD: ${data.mld_text} | StickMotion: ${data.stickmotion_text}`;
-  mldView.setMotion(data.mld_motion);
-  stickmotionView.setMotion(data.stickmotion_motion);
+  els.baselineCaption.textContent = data.caption || "";
+  const resultByKey = new Map(
+    (data.baselines || []).map((item) => [item.key, item])
+  );
+  els.baselinePanel.dataset.baselineCount = String(resultByKey.size);
+  els.baselineCards.forEach((card) => {
+    const key = card.dataset.baselineCard;
+    const result = resultByKey.get(key);
+    card.hidden = !result;
+    const viewport = baselineViews.get(key);
+    if (result) {
+      const title = card.querySelector("h3");
+      if (title) title.textContent = result.label || key;
+      viewport?.setMotion(result.motion);
+    } else {
+      viewport?.setMotion(null);
+    }
+  });
   renderStickMotionConditions(data);
   if (scroll) {
     els.baselinePanel.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1427,12 +1471,26 @@ async function onBuildBlend() {
   if (!currentComparisonSource) return;
   const frames = selectedSketchFrames();
   const captionText = els.comparisonText.value.replaceAll("#", " ").trim();
+  const baselines = selectedBaselineKeys();
+  const stickmotionSelected = baselines.includes("stickmotion");
   const seqLen = Number(currentComparisonSource.meta?.seq_len || 0);
   if (
-    frames.some((frame) => frame == null || frame < 0 || frame >= seqLen) ||
-    new Set(frames).size !== 3
+    stickmotionSelected
+    && (frames.some((frame) => frame == null || frame < 0 || frame >= seqLen)
+      || new Set(frames).size !== 3)
   ) {
     els.blendStatus.textContent = `Select three distinct frames within [0, ${seqLen - 1}].`;
+    return;
+  }
+  if (baselines.length === 0) {
+    els.blendStatus.textContent = "Select at least one baseline method.";
+    return;
+  }
+  if (
+    baselines.includes("flooddiffusion")
+    && els.comparisonDevice.value.trim().toLowerCase() === "cpu"
+  ) {
+    els.blendStatus.textContent = "FloodDiffusion requires CUDA; deselect it to use CPU.";
     return;
   }
   if (!currentComparisonCaption || !captionText) {
@@ -1458,6 +1516,7 @@ async function onBuildBlend() {
         stickmotion_sketch_frames: frames,
         caption_index: currentComparisonCaption.index,
         caption_text: captionText,
+        baselines,
         visualization_mode: currentVisualizationMode,
         device: els.comparisonDevice.value.trim() || null,
       }),
@@ -1470,7 +1529,7 @@ async function onBuildBlend() {
     els.blendStatus.textContent = data.stage || "Queued";
     setComparisonJobStage(data.stage || "Queued");
     appendLog(
-      `Comparison blend queued: description ${currentComparisonCaption.index + 1}/${currentComparisonCaption.count}, sketches [${frames.join(", ")}], job ${data.job_id}`
+      `Comparison queued: ${baselines.join(", ")}, description ${currentComparisonCaption.index + 1}/${currentComparisonCaption.count}, job ${data.job_id}`
     );
     pollComparisonJob(data.job_id, data.status_url);
   } catch (err) {
@@ -1775,6 +1834,12 @@ els.comparisonText.addEventListener("input", () => {
 sketchFrameInputs().forEach((input) => {
   input.addEventListener("input", updateSketchSourceFrames);
 });
+els.baselineMethodInputs.forEach((input) => {
+  input.addEventListener("change", () => {
+    updateComparisonControls();
+    updateSketchSourceFrames();
+  });
+});
 els.lightboxPrev.addEventListener("click", () => stepLightbox(-1));
 els.lightboxNext.addEventListener("click", () => stepLightbox(1));
 els.clipVideo.addEventListener("error", () => {
@@ -1831,8 +1896,7 @@ function animate(ts) {
   lastTs = ts;
   genView.tick(dt);
   condView.tick(dt);
-  mldView.tick(dt);
-  stickmotionView.tick(dt);
+  baselineViews.forEach((viewport) => viewport.tick(dt));
   requestAnimationFrame(animate);
 }
 requestAnimationFrame(animate);

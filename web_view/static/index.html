@@ -219,7 +219,7 @@
 
     <section id="baselinePanel" class="panel baseline-panel" hidden>
       <div class="panel-heading">
-        <h2>MLD and StickMotion</h2>
+        <h2>Baseline Comparisons</h2>
         <div class="baseline-heading-actions">
           <div id="baselineSampleMeta" class="muted"></div>
           <a id="baselineBlendDownload" class="download-btn" href="#" download hidden>Download .blend</a>
@@ -230,16 +230,24 @@
         <p id="baselineCaption"></p>
       </div>
       <div class="view-grid">
-        <div class="view-card">
+        <div class="view-card" data-baseline-card="mld" hidden>
           <h3>MLD</h3>
           <canvas id="mldCanvas"></canvas>
         </div>
-        <div class="view-card">
+        <div class="view-card" data-baseline-card="stickmotion" hidden>
           <h3>StickMotion</h3>
           <canvas id="stickmotionCanvas"></canvas>
         </div>
+        <div class="view-card" data-baseline-card="motionhiflow" hidden>
+          <h3>MotionHiFlow</h3>
+          <canvas id="motionhiflowCanvas"></canvas>
+        </div>
+        <div class="view-card" data-baseline-card="flooddiffusion" hidden>
+          <h3>FloodDiffusion</h3>
+          <canvas id="flooddiffusionCanvas"></canvas>
+        </div>
       </div>
-      <div class="baseline-conditions">
+      <div id="baselineConditions" class="baseline-conditions" hidden>
         <div class="sketch-condition-area">
           <h3>StickMotion Sketch Conditions</h3>
           <div id="stickSketchGrid" class="stick-sketch-grid"></div>
@@ -286,25 +294,38 @@
       <div id="comparisonTextMeta" class="muted caption-editor-meta"></div>
     </div>
 
-    <div class="sketch-frame-grid">
-      <label>Sketch Frame 1
-        <input id="stickFrame1" type="number" min="0" value="24" />
-      </label>
-      <label>Sketch Frame 2
-        <input id="stickFrame2" type="number" min="0" value="98" />
-      </label>
-      <label>Sketch Frame 3
-        <input id="stickFrame3" type="number" min="0" value="171" />
-      </label>
+    <fieldset class="baseline-picker">
+      <legend>Baseline Methods</legend>
+      <div class="baseline-toggle-grid">
+        <label><input type="checkbox" name="comparisonBaseline" value="mld" checked /><span>MLD</span></label>
+        <label><input type="checkbox" name="comparisonBaseline" value="stickmotion" checked /><span>StickMotion</span></label>
+        <label><input type="checkbox" name="comparisonBaseline" value="motionhiflow" checked /><span>MotionHiFlow</span></label>
+        <label><input type="checkbox" name="comparisonBaseline" value="flooddiffusion" checked /><span>FloodDiffusion</span></label>
+      </div>
+    </fieldset>
+
+    <div id="stickmotionOptions" class="baseline-specific-options">
+      <div class="option-group-title">StickMotion Sketch Frames</div>
+      <div class="sketch-frame-grid">
+        <label>Frame 1
+          <input id="stickFrame1" type="number" min="0" value="24" />
+        </label>
+        <label>Frame 2
+          <input id="stickFrame2" type="number" min="0" value="98" />
+        </label>
+        <label>Frame 3
+          <input id="stickFrame3" type="number" min="0" value="171" />
+        </label>
+      </div>
+      <div id="stickSourceFrames" class="muted source-frame-summary"></div>
     </div>
-    <div id="stickSourceFrames" class="muted source-frame-summary"></div>
 
     <label class="comparison-device-field">Device (optional)
-      <input id="comparisonDevice" placeholder="cpu / cuda / cuda:0" />
+      <input id="comparisonDevice" placeholder="cuda / cuda:0" />
     </label>
 
     <div class="dialog-actions">
-      <button id="buildBlendBtn" type="button">Build .blend</button>
+      <button id="buildBlendBtn" type="button">Build Comparison</button>
       <span id="blendSpinner" class="spinner" aria-hidden="true"></span>
       <a id="blendDownload" class="download-btn" href="#" download hidden>Download .blend</a>
     </div>
@@ -322,6 +343,6 @@
     </div>
   </div>
 
-  <script type="module" src="./static/app.js?v=20260731-condition-media-fix2"></script>
+  <script type="module" src="./static/app.js?v=20260901-baseline-registry"></script>
 </body>
 </html>

@@ -32,6 +32,8 @@ PALETTE = {
     "flowmimic": ((0.04, 0.48, 0.36, 1.0), (0.18, 0.72, 0.52, 1.0)),
     "mld": ((0.66, 0.22, 0.12, 1.0), (0.92, 0.38, 0.20, 1.0)),
     "stickmotion": ((0.48, 0.20, 0.62, 1.0), (0.71, 0.42, 0.82, 1.0)),
+    "motionhiflow": ((0.62, 0.45, 0.06, 1.0), (0.91, 0.70, 0.16, 1.0)),
+    "flooddiffusion": ((0.08, 0.46, 0.56, 1.0), (0.20, 0.72, 0.78, 1.0)),
 }
 ROOT_COLLECTION = "FlowMimicComparison"
 SMPL22_BONES = [
@@ -427,8 +429,10 @@ def _set_linear_interpolation() -> None:
 def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     motions_spec = manifest.get("motions", [])
-    if len(motions_spec) != 4:
-        raise ValueError(f"Expected four motions in manifest, got {len(motions_spec)}")
+    if len(motions_spec) < 3:
+        raise ValueError(
+            f"Expected reference, FlowMimic, and at least one baseline; got {len(motions_spec)} motions"
+        )
     motions = [
         (item, _load_motion(_resolve(manifest_path, item["path"]), args.scale))
         for item in motions_spec
@@ -458,7 +462,8 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
     bpy.context.preferences.edit.keyframe_new_interpolation_type = "LINEAR"
 
     count = len(motions)
-    offsets_x = (np.arange(count) - (count - 1) * 0.5) * args.rig_spacing
+    rig_spacing = args.rig_spacing if count <= 4 else min(args.rig_spacing, 3.1)
+    offsets_x = (np.arange(count) - (count - 1) * 0.5) * rig_spacing
     for (item, motion), x in zip(motions, offsets_x):
         offset = Vector((float(x), 0.0, 0.0))
         if args.visualization_mode == "rigged":
@@ -476,13 +481,19 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
                 args.bone_radius,
             )
 
-    span = args.rig_spacing * max(count - 1, 1) + 3.0
+    span = rig_spacing * max(count - 1, 1) + 3.0
     caption = manifest.get("caption", {}).get("text", "")
+    baseline_labels = [
+        item.get("label", item.get("key", ""))
+        for item in motions_spec
+        if item.get("key") not in {"reference", "flowmimic"}
+    ]
     header = (
         f"{manifest.get('sample_id', '')} | {manifest.get('split', '')} | "
         f"start={manifest.get('clip_start', 0)} | "
         f"FlowMimic K={manifest.get('condition', {}).get('requested_frames', '?')}\n"
-        f"MLD / StickMotion text: {textwrap.fill(caption, width=105)}"
+        f"Text baselines ({', '.join(baseline_labels)}): "
+        f"{textwrap.fill(caption, width=105)}"
     )
     _create_text("ComparisonCaption", header, (0.0, 1.05, 5.15), root, size=0.21, align="CENTER")
     _build_stickman_panels(manifest, manifest_path, root, span)
@@ -562,7 +573,7 @@ def _build_scene(manifest_path: Path, args: argparse.Namespace) -> None:
         print(f"Saved comparison scene: {save_path}")
     print(
         f"Loaded {manifest.get('sample_id', '')}: {frame_count} frames, "
-        f"4 motions, {len(stick_indices)} StickMotion sketches"
+        f"{count} motions, {len(stick_indices)} StickMotion sketches"
     )
 
 
